@@ -24,12 +24,17 @@
 // hierarchy:
 //
 //   "gated"                 → 401 + X-Error-Code=GatedRepo
-//                             (or: any 401 with the aggregate body
-//                              flagging an upstream auth failure)
+//                             (only — bare 401 without the code means
+//                              HF-compat "repo doesn't exist", see below)
 //   "forbidden"             → 403
-//   "not-found"             → 404 / 410
-//                             (EntryNotFound, RepoNotFound, or bare
-//                              404 without a specific code)
+//   "not-found"             → 404 / 410, or bare 401 without GatedRepo
+//                             (EntryNotFound, RepoNotFound,
+//                              RevisionNotFound, bare 404, or bare 401
+//                              — HF returns 401 without a code for
+//                              non-existent repos as anti-enumeration,
+//                              and `huggingface_hub.utils._http` maps
+//                              the same shape to `RepositoryNotFoundError`;
+//                              we follow the same heuristic)
 //   "upstream-unavailable"  → 5xx / 502 / 503 / 504
 //   "cors"                  → browser-level CORS / network failure
 //                             (surfaces as TypeError "Failed to fetch")
@@ -88,17 +93,21 @@ function classifyStatus(status, errorCode) {
   // GatedRepo on 401 is the canonical HF case. Honour the code when
   // present even if some middleware remapped the status.
   if (errorCode === "GatedRepo") return ERROR_KIND.GATED;
-  if (status === 401) return ERROR_KIND.GATED;
-  if (status === 403) return ERROR_KIND.FORBIDDEN;
   if (
     errorCode === "EntryNotFound" ||
     errorCode === "RepoNotFound" ||
-    errorCode === "RevisionNotFound" ||
-    status === 404 ||
-    status === 410
+    errorCode === "RevisionNotFound"
   ) {
     return ERROR_KIND.NOT_FOUND;
   }
+  // Bare 401 without X-Error-Code → HF's anti-enumeration response
+  // for a non-existent repo. `huggingface_hub.utils._http` raises
+  // `RepositoryNotFoundError` for the same shape; we classify as
+  // NOT_FOUND so the UI shows "does not exist" instead of asking the
+  // user for a token that would not help.
+  if (status === 401) return ERROR_KIND.NOT_FOUND;
+  if (status === 403) return ERROR_KIND.FORBIDDEN;
+  if (status === 404 || status === 410) return ERROR_KIND.NOT_FOUND;
   if (typeof status === "number" && status >= 500 && status < 600) {
     return ERROR_KIND.UPSTREAM_UNAVAILABLE;
   }

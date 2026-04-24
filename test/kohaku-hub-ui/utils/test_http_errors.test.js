@@ -48,8 +48,21 @@ describe("classifyResponse", () => {
     expect(out.detail).toBe("need auth");
   });
 
-  it("treats a bare 401 without X-Error-Code as gated anyway", async () => {
+  it("treats a bare 401 without X-Error-Code as not-found (HF's repo-miss shape)", async () => {
+    // HF returns 401 without X-Error-Code for non-existent repos as
+    // anti-enumeration. `huggingface_hub.utils._http` maps the same
+    // shape to `RepositoryNotFoundError`, and so do we — the UI
+    // otherwise prompts the user for a token that would not help.
     const res = mkResponse({ status: 401 });
+    const out = await classifyResponse(res);
+    expect(out.kind).toBe(ERROR_KIND.NOT_FOUND);
+  });
+
+  it("honours X-Error-Code=GatedRepo alongside a 401 (real gated case)", async () => {
+    const res = mkResponse({
+      status: 401,
+      headers: { "X-Error-Code": "GatedRepo" },
+    });
     const out = await classifyResponse(res);
     expect(out.kind).toBe(ERROR_KIND.GATED);
   });

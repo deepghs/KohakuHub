@@ -516,7 +516,14 @@ async def test_try_fallback_resolve_continues_past_every_failure_and_aggregates(
         path,
         httpx.TimeoutException("too slow"),
     )
-    FakeFallbackClient.queue("https://auth.local", "HEAD", path, _content_response(401))
+    # 401 WITH X-Error-Code=GatedRepo — a genuinely gated repo (not the
+    # bare-401 anti-enumeration shape HF uses for missing repos).
+    FakeFallbackClient.queue(
+        "https://auth.local",
+        "HEAD",
+        path,
+        _content_response(401, headers={"X-Error-Code": "GatedRepo"}),
+    )
     FakeFallbackClient.queue("https://missing.local", "HEAD", path, _content_response(404))
 
     response = await fallback_ops.try_fallback_resolve(
@@ -535,8 +542,8 @@ async def test_try_fallback_resolve_continues_past_every_failure_and_aggregates(
         "https://missing.local",
     ]
 
-    # Aggregate: timeout + 401 + 404. Auth wins the priority contest
-    # because it's the most actionable status to surface.
+    # Aggregate: timeout + 401(GatedRepo) + 404. Auth wins the priority
+    # contest because it's the most actionable status to surface.
     assert response is not None
     assert response.status_code == 401
     assert response.headers.get("x-error-code") == "GatedRepo"
@@ -949,7 +956,13 @@ async def test_try_fallback_resolve_surfaces_upstream_401_as_aggregated_error(
         _content_response(
             401,
             content=gated_body,
-            headers={"content-type": "text/plain; charset=utf-8"},
+            # X-Error-Code=GatedRepo is what HF sets only when the repo
+            # actually exists and is gated — bare 401 means the repo
+            # doesn't exist, see test_try_fallback_resolve_bare_401...
+            headers={
+                "content-type": "text/plain; charset=utf-8",
+                "X-Error-Code": "GatedRepo",
+            },
         ),
     )
 
@@ -1054,12 +1067,16 @@ async def test_try_fallback_resolve_continues_past_401_and_succeeds_on_next_sour
         ],
     )
     path = "/models/owner/demo/resolve/main/weights.bin"
-    # Source 1 is gated.
+    # Source 1 is gated — 401 + X-Error-Code=GatedRepo, not bare 401
+    # (which HF uses for non-existent repos and we would classify as
+    # not-found instead).
     FakeFallbackClient.queue(
         "https://gated.local",
         "HEAD",
         path,
-        _content_response(401, content=b"gated"),
+        _content_response(
+            401, content=b"gated", headers={"X-Error-Code": "GatedRepo"}
+        ),
     )
     # Source 2 happily serves the same file.
     FakeFallbackClient.queue(
@@ -1116,7 +1133,11 @@ async def test_try_fallback_resolve_aggregates_mixed_failures_across_sources(
     path = "/models/owner/demo/resolve/main/file.bin"
     FakeFallbackClient.queue(
         "https://gated.local", "HEAD", path,
-        _content_response(401, content=b"Auth required"),
+        _content_response(
+            401,
+            content=b"Auth required",
+            headers={"X-Error-Code": "GatedRepo"},
+        ),
     )
     FakeFallbackClient.queue(
         "https://missing.local", "HEAD", path,
