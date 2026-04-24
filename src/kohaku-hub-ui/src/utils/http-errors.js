@@ -277,3 +277,66 @@ export function classifyError(err) {
 
   return { ...blank, detail: err.message ?? null };
 }
+
+/**
+ * Pre-flight a URL and classify the outcome. Intended for the "am I
+ * about to hand this URL to a native download / window.open" case —
+ * blob-page Download button, anything that would otherwise let the
+ * browser render a raw JSON error body in a new tab.
+ *
+ * Issues a ``GET`` with ``Range: bytes=0-0`` so that the S3/MinIO
+ * presigned URL the backend 302s to is still a valid signature
+ * (presigned URLs are signed for GET, not HEAD) and only a couple of
+ * hundred bytes cross the wire on the happy path. The backend's
+ * aggregate failure body is small enough that a full download
+ * on the failure path is also cheap.
+ *
+ * Returns ``{ ok: true, classification: null }`` on 2xx, else
+ * ``{ ok: false, classification }`` where ``classification`` is the
+ * same shape classifyResponse / classifyError emit.
+ *
+ * ``fetchImpl`` is injectable for tests; default is the global fetch.
+ */
+export async function probeUrlAndClassify(url, fetchImpl) {
+  const impl = fetchImpl || globalThis.fetch;
+  try {
+    const response = await impl(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+      redirect: "follow",
+    });
+    if (response.ok) {
+      return { ok: true, classification: null };
+    }
+    return { ok: false, classification: await classifyResponse(response) };
+  } catch (err) {
+    return { ok: false, classification: classifyError(err) };
+  }
+}
+
+/**
+ * Per-kind toast copy for the blob-page Download button. Kept here
+ * next to the classification it's keyed on so the two stay in sync —
+ * when a new ``ERROR_KIND`` lands, this map refuses to silently fall
+ * through to "generic" without a matching caller update.
+ */
+export const DOWNLOAD_TOAST_HINTS = Object.freeze({
+  [ERROR_KIND.GATED]:
+    "This repository is gated. Attach a Hugging Face token in Settings → Tokens, then retry.",
+  [ERROR_KIND.FORBIDDEN]: "Upstream source denied access to this file.",
+  [ERROR_KIND.NOT_FOUND]: "No source serves this file.",
+  [ERROR_KIND.UPSTREAM_UNAVAILABLE]:
+    "Upstream source is unavailable right now. Retry shortly.",
+  [ERROR_KIND.CORS]:
+    "Download blocked by CORS on the storage host. See local-dev docs.",
+  [ERROR_KIND.GENERIC]:
+    "Download failed. See browser console for the raw response.",
+});
+
+export function downloadToastFor(classification) {
+  if (!classification) return DOWNLOAD_TOAST_HINTS[ERROR_KIND.GENERIC];
+  return (
+    DOWNLOAD_TOAST_HINTS[classification.kind] ||
+    DOWNLOAD_TOAST_HINTS[ERROR_KIND.GENERIC]
+  );
+}

@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   classifyError,
   classifyResponse,
   defaultCopyFor,
+  downloadToastFor,
+  DOWNLOAD_TOAST_HINTS,
   ERROR_KIND,
+  probeUrlAndClassify,
 } from "@/utils/http-errors";
 
 // Convenience: build a Response-like object with Headers + optional
@@ -250,6 +253,102 @@ describe("classifyError", () => {
   it("falls back to .message detail for plain Errors", () => {
     const err = new Error("boom");
     expect(classifyError(err).detail).toBe("boom");
+  });
+});
+
+describe("classifyError detail fallback", () => {
+  it("falls back to err.message when err.detail is not a string", () => {
+    // Triggers the `detail: err.detail ?? err.message ?? null` chain's
+    // message arm — an object surfaced without `detail` but with
+    // `message`, and with `status`/`errorCode` so the inline-safetensors
+    // branch is taken.
+    const err = {
+      status: 500,
+      errorCode: null,
+      sources: null,
+      detail: undefined,
+      message: "boom from inner",
+    };
+    const out = classifyError(err);
+    expect(out.kind).toBe(ERROR_KIND.UPSTREAM_UNAVAILABLE);
+    expect(out.detail).toBe("boom from inner");
+  });
+});
+
+describe("probeUrlAndClassify", () => {
+  it("reports ok=true for a 2xx probe and never calls classification", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(null, { status: 206, headers: { "Content-Length": "1" } }),
+    );
+    const out = await probeUrlAndClassify("https://test/ok", fetchImpl);
+    expect(out.ok).toBe(true);
+    expect(out.classification).toBeNull();
+    // Uses GET with Range header so signed presigned URLs accept it.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.method).toBe("GET");
+    expect(init.headers.Range).toBe("bytes=0-0");
+  });
+
+  it("classifies a 401 probe as gated", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(null, {
+        status: 401,
+        headers: { "X-Error-Code": "GatedRepo" },
+      }),
+    );
+    const out = await probeUrlAndClassify("https://test/gated", fetchImpl);
+    expect(out.ok).toBe(false);
+    expect(out.classification.kind).toBe(ERROR_KIND.GATED);
+  });
+
+  it("classifies a transport error as cors / generic via classifyError", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const out = await probeUrlAndClassify("https://test/broken", fetchImpl);
+    expect(out.ok).toBe(false);
+    expect(out.classification.kind).toBe(ERROR_KIND.CORS);
+  });
+
+  it("falls back to globalThis.fetch when no impl is provided", async () => {
+    // Stub the global fetch just for this case so we don't hit the
+    // network. Restored after the test by vitest's beforeEach reset.
+    const stub = vi.fn(async () => new Response(null, { status: 206 }));
+    vi.stubGlobal("fetch", stub);
+    try {
+      const out = await probeUrlAndClassify("https://test/default");
+      expect(out.ok).toBe(true);
+      expect(stub).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("downloadToastFor / DOWNLOAD_TOAST_HINTS", () => {
+  it("maps every ERROR_KIND to a non-empty toast message", () => {
+    for (const kind of Object.values(ERROR_KIND)) {
+      expect(DOWNLOAD_TOAST_HINTS[kind]).toBeDefined();
+      expect(DOWNLOAD_TOAST_HINTS[kind].length).toBeGreaterThan(0);
+    }
+  });
+
+  it("returns the right hint per classification kind", () => {
+    expect(downloadToastFor({ kind: ERROR_KIND.GATED })).toContain("gated");
+    expect(downloadToastFor({ kind: ERROR_KIND.NOT_FOUND })).toContain(
+      "No source",
+    );
+    expect(downloadToastFor({ kind: ERROR_KIND.UPSTREAM_UNAVAILABLE })).toContain(
+      "unavailable",
+    );
+  });
+
+  it("falls back to GENERIC on null / unknown kind", () => {
+    expect(downloadToastFor(null)).toBe(DOWNLOAD_TOAST_HINTS[ERROR_KIND.GENERIC]);
+    expect(downloadToastFor({ kind: "nonsense" })).toBe(
+      DOWNLOAD_TOAST_HINTS[ERROR_KIND.GENERIC],
+    );
   });
 });
 

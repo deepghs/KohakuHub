@@ -292,7 +292,12 @@ import CodeViewer from "@/components/common/CodeViewer.vue";
 import ErrorState from "@/components/common/ErrorState.vue";
 import { copyToClipboard } from "@/utils/clipboard";
 import { normalizeCatchAllParam } from "@/utils/repo-paths";
-import { classifyError, classifyResponse } from "@/utils/http-errors";
+import {
+  classifyError,
+  classifyResponse,
+  downloadToastFor,
+  probeUrlAndClassify,
+} from "@/utils/http-errors";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useAuthStore } from "@/stores/auth";
 import { repoAPI } from "@/utils/api";
@@ -632,61 +637,24 @@ async function loadFileInfo() {
 }
 
 async function downloadFile() {
-  // Probe the resolve endpoint with a regular GET short-fetch before
-  // handing the browser off. If the backend already has an aggregated
-  // JSON error ready, we surface it as a toast with a kind-specific
-  // hint instead of dumping raw JSON into a new tab — which is what
-  // `window.open(fileUrl)` used to do on a gated repo.
-  //
-  // HEAD is not usable here: S3/MinIO presigned URLs are signed for
-  // GET only, so a HEAD through the 302 would 403. The backend's own
-  // /resolve/ HEAD route is signed differently and *would* work for a
-  // probe, but its response is still a 302 so we cannot read the
-  // aggregated body anyway. A quick abortable GET with a `Range: 0-0`
-  // is the cheapest reliable probe: the server returns the full HF
-  // metadata headers + (on error) the aggregated body, and we bail
-  // out after at most a couple of hundred bytes.
-  try {
-    const probe = await fetch(fileUrl.value, {
-      method: "GET",
-      headers: { Range: "bytes=0-0" },
-      redirect: "follow",
-    });
-    if (probe.ok) {
-      // Happy path — let the browser handle the real download. We
-      // intentionally re-issue rather than reuse `probe` so the
-      // Content-Disposition the server attaches to a full GET (not a
-      // Range probe) drives the filename.
-      window.open(fileUrl.value, "_blank");
-      return;
-    }
-    const classification = await classifyResponse(probe);
-    const hintByKind = {
-      gated:
-        "This repository is gated. Attach a Hugging Face token in Settings → Tokens, then retry.",
-      forbidden: "Upstream source denied access to this file.",
-      "not-found": "No source serves this file.",
-      "upstream-unavailable":
-        "Upstream source is unavailable right now. Retry shortly.",
-      cors:
-        "Download blocked by CORS on the storage host. See local-dev docs.",
-      generic: "Download failed. See browser console for the raw response.",
-    };
-    ElMessage({
-      type: "error",
-      message: hintByKind[classification.kind] || hintByKind.generic,
-      duration: 6000,
-    });
-  } catch (err) {
-    const classification = classifyError(err);
-    ElMessage({
-      type: "error",
-      message:
-        classification.detail ||
-        "Download failed — check your connection and retry.",
-      duration: 6000,
-    });
+  // Pre-flight probe via probeUrlAndClassify — issues a Range: 0-0 GET
+  // against the resolve endpoint so we can tell a gated/404/etc.
+  // failure apart from a successful stream. The happy path still
+  // goes through `window.open` so the browser owns the real download
+  // (filename-from-Content-Disposition, progress, cancel). On a
+  // classified failure we surface a toast with kind-specific copy
+  // instead of letting the browser render the aggregated JSON body
+  // as raw text in a new tab.
+  const { ok, classification } = await probeUrlAndClassify(fileUrl.value);
+  if (ok) {
+    window.open(fileUrl.value, "_blank");
+    return;
   }
+  ElMessage({
+    type: "error",
+    message: downloadToastFor(classification),
+    duration: 6000,
+  });
 }
 
 async function copyFileUrl() {

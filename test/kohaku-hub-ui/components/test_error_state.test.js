@@ -160,6 +160,32 @@ describe("ErrorState", () => {
     expect(text).toMatch(/-/);
   });
 
+  it("falls back on missing source fields when rendering the disclosure table", () => {
+    // Every field uses a `??` / `typeof === 'string' ? ... : ''` guard
+    // so a partial source object (e.g. backend adding a new field or
+    // a future test fixture omitting `url`/`status`) never renders a
+    // bare "undefined" or blows up the table.
+    const wrapper = mountWith({
+      classification: {
+        kind: ERROR_KIND.GATED,
+        sources: [
+          {}, // totally empty
+          { name: "With-only-name" },
+          { status: 500 }, // status-only
+        ],
+      },
+    });
+    const text = wrapper.text();
+    expect(text).toContain("Fallback sources tried (3)");
+    // Name column falls back to "(unknown)" / renders the explicit
+    // name when given, and status column renders "-" when missing.
+    expect(text).toContain("(unknown)");
+    expect(text).toContain("With-only-name");
+    expect(text).toContain("500");
+    // Ensure no bare "undefined" snuck through any column.
+    expect(text).not.toContain("undefined");
+  });
+
   it("omits the disclosure when sources is null / empty / non-array", () => {
     for (const sources of [null, undefined, [], "oops"]) {
       const wrapper = mountWith({
