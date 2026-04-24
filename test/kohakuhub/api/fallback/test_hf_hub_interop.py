@@ -637,3 +637,102 @@ async def test_pattern_D_all_5xx_raises_generic_HfHubHTTPError(monkeypatch):
     assert not isinstance(excinfo.value, GatedRepoError)
     assert not isinstance(excinfo.value, EntryNotFoundError)
     assert not isinstance(excinfo.value, RepositoryNotFoundError)
+
+
+# ---------------------------------------------------------------------------
+# Pattern E. Aggregate failures for non-resolve fallback operations
+# (tree / info / paths-info). Mirrors pattern D but with repo-level
+# scope: all-404 on tree / info must surface as RepositoryNotFoundError
+# on the hf_hub client, not EntryNotFoundError; paths-info keeps the
+# per-file EntryNotFound classification because it answers "is this
+# specific path present" not "does this repo exist".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pattern_E_tree_all_404_raises_RepositoryNotFoundError(monkeypatch):
+    """Every source 404s on tree → aggregate 404 with
+    X-Error-Code=RepoNotFound. hf_hub's hf_raise_for_status must
+    raise RepositoryNotFoundError, not EntryNotFoundError — the
+    failure is at the whole-repo scope."""
+    RepositoryNotFoundError = _hf_error("RepositoryNotFoundError")
+    from huggingface_hub.utils import hf_raise_for_status
+
+    monkeypatch.setattr(fallback_ops, "get_enabled_sources", lambda namespace, user_tokens=None: [
+        {"url": HF_ENDPOINT, "name": "HF", "source_type": "huggingface"},
+    ])
+    path = f"/api/models/owner/demo/tree/main/"
+    FakeFallbackClient.queue(
+        HF_ENDPOINT, "GET", path,
+        _content_response(404, url=f"{HF_ENDPOINT}{path}"),
+    )
+
+    resp = await fallback_ops.try_fallback_tree(
+        "model", "owner", "demo", "main",
+    )
+    hx = _to_hf_response(resp, request_url=f"{KHUB_BASE}{path}")
+    assert hx.status_code == 404
+    assert hx.headers.get("x-error-code") == "RepoNotFound"
+
+    with pytest.raises(RepositoryNotFoundError):
+        hf_raise_for_status(hx)
+
+
+@pytest.mark.asyncio
+async def test_pattern_E_info_all_401_raises_GatedRepoError(monkeypatch):
+    """At least one source 401s on info → aggregate 401 with
+    X-Error-Code=GatedRepo so hf_hub raises GatedRepoError. Parity
+    with the resolve-aggregate path proven in Pattern D."""
+    GatedRepoError = _hf_error("GatedRepoError")
+    from huggingface_hub.utils import hf_raise_for_status
+
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(fallback_ops, "get_enabled_sources", lambda namespace, user_tokens=None: [
+        {"url": HF_ENDPOINT, "name": "HF", "source_type": "huggingface"},
+    ])
+    path = f"/api/models/owner/gated/"
+    FakeFallbackClient.queue(
+        HF_ENDPOINT, "GET", path.rstrip("/"),
+        _content_response(
+            401,
+            content=b"Access to model owner/gated is restricted.",
+            url=f"{HF_ENDPOINT}{path.rstrip('/')}",
+        ),
+    )
+
+    resp = await fallback_ops.try_fallback_info("model", "owner", "gated")
+    hx = _to_hf_response(resp, request_url=f"{KHUB_BASE}{path.rstrip('/')}")
+    assert hx.status_code == 401
+    assert hx.headers.get("x-error-code") == "GatedRepo"
+
+    with pytest.raises(GatedRepoError):
+        hf_raise_for_status(hx)
+
+
+@pytest.mark.asyncio
+async def test_pattern_E_paths_info_all_404_raises_EntryNotFoundError(monkeypatch):
+    """paths-info is per-file — all-404 should stay EntryNotFound
+    (not RepoNotFound) so hf_hub raises EntryNotFoundError. The user
+    still knows the repo itself exists at the tree level; only this
+    specific path is missing."""
+    EntryNotFoundError = _hf_error("EntryNotFoundError")
+    from huggingface_hub.utils import hf_raise_for_status
+
+    monkeypatch.setattr(fallback_ops, "get_enabled_sources", lambda namespace, user_tokens=None: [
+        {"url": HF_ENDPOINT, "name": "HF", "source_type": "huggingface"},
+    ])
+    path = f"/api/models/owner/demo/paths-info/main"
+    FakeFallbackClient.queue(
+        HF_ENDPOINT, "POST", path,
+        _content_response(404, url=f"{HF_ENDPOINT}{path}"),
+    )
+
+    resp = await fallback_ops.try_fallback_paths_info(
+        "model", "owner", "demo", "main", ["nope.bin"],
+    )
+    hx = _to_hf_response(resp, request_url=f"{KHUB_BASE}{path}")
+    assert hx.status_code == 404
+    assert hx.headers.get("x-error-code") == "EntryNotFound"
+
+    with pytest.raises(EntryNotFoundError):
+        hf_raise_for_status(hx)

@@ -44,12 +44,27 @@
       </el-icon>
     </div>
 
-    <div v-else-if="error" class="text-center py-20">
-      <div class="i-carbon-warning text-6xl text-red-500 mb-4" />
-      <h2 class="text-2xl font-bold mb-2">File Not Found</h2>
-      <p class="text-gray-600 dark:text-gray-400 mb-4">{{ error }}</p>
-      <el-button @click="$router.back()">Go Back</el-button>
-    </div>
+    <ErrorState
+      v-else-if="errorClassification"
+      :classification="errorClassification"
+      mode="full-page"
+      :retry="loadFile"
+    >
+      <template #actions>
+        <div class="flex items-center gap-2 mt-4">
+          <el-button type="primary" plain @click="loadFile">Retry</el-button>
+          <el-button
+            v-if="errorClassification.kind === 'gated'"
+            type="primary"
+            @click="$router.push('/settings')"
+          >
+            <div class="i-carbon-settings inline-block mr-1" />
+            Open account settings
+          </el-button>
+          <el-button v-else @click="$router.back()">Go Back</el-button>
+        </div>
+      </template>
+    </ErrorState>
 
     <div v-else>
       <!-- File Header -->
@@ -274,8 +289,10 @@
 <script setup>
 import MarkdownViewer from "@/components/common/MarkdownViewer.vue";
 import CodeViewer from "@/components/common/CodeViewer.vue";
+import ErrorState from "@/components/common/ErrorState.vue";
 import { copyToClipboard } from "@/utils/clipboard";
 import { normalizeCatchAllParam } from "@/utils/repo-paths";
+import { classifyError, classifyResponse } from "@/utils/http-errors";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useAuthStore } from "@/stores/auth";
 import { repoAPI } from "@/utils/api";
@@ -302,7 +319,10 @@ const maxPreviewSize = 100 * 1000; // 100KB
 
 // State
 const loading = ref(true);
-const error = ref(null);
+// Classification payload from utils/http-errors.js shared across the
+// SPA. Replaces the pre-#28 "error string → generic 404 page" path
+// so a gated upstream no longer surfaces as "File Not Found".
+const errorClassification = ref(null);
 const fileContent = ref("");
 const fileSize = ref(0);
 const fileHeaders = ref({});
@@ -525,9 +545,16 @@ function formatSize(bytes) {
   return (bytes / (1000 * 1000 * 1000)).toFixed(1) + " GB";
 }
 
+// Thin retry-style wrapper the template's ErrorState binds to.
+// Kept as a dedicated export so the Retry button's click handler and
+// the initial onMounted call share the same name.
+async function loadFile() {
+  await loadFileInfo();
+}
+
 async function loadFileInfo() {
   loading.value = true;
-  error.value = null;
+  errorClassification.value = null;
 
   try {
     // Note: Presigned URLs are signed for GET method only
@@ -539,9 +566,11 @@ async function loadFileInfo() {
     if (canPreviewText.value || isMarkdown.value) {
       let retries = 0;
       const maxRetries = 10;
+      let lastResponse = null;
 
       while (retries < maxRetries) {
         const response = await fetch(fileUrl.value);
+        lastResponse = response;
 
         if (response.ok) {
           fileSize.value = parseInt(
@@ -549,21 +578,41 @@ async function loadFileInfo() {
           );
           fileHeaders.value = Object.fromEntries(response.headers.entries());
           fileContent.value = await response.text();
-          break;
+          return;
         }
 
-        // If 404, might be commit still processing - retry
-        if (response.status === 404 && retries < maxRetries - 1) {
+        // If 404 and no specific HF error code, commit might still be
+        // processing — retry a few times before surfacing. A 404 with
+        // an EntryNotFound / RepoNotFound code is already a terminal
+        // answer from the backend, so short-circuit out of the retry
+        // loop to avoid wasting the user's time.
+        const specificErrorCode =
+          response.headers.get("x-error-code") ||
+          response.headers.get("X-Error-Code");
+        if (
+          response.status === 404 &&
+          !specificErrorCode &&
+          retries < maxRetries - 1
+        ) {
           console.log(
             `File not ready yet (attempt ${retries + 1}/${maxRetries}), retrying...`,
           );
-          await new Promise((resolve) => setTimeout(resolve, 500)); // Wait 500ms
+          await new Promise((resolve) => setTimeout(resolve, 500));
           retries++;
           continue;
         }
 
-        // Other errors or max retries reached
-        throw new Error("File not found");
+        // Terminal non-2xx: surface the classified error instead of a
+        // bare "File not found" string.
+        errorClassification.value = await classifyResponse(response);
+        return;
+      }
+
+      // Exhausted retries without ever getting a 2xx — still classify
+      // the last response so the user sees why (almost certainly 404
+      // without an error code at this point).
+      if (lastResponse) {
+        errorClassification.value = await classifyResponse(lastResponse);
       }
     } else {
       // For media/binary files, we don't need size upfront
@@ -573,15 +622,71 @@ async function loadFileInfo() {
       fileHeaders.value = {};
     }
   } catch (err) {
-    error.value = err.message || "Failed to load file";
+    // Transport-level failure (CORS, network, abort). Classification
+    // downgrades to `cors` / `generic` with a usable hint.
+    errorClassification.value = classifyError(err);
     console.error("Failed to load file:", err);
   } finally {
     loading.value = false;
   }
 }
 
-function downloadFile() {
-  window.open(fileUrl.value, "_blank");
+async function downloadFile() {
+  // Probe the resolve endpoint with a regular GET short-fetch before
+  // handing the browser off. If the backend already has an aggregated
+  // JSON error ready, we surface it as a toast with a kind-specific
+  // hint instead of dumping raw JSON into a new tab — which is what
+  // `window.open(fileUrl)` used to do on a gated repo.
+  //
+  // HEAD is not usable here: S3/MinIO presigned URLs are signed for
+  // GET only, so a HEAD through the 302 would 403. The backend's own
+  // /resolve/ HEAD route is signed differently and *would* work for a
+  // probe, but its response is still a 302 so we cannot read the
+  // aggregated body anyway. A quick abortable GET with a `Range: 0-0`
+  // is the cheapest reliable probe: the server returns the full HF
+  // metadata headers + (on error) the aggregated body, and we bail
+  // out after at most a couple of hundred bytes.
+  try {
+    const probe = await fetch(fileUrl.value, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+      redirect: "follow",
+    });
+    if (probe.ok) {
+      // Happy path — let the browser handle the real download. We
+      // intentionally re-issue rather than reuse `probe` so the
+      // Content-Disposition the server attaches to a full GET (not a
+      // Range probe) drives the filename.
+      window.open(fileUrl.value, "_blank");
+      return;
+    }
+    const classification = await classifyResponse(probe);
+    const hintByKind = {
+      gated:
+        "This repository is gated. Attach a Hugging Face token in Settings → Tokens, then retry.",
+      forbidden: "Upstream source denied access to this file.",
+      "not-found": "No source serves this file.",
+      "upstream-unavailable":
+        "Upstream source is unavailable right now. Retry shortly.",
+      cors:
+        "Download blocked by CORS on the storage host. See local-dev docs.",
+      generic: "Download failed. See browser console for the raw response.",
+    };
+    ElMessage({
+      type: "error",
+      message: hintByKind[classification.kind] || hintByKind.generic,
+      duration: 6000,
+    });
+  } catch (err) {
+    const classification = classifyError(err);
+    ElMessage({
+      type: "error",
+      message:
+        classification.detail ||
+        "Download failed — check your connection and retry.",
+      duration: 6000,
+    });
+  }
 }
 
 async function copyFileUrl() {

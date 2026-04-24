@@ -223,7 +223,11 @@ def build_fallback_attempt(
     return base
 
 
-def build_aggregate_failure_response(attempts: list[dict]) -> JSONResponse:
+def build_aggregate_failure_response(
+    attempts: list[dict],
+    *,
+    scope: str = "file",
+) -> JSONResponse:
     """Combine per-source attempts into one HTTP response.
 
     Status priority (highest first): 401 > 403 > 404 > 502. The
@@ -236,10 +240,21 @@ def build_aggregate_failure_response(attempts: list[dict]) -> JSONResponse:
     huggingface_hub.utils._http.hf_raise_for_status**:
 
     - 401 → ``GatedRepo`` → ``GatedRepoError`` on the client
-    - 404 (all attempts) → ``EntryNotFound`` → ``EntryNotFoundError``
+    - 404 (all attempts) → ``EntryNotFound`` / ``RepoNotFound``
+      depending on ``scope`` (see below) → ``EntryNotFoundError`` or
+      ``RepositoryNotFoundError``
     - 403, 502 → no ``X-Error-Code`` (HF client falls back to generic
       ``HfHubHTTPError``; for 5xx its retry path handles transient
       upstream issues).
+
+    ``scope`` picks the right 404 classification for the caller:
+
+    - ``"file"`` (default) — per-file operation (``resolve``,
+      ``paths-info``). All-404 → ``EntryNotFound`` so the client
+      raises ``EntryNotFoundError``.
+    - ``"repo"`` — repo-level operation (``info``, ``tree``).
+      All-404 → ``RepoNotFound`` so the client raises
+      ``RepositoryNotFoundError``.
 
     Putting the code in the header (not just the body) matters because
     ``huggingface_hub`` reads ``X-Error-Code`` to decide which exception
@@ -263,8 +278,12 @@ def build_aggregate_failure_response(attempts: list[dict]) -> JSONResponse:
         detail = "Upstream source denied access."
     elif attempts and categories <= {CATEGORY_NOT_FOUND}:
         status_code = 404
-        error_code = "EntryNotFound"
-        detail = "No fallback source serves this file."
+        if scope == "repo":
+            error_code = "RepoNotFound"
+            detail = "No fallback source serves this repository."
+        else:
+            error_code = "EntryNotFound"
+            detail = "No fallback source serves this file."
     else:
         # 5xx / timeout / network mix (or an edge-case "other" category).
         status_code = 502
