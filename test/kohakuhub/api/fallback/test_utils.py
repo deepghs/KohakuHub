@@ -66,6 +66,7 @@ def test_extract_error_message_falls_back_to_text_and_status():
     ("status_code", "should_retry"),
     [
         (200, False),
+        (302, False),  # 3xx falls through to the default "don't retry" branch
         (400, False),
         (401, False),
         (403, False),
