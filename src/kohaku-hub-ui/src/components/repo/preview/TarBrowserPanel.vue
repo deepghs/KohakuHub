@@ -28,10 +28,12 @@ import {
   downloadBytesAs,
 } from "@/utils/indexed-tar";
 import { classifyError } from "@/utils/http-errors";
+import { useThumbnailToggle, isImageMember } from "@/utils/tar-thumbnail";
 import ErrorState from "@/components/common/ErrorState.vue";
 import CodeViewer from "@/components/common/CodeViewer.vue";
 import MarkdownViewer from "@/components/common/MarkdownViewer.vue";
 import FilePreviewDialog from "@/components/repo/preview/FilePreviewDialog.vue";
+import TarMemberThumbnail from "@/components/repo/preview/TarMemberThumbnail.vue";
 import { ElMessage } from "element-plus";
 
 const props = defineProps({
@@ -379,6 +381,22 @@ function fileExtension(name) {
   return m ? m[1].toLowerCase() : "";
 }
 
+// Image-thumbnail toggle. Persisted globally in localStorage so the
+// user's choice survives modal re-opens and even tab navigation.
+// Default ON; flipping OFF skips ALL extraction work for image rows
+// (no Range read, no IO subscription, no cache lookup) — just the
+// generic placeholder icon, same as before this feature landed.
+const { enabled: thumbnailsEnabled, setEnabled: setThumbnailsEnabled } =
+  useThumbnailToggle();
+
+function shouldRenderThumbnail(entry) {
+  return (
+    thumbnailsEnabled.value &&
+    entry.type !== "dir" &&
+    isImageMember(entry)
+  );
+}
+
 // Inner FilePreviewDialog stays closed until the user explicitly
 // clicks "Open metadata preview". Auto-opening it on prop change
 // would race with the member view itself, leave the inner overlay
@@ -668,6 +686,20 @@ watch(innerPreviewProps, (val) => {
             Up
           </el-button>
           <span class="flex-1" />
+          <el-tooltip
+            content="Toggle in-listing thumbnails (saved across sessions)"
+            placement="top"
+          >
+            <el-switch
+              :model-value="thumbnailsEnabled"
+              @update:model-value="setThumbnailsEnabled"
+              size="small"
+              inline-prompt
+              active-text="thumbs"
+              inactive-text="thumbs"
+              data-testid="tar-thumbnail-toggle"
+            />
+          </el-tooltip>
           <el-radio-group v-model="viewMode" size="small">
             <el-radio-button label="list">
               <div class="i-carbon-list inline-block" />
@@ -709,7 +741,15 @@ watch(innerPreviewProps, (val) => {
             class="flex items-center gap-3 px-3 py-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 border-b border-gray-100 dark:border-gray-800 last:border-b-0"
             @click="entry.type === 'dir' ? enterFolder(entry) : openMember(entry)"
           >
+            <TarMemberThumbnail
+              v-if="shouldRenderThumbnail(entry)"
+              :tar-url="props.tarUrl"
+              :member="entry"
+              :placeholder-icon="iconForFile(entry.name)"
+              :size="28"
+            />
             <div
+              v-else
               :class="
                 entry.type === 'dir'
                   ? 'i-carbon-folder text-blue-500'
@@ -755,7 +795,16 @@ watch(innerPreviewProps, (val) => {
             class="border border-gray-200 dark:border-gray-700 rounded p-3 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 flex flex-col items-center text-center"
             @click="entry.type === 'dir' ? enterFolder(entry) : openMember(entry)"
           >
+            <TarMemberThumbnail
+              v-if="shouldRenderThumbnail(entry)"
+              :tar-url="props.tarUrl"
+              :member="entry"
+              :placeholder-icon="iconForFile(entry.name)"
+              :size="56"
+              class="mb-2"
+            />
             <div
+              v-else
               :class="
                 entry.type === 'dir'
                   ? 'i-carbon-folder text-blue-500'

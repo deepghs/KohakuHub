@@ -141,6 +141,14 @@ beforeEach(() => {
   URL.createObjectURL = vi.fn(() => "blob:mock/abc");
   URL.revokeObjectURL = vi.fn();
 
+  // The panel now embeds <TarMemberThumbnail> for image rows; with
+  // thumbnails ON it would issue extra Range reads against the .tar
+  // URL on mount, polluting the fetch counters in download-path
+  // tests. Disable the global toggle for the panel suite — the
+  // thumbnail behaviour itself is exhaustively covered in
+  // test_tar_member_thumbnail.test.js.
+  localStorage.setItem("kohaku-tar-thumbnail-enabled", "0");
+
   // The panel constructs `new AbortController()` inside its setup
   // and passes the signal to fetch. Under vitest + jsdom + Node 24,
   // signals constructed inside the Vue component scope fail
