@@ -3345,21 +3345,21 @@ def build_open_media_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
 def build_big_indexed_tar_pagination_seeds() -> tuple[RepoSeed, ...]:
     """Pagination UAT fixture.
 
-    A single dataset whose root carries 1000 hfutils.index-compatible
-    tar/json pairs (so 2000 entries plus a README) — enough for the
-    file-list pager to walk through 40 pages at the default 50/page,
-    and exactly 10 at the 200/page setting. Reusing one identical
-    bundle across every pair keeps the seed cheap (single tar+index
-    materialization) while still exercising the listing surface
-    against real LakeFS object counts: LakeFS dedupes by content
-    hash, so the underlying storage stays small even though the
-    repo metadata grows. The two halves of each pair are adjacent
-    alphabetically, which is the "loaded-listing fast path" the
-    sidecar predicate prefers — the HEAD-probe fallback is
-    exercised separately by the unit tests.
+    A single dataset whose root carries 250 hfutils.index-compatible
+    tar/json pairs (so 500 entries plus a README) — enough for the
+    file-list pager to walk through 10 pages at the default 50/page,
+    and 3 pages at the 200/page setting, while keeping the initial
+    seed under a minute. Reusing one identical bundle across every
+    pair keeps the seed cheap (single tar+index materialization)
+    while still exercising the listing surface against real LakeFS
+    object counts: LakeFS dedupes by content hash, so the underlying
+    storage stays small even though the repo metadata grows. The two
+    halves of each pair are adjacent alphabetically, which is the
+    "loaded-listing fast path" the sidecar predicate prefers — the
+    HEAD-probe fallback is exercised separately by the unit tests.
     """
 
-    bundle_count = 1000
+    bundle_count = 250
 
     bundle_cache: dict[str, tuple[bytes, bytes]] = {}
 
@@ -3395,8 +3395,8 @@ def build_big_indexed_tar_pagination_seeds() -> tuple[RepoSeed, ...]:
                 Pagination UAT fixture: {bundle_count} hfutils.index-compatible
                 tar/json pairs sit under `archives/` so the new file-list
                 pager can be exercised against a directory that genuinely
-                needs paging. Default 50 entries/page → 40 pages; 200/page
-                → 10. The two halves of each pair are alphabetically
+                needs paging. Default 50 entries/page → 10 pages; 200/page
+                → 3. The two halves of each pair are alphabetically
                 adjacent so the indexed-tar icon lights up via the loaded
                 listing — the HEAD-probe fallback is covered by the unit
                 tests in `test_repo_viewer_paths.test.js`.
