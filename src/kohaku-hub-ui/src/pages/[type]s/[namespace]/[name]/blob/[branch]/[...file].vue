@@ -305,7 +305,7 @@ import MarkdownViewer from "@/components/common/MarkdownViewer.vue";
 import CodeViewer from "@/components/common/CodeViewer.vue";
 import ErrorState from "@/components/common/ErrorState.vue";
 import TarBrowserPanel from "@/components/repo/preview/TarBrowserPanel.vue";
-import { hasIndexSibling } from "@/utils/indexed-tar";
+import { hasIndexSibling, tarSidecarPath } from "@/utils/indexed-tar";
 import { copyToClipboard } from "@/utils/clipboard";
 import { normalizeCatchAllParam } from "@/utils/repo-paths";
 import {
@@ -708,7 +708,30 @@ async function detectIndexedTar() {
     {},
   );
   const entries = response.data || [];
-  if (!hasIndexSibling(filePath.value, entries)) return;
+  // Loaded-listing fast path mirrors the RepoViewer behaviour. The
+  // listing returns up to TREE_PAGE_SIZE (1000) entries — enough to
+  // cover most directories — but a single folder can hold more than
+  // that, in which case the sidecar might sit on a later page.
+  if (hasIndexSibling(filePath.value, entries)) {
+    const tarEntry = entries.find((e) => e.path === filePath.value);
+    if (tarEntry) indexedTarTreeEntry.value = tarEntry;
+    isIndexedTar.value = true;
+    return;
+  }
+  // Fallback: probe the sidecar directly via HEAD /resolve/. Cheap
+  // enough that running it on every blob page open is fine, and
+  // unblocks indexed-tar UX once the parent folder grows past the
+  // single tree-page cap.
+  const sidecar = tarSidecarPath(filePath.value);
+  if (!sidecar) return;
+  const exists = await repoAPI.fileExists(
+    repoType.value,
+    namespace.value,
+    name.value,
+    branch.value,
+    sidecar,
+  );
+  if (!exists) return;
   const tarEntry = entries.find((e) => e.path === filePath.value);
   if (tarEntry) indexedTarTreeEntry.value = tarEntry;
   isIndexedTar.value = true;

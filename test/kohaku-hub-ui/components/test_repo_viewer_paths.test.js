@@ -2,7 +2,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { http } from "@/testing/msw";
+import { http, HttpResponse } from "@/testing/msw";
 import { ElementPlusStubs, RouterLinkStub } from "../helpers/vue";
 import {
   cloneFixture,
@@ -134,7 +134,11 @@ describe("RepoViewer path handling", () => {
       {
         name: "hierarchy-crawl-fixtures",
         path: "/catalog",
-        params: { recursive: "false" },
+        // The file list now requests one page at a time. The page-size
+        // pref defaults to 50 (utils/repo-list-pagination.js); paginated
+        // listing reduces the wire volume on large directories without
+        // changing how the SPA reads back individual entries.
+        params: { recursive: "false", limit: "50" },
       },
     ]);
     expect(requests.pathsInfo).toEqual([
@@ -578,6 +582,289 @@ describe("RepoViewer path handling", () => {
     // The misleading "No files" / empty-tree copy must NOT be shown
     // once we have a classified error.
     expect(wrapper.text()).not.toContain("No files");
+
+    wrapper.unmount();
+  });
+
+  it("paginates the file list: defaults to 50/page, advances via the cursor in Link rel=next, and walks back via First/Prev", async () => {
+    // Two-page directory. Backend hands a `Link: rel=next` header with
+    // a cursor on page 1; the SPA must request the same path with that
+    // cursor for page 2 and stop following on the empty-cursor response.
+    let page1Calls = 0;
+    let page2Calls = 0;
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
+        ({ request }) => {
+          const url = new URL(request.url);
+          const cursor = url.searchParams.get("cursor");
+          const limit = url.searchParams.get("limit");
+          expect(limit).toBe("50");
+          if (!cursor) {
+            page1Calls += 1;
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/a-first.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog?recursive=false&limit=50&cursor=cursor-2>; rel="next"',
+                },
+              },
+            );
+          }
+          expect(cursor).toBe("cursor-2");
+          page2Calls += 1;
+          return jsonResponse([
+            {
+              type: "file",
+              path: "catalog/z-last.txt",
+              size: 2,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]);
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "catalog" });
+    await flushPromises();
+    await flushPromises();
+
+    expect(page1Calls).toBe(1);
+    expect(wrapper.find('[data-testid="file-list-pager"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("a-first.txt");
+    expect(wrapper.text()).not.toContain("z-last.txt");
+    expect(wrapper.text()).toContain("Page 1");
+
+    const nextBtn = wrapper.find('[data-testid="file-list-page-next"]');
+    expect(nextBtn.exists()).toBe(true);
+    await nextBtn.trigger("click");
+    await flushPromises();
+    await flushPromises();
+
+    expect(page2Calls).toBe(1);
+    expect(wrapper.text()).toContain("z-last.txt");
+    expect(wrapper.text()).not.toContain("a-first.txt");
+    expect(wrapper.text()).toContain("Page 2");
+    // Page 2 was the tail (no Link rel=next), so Next disables itself.
+    expect(
+      wrapper.find('[data-testid="file-list-page-next"]').attributes("disabled"),
+    ).toBeDefined();
+
+    // Prev returns to page 1 reusing the stored stack (no extra fetch
+    // beyond the page-1 reload — backend can't seek backward, so the UI
+    // re-issues the cursor-less first-page request).
+    await wrapper.find('[data-testid="file-list-page-prev"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+    expect(page1Calls).toBe(2);
+    expect(wrapper.text()).toContain("a-first.txt");
+    expect(wrapper.text()).toContain("Page 1");
+
+    wrapper.unmount();
+  });
+
+  it("changing the page-size selector resets to page 1, persists the choice in localStorage, and re-fetches with the new limit", async () => {
+    const observed = [];
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
+        ({ request }) => {
+          const url = new URL(request.url);
+          observed.push({
+            limit: url.searchParams.get("limit"),
+            cursor: url.searchParams.get("cursor"),
+          });
+          return jsonResponse(
+            [
+              {
+                type: "file",
+                path: "catalog/a-first.txt",
+                size: 1,
+                lastModified: "2026-04-21T13:53:39.000000Z",
+              },
+            ],
+            {
+              headers: {
+                Link: '<https://hub.test/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog?recursive=false&limit=50&cursor=cursor-2>; rel="next"',
+              },
+            },
+          );
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "catalog" });
+    await flushPromises();
+    await flushPromises();
+
+    // Default first-page request uses limit=50, no cursor.
+    expect(observed[0]).toEqual({ limit: "50", cursor: null });
+
+    const select = wrapper.find('[data-testid="file-list-page-size"]');
+    expect(select.exists()).toBe(true);
+
+    // ElSelect renders as a stub here — drive the change handler
+    // directly (the el-select stub doesn't render real <option>s in
+    // jsdom). Mirrors how page-size widgets are exercised elsewhere
+    // in the suite.
+    const componentVm = wrapper.vm;
+    componentVm.changeFileListPageSize(100);
+    await flushPromises();
+    await flushPromises();
+
+    // New fetch lands with the new limit AND no cursor — switching size
+    // resets the stack because the previous cursors were minted at the
+    // old page size and don't address the same slice anymore.
+    const last = observed[observed.length - 1];
+    expect(last).toEqual({ limit: "100", cursor: null });
+    expect(localStorage.getItem("kohaku-repo-file-list-page-size")).toBe(
+      "100",
+    );
+
+    wrapper.unmount();
+  });
+
+  it("indexed-tar sibling icon: lights up when the .json sibling exists on a different page and stays dark when HEAD says it does not", async () => {
+    const headProbes = [];
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main",
+        () =>
+          jsonResponse([
+            {
+              type: "file",
+              path: "with-sibling.tar",
+              size: 100,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+            {
+              type: "file",
+              path: "no-sibling.tar",
+              size: 100,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]),
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+      // HEAD probes mimic the backend: 200 for the existing sidecar,
+      // 404 for the bare tar's missing sidecar.
+      http.head(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/resolve/main/with-sibling.json",
+        () => {
+          headProbes.push("with-sibling.json");
+          return new HttpResponse(null, { status: 200 });
+        },
+      ),
+      http.head(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/resolve/main/no-sibling.json",
+        () => {
+          headProbes.push("no-sibling.json");
+          return new HttpResponse(null, { status: 404 });
+        },
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "" });
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    // Both probes should have fired exactly once (one per .tar row
+    // whose sibling is not in the loaded page).
+    expect(headProbes.sort()).toEqual([
+      "no-sibling.json",
+      "with-sibling.json",
+    ]);
+
+    // The confirmed tar gets the indexed-tar icon (Carbon's archive),
+    // the unconfirmed one stays bare.
+    const previewButtons = wrapper.findAll(
+      "button[aria-label^='Preview metadata for'], button[aria-label^='Preview metadata for ']",
+    );
+    // ElButton stubs render as <button>; iterate all of them and
+    // collect the ones the icon predicate says are previewable.
+    const allButtons = wrapper.findAll("button");
+    const tarPreviewButtons = allButtons.filter((b) =>
+      (b.attributes("aria-label") || "").startsWith("Preview metadata for"),
+    );
+    const titles = tarPreviewButtons.map((b) => b.attributes("title") || "");
+    // One previewable .tar row only — the confirmed one.
+    expect(tarPreviewButtons).toHaveLength(1);
+    expect(titles[0]).toContain("Browse indexed tar contents");
+    // unused alias kept to silence the linter when the future patch
+    // adds a second selector — drop on the next touch.
+    void previewButtons;
+
+    wrapper.unmount();
+  });
+
+  it("indexed-tar sibling icon short-circuits when the .json is in the loaded page (no HEAD probe issued)", async () => {
+    const headSpy = vi.fn(() => new HttpResponse(null, { status: 500 }));
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main",
+        () =>
+          jsonResponse([
+            {
+              type: "file",
+              path: "bundle.tar",
+              size: 100,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+            {
+              type: "file",
+              path: "bundle.json",
+              size: 50,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]),
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+      http.head(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/resolve/main/bundle.json",
+        headSpy,
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "" });
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    // The icon should already be lit from the loaded-listing fast
+    // path — and the probe must NOT fire, otherwise the cheap path is
+    // doing wasted work on every paginated render.
+    expect(headSpy).not.toHaveBeenCalled();
+    const previewBtn = wrapper
+      .findAll("button")
+      .find((b) =>
+        (b.attributes("aria-label") || "").startsWith("Preview metadata for bundle.tar"),
+      );
+    expect(previewBtn).toBeTruthy();
+    expect(previewBtn.attributes("title")).toContain(
+      "Browse indexed tar contents",
+    );
 
     wrapper.unmount();
   });

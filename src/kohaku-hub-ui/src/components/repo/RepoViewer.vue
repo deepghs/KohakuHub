@@ -379,8 +379,14 @@
               <span
                 class="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap"
               >
-                {{ fileTree.length }}
-                {{ fileTree.length === 1 ? "file" : "files" }}
+                <template v-if="fileListHasPrev || fileListHasNext">
+                  Page {{ fileListPageIndex }} ·
+                  {{ fileTree.length }} on this page
+                </template>
+                <template v-else>
+                  {{ fileTree.length }}
+                  {{ fileTree.length === 1 ? "file" : "files" }}
+                </template>
               </span>
             </div>
 
@@ -521,7 +527,7 @@
                   <div class="font-medium truncate flex items-center gap-2">
                     <span class="truncate">{{ getFileName(file.path) }}</span>
                     <button
-                      v-if="canPreviewFile(file, fileTree)"
+                      v-if="canPreviewFileRow(file)"
                       type="button"
                       class="relative z-20 flex-shrink-0 text-gray-400 hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
                       :title="previewIconTitle(file)"
@@ -587,9 +593,75 @@
                 <div
                   class="i-carbon-document-blank text-6xl mb-4 inline-block"
                 />
-                <p>No files found</p>
+                <p v-if="fileSearchQuery">
+                  No files match "{{ fileSearchQuery }}" on this page
+                </p>
+                <p v-else>No files found</p>
               </div>
             </template>
+          </div>
+
+          <!--
+            File-list pager. Hidden until there is at least one extra
+            page to navigate to (or back from) so a small repo does
+            not see scaffolding it has no use for. Cursor-based: the
+            backend returns LakeFS' opaque `next_offset`, no `total`,
+            so jump-to-page-N is intentionally out of scope here.
+          -->
+          <div
+            v-if="!filesLoading && (fileListHasPrev || fileListHasNext)"
+            class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+            data-testid="file-list-pager"
+          >
+            <div class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
+              <span>Per page:</span>
+              <el-select
+                :model-value="fileListPageSize"
+                size="small"
+                class="w-24"
+                data-testid="file-list-page-size"
+                @change="changeFileListPageSize"
+              >
+                <el-option
+                  v-for="size in FILE_LIST_PAGE_SIZE_OPTIONS"
+                  :key="size"
+                  :label="String(size)"
+                  :value="size"
+                />
+              </el-select>
+            </div>
+            <div class="flex items-center gap-2">
+              <el-button
+                size="small"
+                :disabled="!fileListHasPrev || filesLoading"
+                data-testid="file-list-page-first"
+                @click="goToFirstFileListPage"
+              >
+                <div class="i-carbon-skip-back inline-block mr-1" />
+                First
+              </el-button>
+              <el-button
+                size="small"
+                :disabled="!fileListHasPrev || filesLoading"
+                data-testid="file-list-page-prev"
+                @click="goToPrevFileListPage"
+              >
+                <div class="i-carbon-chevron-left inline-block mr-1" />
+                Prev
+              </el-button>
+              <span class="text-sm text-gray-600 dark:text-gray-400 px-1">
+                Page {{ fileListPageIndex }}
+              </span>
+              <el-button
+                size="small"
+                :disabled="!fileListHasNext || filesLoading"
+                data-testid="file-list-page-next"
+                @click="goToNextFileListPage"
+              >
+                Next
+                <div class="i-carbon-chevron-right inline-block ml-1" />
+              </el-button>
+            </div>
           </div>
         </div>
 
@@ -939,6 +1011,13 @@ import {
   canPreviewFile,
   getPreviewKind,
 } from "@/utils/file-preview";
+import { tarSidecarPath } from "@/utils/indexed-tar";
+import {
+  DEFAULT_PAGE_SIZE as DEFAULT_FILE_LIST_PAGE_SIZE,
+  VALID_PAGE_SIZES as FILE_LIST_PAGE_SIZES,
+  readPageSize as readFileListPageSize,
+  writePageSize as writeFileListPageSize,
+} from "@/utils/repo-list-pagination";
 
 /**
  * @typedef {Object} Props
@@ -988,6 +1067,37 @@ const likingInProgress = ref(false);
 const deletingFolder = ref(false);
 const fileTreeRequestId = ref(0);
 
+// Paging state for the file list. The backend exposes opaque LakeFS
+// `next_offset` cursors only — random-page jumps would require a count
+// the wire format doesn't carry. So the UI keeps a `cursorStack` of
+// previously-visited cursors for Prev navigation and the page index is
+// derived (1-based) from its length.
+//
+// `nextCursor` mirrors the response's `next_cursor`; presence drives
+// the Next button's enabled state. `currentCursor` is the cursor used
+// to fetch the current page (null on page 1) and is what we re-issue
+// when the user changes page size or refreshes after a delete.
+const fileListPageSize = ref(DEFAULT_FILE_LIST_PAGE_SIZE);
+const fileListCursorStack = ref([]);
+const fileListCurrentCursor = ref(null);
+const fileListNextCursor = ref(null);
+const fileListPageIndex = computed(() => fileListCursorStack.value.length + 1);
+const fileListHasPrev = computed(() => fileListCursorStack.value.length > 0);
+const fileListHasNext = computed(() => Boolean(fileListNextCursor.value));
+const FILE_LIST_PAGE_SIZE_OPTIONS = FILE_LIST_PAGE_SIZES;
+
+// Indexed-tar sibling-icon probe state. The sync `hasIndexSibling`
+// lookup runs against the loaded page first (cheap); when a `.tar`
+// row's `.json` sibling is not in the page, we issue a HEAD against
+// /resolve/<sibling.json> so the icon can still light up. Two reactive
+// sets memoize the answer per (currentBranch, currentPath, page) so
+// flipping back-and-forth never reissues the probe:
+//   * `confirmedIndexedTars`  — sidecar exists  → icon lights up
+//   * `rejectedIndexedTars`   — sidecar missing → row stays bare
+const confirmedIndexedTars = ref(new Set());
+const rejectedIndexedTars = ref(new Set());
+let pendingIndexedTarProbeId = 0;
+
 // Client-side metadata preview (issue #27 v4): a small icon appears next
 // to .safetensors / .parquet rows; clicking opens a modal that reads the
 // file header via HTTP Range against /resolve/ (no backend parsing).
@@ -1009,16 +1119,28 @@ const PREVIEW_ICON_BY_KIND = {
 };
 
 function previewIconClass(file) {
-  const kind = getPreviewKind(file.path, fileTree.value);
+  const kind = getPreviewKind(
+    file.path,
+    fileTree.value,
+    confirmedIndexedTars.value,
+  );
   return PREVIEW_ICON_BY_KIND[kind] || "i-carbon-chart-line-data";
 }
 
 function previewIconTitle(file) {
-  const kind = getPreviewKind(file.path, fileTree.value);
+  const kind = getPreviewKind(
+    file.path,
+    fileTree.value,
+    confirmedIndexedTars.value,
+  );
   if (kind === "indexed-tar") {
     return "Browse indexed tar contents (Range-read, no full download)";
   }
   return `Preview ${kind} metadata (Range-read, no download)`;
+}
+
+function canPreviewFileRow(file) {
+  return canPreviewFile(file, fileTree.value, confirmedIndexedTars.value);
 }
 
 function buildResolveForPath(path) {
@@ -1033,7 +1155,11 @@ function buildResolveForPath(path) {
 }
 
 function openFilePreview(file) {
-  const kind = getPreviewKind(file.path, fileTree.value);
+  const kind = getPreviewKind(
+    file.path,
+    fileTree.value,
+    confirmedIndexedTars.value,
+  );
   if (!kind) return;
   if (kind === "indexed-tar") {
     const dot = file.path.lastIndexOf(".");
@@ -1374,37 +1500,50 @@ async function toggleLike() {
   }
 }
 
-async function loadFileTree() {
+async function loadFileTree({ cursor = null, resetStack = true } = {}) {
   filesLoading.value = true;
   treeErrorClassification.value = null;
   const requestId = fileTreeRequestId.value + 1;
   fileTreeRequestId.value = requestId;
 
+  if (resetStack) {
+    fileListCursorStack.value = [];
+  }
+
   let sortedEntries = [];
+  let nextCursor = null;
 
   try {
-    const data = await repoAPI.listTreeAll(
+    const page = await repoAPI.listTreePage(
       props.repoType,
       props.namespace,
       props.name,
       currentBranch.value,
       props.currentPath ? `/${props.currentPath}` : "",
-      { recursive: false },
+      {
+        recursive: false,
+        limit: fileListPageSize.value,
+        cursor: cursor || undefined,
+      },
     );
 
     if (requestId !== fileTreeRequestId.value) return;
 
-    sortedEntries = sortFileEntries(data || []);
+    sortedEntries = sortFileEntries(page.entries || []);
+    nextCursor = page.nextCursor || null;
     fileTree.value = sortedEntries;
+    fileListCurrentCursor.value = cursor || null;
+    fileListNextCursor.value = nextCursor;
 
     if (sortedEntries.length === 0) {
       return;
     }
-
   } catch (err) {
     console.error("Failed to load file tree:", err);
     if (requestId === fileTreeRequestId.value) {
       fileTree.value = [];
+      fileListNextCursor.value = null;
+      fileListCurrentCursor.value = cursor || null;
       // Axios interceptor in utils/api.js attaches `.classification`.
       // Prefer it; fall back to classifying the bare error ourselves
       // if a future refactor changes the interceptor.
@@ -1420,6 +1559,12 @@ async function loadFileTree() {
   if (sortedEntries.length === 0 || requestId !== fileTreeRequestId.value) {
     return;
   }
+
+  // Sibling-icon probe pass for `.tar` rows on this page that did NOT
+  // ship a sibling `.json` in the loaded entries. The probe fires
+  // strictly off the loaded slice — paths-info / expanded metadata
+  // below run in parallel and don't depend on it.
+  void probeMissingIndexedTarSiblings(sortedEntries, requestId);
 
   try {
     const pathInfoByPath = new Map();
@@ -1454,13 +1599,108 @@ async function loadFileTree() {
   }
 }
 
+async function probeMissingIndexedTarSiblings(entries, requestId) {
+  // Reset memoized probe outcomes whenever the page slice changes —
+  // a paginate / branch-switch / path-change can introduce a new
+  // sibling that we have a "missing" answer cached for.
+  pendingIndexedTarProbeId += 1;
+  const probeId = pendingIndexedTarProbeId;
+  confirmedIndexedTars.value = new Set();
+  rejectedIndexedTars.value = new Set();
+
+  const pageHasSibling = new Set(
+    entries
+      .filter((entry) => entry && entry.type !== "directory")
+      .map((entry) => entry.path),
+  );
+
+  const pending = [];
+  for (const entry of entries) {
+    if (!entry || entry.type === "directory") continue;
+    const sidecar = tarSidecarPath(entry.path);
+    if (!sidecar) continue;
+    if (pageHasSibling.has(sidecar)) continue;
+    pending.push({ tarPath: entry.path, sidecar });
+  }
+  if (pending.length === 0) return;
+
+  await Promise.all(
+    pending.map(async ({ tarPath, sidecar }) => {
+      const exists = await repoAPI.fileExists(
+        props.repoType,
+        props.namespace,
+        props.name,
+        currentBranch.value,
+        sidecar,
+      );
+      if (
+        probeId !== pendingIndexedTarProbeId ||
+        requestId !== fileTreeRequestId.value
+      ) {
+        return;
+      }
+      if (exists) {
+        // Reassign the Set so reactivity picks the change up — Vue
+        // tracks the ref binding, not the in-place .add() mutation.
+        const next = new Set(confirmedIndexedTars.value);
+        next.add(tarPath);
+        confirmedIndexedTars.value = next;
+      } else {
+        const next = new Set(rejectedIndexedTars.value);
+        next.add(tarPath);
+        rejectedIndexedTars.value = next;
+      }
+    }),
+  );
+}
+
+function changeFileListPageSize(nextSize) {
+  const n = Number(nextSize);
+  if (!FILE_LIST_PAGE_SIZE_OPTIONS.includes(n)) return;
+  if (n === fileListPageSize.value) return;
+  fileListPageSize.value = n;
+  writeFileListPageSize(n);
+  // Resetting to page 1 keeps cursor-stack semantics meaningful — the
+  // previous-page cursors were minted at the old page size and would
+  // not address the same slice with the new one.
+  loadFileTree({ resetStack: true, cursor: null });
+}
+
+function goToNextFileListPage() {
+  if (!fileListHasNext.value || filesLoading.value) return;
+  const cursorToAdvance = fileListCurrentCursor.value;
+  fileListCursorStack.value = [...fileListCursorStack.value, cursorToAdvance];
+  loadFileTree({ resetStack: false, cursor: fileListNextCursor.value });
+}
+
+function goToPrevFileListPage() {
+  if (!fileListHasPrev.value || filesLoading.value) return;
+  const stack = [...fileListCursorStack.value];
+  const previousCursor = stack.pop() ?? null;
+  fileListCursorStack.value = stack;
+  loadFileTree({ resetStack: false, cursor: previousCursor });
+}
+
+function goToFirstFileListPage() {
+  if (!fileListHasPrev.value || filesLoading.value) return;
+  loadFileTree({ resetStack: true, cursor: null });
+}
+
 async function loadReadme() {
   readmeLoading.value = true;
   readmeErrorClassification.value = null;
   try {
-    const readmeFile = fileTree.value.find(
+    let readmeFile = fileTree.value.find(
       (f) => f.type === "file" && f.path.toLowerCase().endsWith("readme.md"),
     );
+
+    // Paginated tree may not contain README.md on the current page —
+    // probe the common variants directly via paths-info so the Card
+    // tab does not silently render "No README" when one exists later
+    // in the listing.
+    if (!readmeFile) {
+      readmeFile = await findReadmeViaPathsInfo();
+    }
 
     if (!readmeFile) {
       readmeContent.value = "";
@@ -1496,6 +1736,27 @@ async function loadReadme() {
     readmeMetadata.value = {};
   } finally {
     readmeLoading.value = false;
+  }
+}
+
+async function findReadmeViaPathsInfo() {
+  // README.md / readme.md / Readme.md cover the case-insensitive
+  // variants seen in the wild. paths-info returns only the entries
+  // that exist, so a single call is enough.
+  if (props.currentPath) return null;
+  try {
+    const { data } = await repoAPI.getPathsInfo(
+      props.repoType,
+      props.namespace,
+      props.name,
+      currentBranch.value,
+      ["README.md", "readme.md", "Readme.md"],
+      false,
+    );
+    return (data || []).find((entry) => entry && entry.type === "file") || null;
+  } catch (err) {
+    console.debug("README paths-info probe failed:", err);
+    return null;
   }
 }
 
@@ -1751,6 +2012,7 @@ watch(
 
 // Lifecycle
 onMounted(async () => {
+  fileListPageSize.value = readFileListPageSize();
   await loadRepoInfo();
 
   if (activeTab.value === "files") {
