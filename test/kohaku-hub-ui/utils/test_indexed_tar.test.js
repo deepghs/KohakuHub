@@ -86,6 +86,65 @@ describe("parseTarIndex", () => {
       IndexedTarFormatError,
     );
   });
+
+  it("raises IndexedTarFormatError when the response body is not JSON", async () => {
+    server.use(
+      http.get(INDEX_URL, () =>
+        new HttpResponse("not json{", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    await expect(parseTarIndex(INDEX_URL)).rejects.toBeInstanceOf(
+      IndexedTarFormatError,
+    );
+  });
+
+  it("raises IndexedTarFormatError when the JSON root is an array", async () => {
+    server.use(http.get(INDEX_URL, () => HttpResponse.json([1, 2, 3])));
+    await expect(parseTarIndex(INDEX_URL)).rejects.toBeInstanceOf(
+      IndexedTarFormatError,
+    );
+  });
+
+  it("raises IndexedTarFormatError when an entry has a negative offset", async () => {
+    server.use(
+      http.get(INDEX_URL, () =>
+        HttpResponse.json({
+          filesize: 1,
+          hash: "",
+          hash_lfs: "",
+          files: { neg: { offset: -1, size: 5 } },
+        }),
+      ),
+    );
+    await expect(parseTarIndex(INDEX_URL)).rejects.toBeInstanceOf(
+      IndexedTarFormatError,
+    );
+  });
+
+  it("normalises missing top-level hash fields to empty strings", async () => {
+    server.use(
+      http.get(INDEX_URL, () =>
+        HttpResponse.json({
+          filesize: 4,
+          // hash + hash_lfs deliberately omitted — older sidecars in
+          // the wild lack one or both fields.
+          files: { "x.txt": { offset: 0, size: 4 } },
+        }),
+      ),
+    );
+    const payload = await parseTarIndex(INDEX_URL);
+    expect(payload.hash).toBe("");
+    expect(payload.hash_lfs).toBe("");
+  });
+
+  // Note: AbortSignal forwarding is wired in production but cannot
+  // be unit-tested under jsdom + Node 24 — undici's WebIDL guard
+  // rejects signals constructed in the test realm before fetch is
+  // invoked. The cancel path is exercised end-to-end via the
+  // Playwright verification documented on the PR.
 });
 
 describe("buildTreeFromIndex + listDirectory", () => {
@@ -197,6 +256,50 @@ describe("buildMemberRangeHeader + extractMemberBytes", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
   });
+
+  it("accepts a 200-status response (Range header ignored by the upstream)", async () => {
+    // hfutils.index always uses Range — but if a proxy / cache strips
+    // the header and returns the full body with status 200, the
+    // expected window can still be sliced from the leading bytes.
+    // The contract is "accept 200 too" so a presigned URL behind a
+    // server that ignores Range stays usable for inline preview as
+    // long as the member happens to start at offset 0.
+    const fullTar = new Uint8Array(64);
+    for (let i = 0; i < 64; i++) fullTar[i] = i;
+    server.use(
+      http.get(TAR_URL, () =>
+        new HttpResponse(fullTar.subarray(0, 8), { status: 200 }),
+      ),
+    );
+    const bytes = await extractMemberBytes(TAR_URL, { offset: 0, size: 8 });
+    expect(Array.from(bytes)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  });
+
+  it("rejects a non-2xx response with IndexedTarFetchError", async () => {
+    server.use(
+      http.get(TAR_URL, () => new HttpResponse("nope", { status: 500 })),
+    );
+    await expect(
+      extractMemberBytes(TAR_URL, { offset: 0, size: 4 }),
+    ).rejects.toThrow(IndexedTarFetchError);
+  });
+
+  it("rejects when the response is short of the requested size", async () => {
+    server.use(
+      http.get(TAR_URL, () =>
+        new HttpResponse(new Uint8Array([1, 2, 3]), {
+          status: 206,
+          headers: {
+            "Content-Range": "bytes 0-2/3",
+            "Content-Length": "3",
+          },
+        }),
+      ),
+    );
+    await expect(
+      extractMemberBytes(TAR_URL, { offset: 0, size: 8 }),
+    ).rejects.toThrow(/expected 8/);
+  });
 });
 
 describe("compareTarHash", () => {
@@ -233,6 +336,46 @@ describe("compareTarHash", () => {
     const sha = "f".repeat(64);
     expect(
       compareTarHash({ hash_lfs: sha }, { oid: "ignored", lfs: { oid: sha } }),
+    ).toEqual({ kind: "match" });
+  });
+
+  it("falls back to hash (git-blob sha1) when the tree oid is not sha256-shaped", () => {
+    // A small inline file whose tree-side oid is the git-blob sha1
+    // (40 hex chars) — the index's `hash` field is the matching
+    // git-blob sha1, not the sha256 in `hash_lfs`. The comparator
+    // recognises the shape and falls back to the right side.
+    const blobSha1 = "0123456789abcdef0123456789abcdef01234567"; // 40 hex
+    expect(
+      compareTarHash(
+        { hash: blobSha1, hash_lfs: "f".repeat(64) },
+        { oid: blobSha1 },
+      ),
+    ).toEqual({ kind: "match" });
+  });
+
+  it("flags a mismatch on the non-sha256 fallback when git-blob sha1 differs", () => {
+    expect(
+      compareTarHash(
+        { hash: "0".repeat(40), hash_lfs: "" },
+        { oid: "1".repeat(40) },
+      ).kind,
+    ).toBe("mismatch");
+  });
+
+  it("returns 'partial' when only one side has a usable hash shape", () => {
+    // Index has only sha256, tree only carries a git-blob sha1.
+    expect(
+      compareTarHash({ hash_lfs: "a".repeat(64) }, { oid: "1".repeat(40) }),
+    ).toEqual({ kind: "partial" });
+  });
+
+  it("is case-insensitive (HEX strings normalised to lowercase before compare)", () => {
+    const sha = "ABCDEFabcdef".repeat(5) + "abcd"; // 64 chars, mixed case
+    expect(
+      compareTarHash(
+        { hash_lfs: sha.toUpperCase() },
+        { oid: sha.toLowerCase() },
+      ),
     ).toEqual({ kind: "match" });
   });
 });

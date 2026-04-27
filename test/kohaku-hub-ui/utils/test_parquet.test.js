@@ -84,6 +84,43 @@ describe("parquet utilities", () => {
       const summary = summarizeParquetSchema(metadata);
       expect(summary.columnCount).toBe(4);
     });
+
+    it("rejects bytes that do not end with the PAR1 footer magic", async () => {
+      const { parseParquetMetadataFromBuffer } = await loadModule();
+      // Random non-parquet bytes — hyparquet checks the trailing 4
+      // bytes for "PAR1" and throws on mismatch. Pin the failure
+      // mode so a future hyparquet upgrade doesn't silently swallow
+      // garbage and surface synthetic-looking metadata.
+      const buf = new Uint8Array(64).map((_, i) => i & 0xff);
+      await expect(parseParquetMetadataFromBuffer(buf)).rejects.toThrow(
+        /PAR1/,
+      );
+    });
+
+    it("accepts an ArrayBuffer input (not just Uint8Array)", async () => {
+      const { parseParquetMetadataFromBuffer } = await loadModule();
+      const ab = FIXTURE_BYTES.buffer.slice(
+        FIXTURE_BYTES.byteOffset,
+        FIXTURE_BYTES.byteOffset + FIXTURE_BYTES.byteLength,
+      );
+      const metadata = await parseParquetMetadataFromBuffer(ab);
+      expect(metadata.numRows).toBe(100);
+    });
+
+    it("normalizes input from a different realm (jsdom Buffer / cross-realm ArrayBuffer)", async () => {
+      const { parseParquetMetadataFromBuffer } = await loadModule();
+      // Node fs.readFileSync returns a Buffer whose underlying
+      // ArrayBuffer fails the jsdom realm's `instanceof
+      // ArrayBuffer` check. The from-buffer path explicitly copies
+      // into a current-realm allocation; this test pins that
+      // contract by passing the raw cross-realm ArrayBuffer.
+      const realm = FIXTURE_BYTES.buffer;
+      const metadata = await parseParquetMetadataFromBuffer(realm.slice(
+        FIXTURE_BYTES.byteOffset,
+        FIXTURE_BYTES.byteOffset + FIXTURE_BYTES.byteLength,
+      ));
+      expect(metadata.numRows).toBe(100);
+    });
   });
 
   it("parses footer metadata, row counts, and top-level columns", async () => {

@@ -379,11 +379,6 @@ function fileExtension(name) {
   return m ? m[1].toLowerCase() : "";
 }
 
-function isMarkdown(name) {
-  const ext = fileExtension(name);
-  return ext === "md" || ext === "markdown";
-}
-
 // Inner FilePreviewDialog stays closed until the user explicitly
 // clicks "Open metadata preview". Auto-opening it on prop change
 // would race with the member view itself, leave the inner overlay
