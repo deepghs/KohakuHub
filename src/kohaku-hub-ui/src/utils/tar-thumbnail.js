@@ -32,7 +32,7 @@
 // pushing additional strategies into the registry; the orchestrator
 // doesn't care about which side of the registry handled the member.
 
-import { ref, onMounted, onUnmounted, watch } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 import { extractMemberBytes } from "@/utils/indexed-tar";
 
 // -----------------------------------------------------------------------
@@ -684,19 +684,10 @@ export function useTarThumbnail({ tarUrl, member, rootRef }) {
     cancelInflight();
   });
 
-  // If the (tarUrl, member) target changes mid-life, restart the cycle.
-  watch(
-    () => [tarUrl, member?.offset, member?.size],
-    () => {
-      cancelInflight();
-      thumbUrl.value = null;
-      state.value = "idle";
-      if (rootRef.value && observer) {
-        observer.unobserve(rootRef.value);
-        observer.observe(rootRef.value);
-      }
-    },
-  );
+  // No prop-retarget watch: the consumer (TarBrowserPanel) keys
+  // image rows by `entry.path`, so a member change at the same
+  // DOM slot tears the component down and remounts a fresh one
+  // anyway. A watch here would just be dead code.
 
   return { state, thumbUrl };
 }

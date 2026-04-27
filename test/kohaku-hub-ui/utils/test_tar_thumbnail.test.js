@@ -506,4 +506,44 @@ describe("useThumbnailToggle", () => {
     localStorage.setItem(TOGGLE_STORAGE_KEY, "1");
     expect(localStorage.getItem(TOGGLE_STORAGE_KEY)).toBe("1");
   });
+
+  it("setEnabled(false) writes '0' to storage and broadcasts to other live composables", async () => {
+    // Mount a tiny host component twice so we can observe the
+    // module-level listener fan-out: when one consumer flips the
+    // toggle, the other's reactive `enabled` ref must update too.
+    const { useThumbnailToggle } = await import("@/utils/tar-thumbnail");
+    const { defineComponent, h } = await import("vue");
+    const { mount } = await import("@vue/test-utils");
+
+    const captured = { a: null, b: null, setA: null };
+    const Host = defineComponent({
+      setup() {
+        const { enabled, setEnabled } = useThumbnailToggle();
+        if (captured.a === null) {
+          captured.a = enabled;
+          captured.setA = setEnabled;
+        } else {
+          captured.b = enabled;
+        }
+        return () => h("div");
+      },
+    });
+    const wrapperA = mount(Host);
+    const wrapperB = mount(Host);
+    expect(captured.a.value).toBe(true);
+    expect(captured.b.value).toBe(true);
+
+    captured.setA(false);
+    expect(localStorage.getItem(TOGGLE_STORAGE_KEY)).toBe("0");
+    expect(captured.a.value).toBe(false);
+    expect(captured.b.value).toBe(false);
+
+    // Calling setEnabled with the same value is a no-op — exercise
+    // the early-return branch.
+    captured.setA(false);
+    expect(captured.a.value).toBe(false);
+
+    wrapperA.unmount();
+    wrapperB.unmount();
+  });
 });

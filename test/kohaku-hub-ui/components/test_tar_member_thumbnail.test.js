@@ -215,3 +215,93 @@ describe("TarMemberThumbnail · toggle off", () => {
     expect(wrapper.find(".i-carbon-image").exists()).toBe(true);
   });
 });
+
+describe("TarMemberThumbnail · cache hit on remount", () => {
+  it("short-circuits a second mount of the same (tarUrl, offset, size) member", async () => {
+    let rangeHits = 0;
+    server.use(
+      http.get(TAR_URL, async (...args) => {
+        rangeHits += 1;
+        return rangeServer(JPEG_WITH_EXIF)(...args);
+      }),
+    );
+    // First mount populates the module-level cache.
+    const first = mountThumb();
+    await flushPromises();
+    FakeIntersectionObserver.instances[0].fire(true);
+    await flushPromises();
+    expect(first.find("img").exists()).toBe(true);
+    first.unmount();
+
+    // Second mount of the same member: the cache lookup runs
+    // BEFORE any IntersectionObserver event, so the row should
+    // resolve to ready as soon as it intersects without firing a
+    // new Range read.
+    const before = rangeHits;
+    const second = mountThumb();
+    await flushPromises();
+    FakeIntersectionObserver.instances[1].fire(true);
+    await flushPromises();
+    expect(second.find("img").exists()).toBe(true);
+    expect(rangeHits - before).toBe(0);
+  });
+});
+
+describe("TarMemberThumbnail · abort on out-of-view", () => {
+  it("reverts to placeholder when intersect=false fires while extraction is in flight", async () => {
+    // Server holds the request open so we can fire intersect=false
+    // before the extraction resolves. Verifying the AbortError
+    // branch in handleVisible's catch arm.
+    // _resetThumbnailCache in the global beforeEach already clears
+    // any prior entry, so the standard SAMPLE_MEMBER works here
+    // without needing a fake offset that would land past the
+    // fixture's end and trip the size-mismatch guard.
+    const member = SAMPLE_MEMBER;
+    let release;
+    server.use(
+      http.get(
+        TAR_URL,
+        () =>
+          new Promise((resolve) => {
+            release = () =>
+              resolve(rangeServer(JPEG_WITH_EXIF)({ request: new Request(TAR_URL) }));
+          }),
+      ),
+    );
+    const wrapper = mountThumb({ member });
+    await flushPromises();
+    const observer = FakeIntersectionObserver.instances[0];
+    observer.fire(true); // start extraction
+    await flushPromises();
+    observer.fire(false); // scrolled out — AbortController.abort()
+    await flushPromises();
+    expect(wrapper.find("img").exists()).toBe(false);
+    // Drain the dangling promise so MSW doesn't leak between tests.
+    if (release) release();
+  });
+});
+
+describe("TarMemberThumbnail · environments without IntersectionObserver", () => {
+  it("eagerly loads when IntersectionObserver is undefined (older runtimes)", async () => {
+    // SSR / older test runtimes don't have IntersectionObserver
+    // at all. The composable falls back to handleVisible() at
+    // mount, so the thumbnail loads without ever hearing from
+    // an observer.
+    const originalIO2 = globalThis.IntersectionObserver;
+    globalThis.IntersectionObserver = undefined;
+    server.use(
+      http.get(TAR_URL, rangeServer(JPEG_WITH_EXIF)),
+    );
+    try {
+      const wrapper = mountThumb();
+      // Eager-load runs through extractThumbnail's pool+fetch chain;
+      // give it a beat to drain before asserting.
+      await flushPromises();
+      await new Promise((r) => setTimeout(r, 50));
+      await flushPromises();
+      expect(wrapper.find("img").exists()).toBe(true);
+    } finally {
+      globalThis.IntersectionObserver = originalIO2;
+    }
+  });
+});
