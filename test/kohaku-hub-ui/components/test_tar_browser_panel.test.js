@@ -431,6 +431,40 @@ describe("TarBrowserPanel · listing + navigation", () => {
     ).toBeUndefined();
   });
 
+  it("starts in grid mode by default and persists a switch to list in localStorage", async () => {
+    // The panel suite's beforeEach already disables thumbnails;
+    // it does NOT touch the new view-mode key, so this test sees
+    // the production default (grid).
+    const archive = buildArchive([["a.txt", text("a")]]);
+    serveArchive(archive);
+    const wrapper = mountPanel();
+    await flushPromises();
+    // The list-mode toolbar uses a horizontal flex of rows; grid
+    // mode lays the entries out in a CSS grid. Detect via the
+    // grid container's class signature.
+    expect(wrapper.find(".grid-cols-2").exists()).toBe(true);
+
+    // Flip to list. The ElRadioGroup stub carries the v-model
+    // and emits `update:modelValue`; emitting from the stub
+    // updates the panel's `viewMode` ref the same way a real
+    // click would.
+    await wrapper.findComponent({ name: "ElRadioGroup" }).setValue("list");
+    await flushPromises();
+    expect(localStorage.getItem("kohaku-tar-view-mode")).toBe("list");
+  });
+
+  it("persists a page-size change to localStorage", async () => {
+    const archive = buildArchive([["a.txt", text("a")]]);
+    serveArchive(archive);
+    const wrapper = mountPanel();
+    await flushPromises();
+    // ElementPlusStubs' ElSelect emits update:modelValue + change.
+    // Drive a value change directly on the v-model binding.
+    await wrapper.findComponent({ name: "ElSelect" }).setValue(50);
+    await flushPromises();
+    expect(localStorage.getItem("kohaku-tar-page-size")).toBe("50");
+  });
+
   it("filters the listing in place when the search input has a query", async () => {
     const archive = buildArchive([
       ["alpha.txt", text("a")],

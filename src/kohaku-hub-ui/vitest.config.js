@@ -83,6 +83,7 @@ export default defineConfig({
         "src/utils/repoSortPreference.js",
         "src/utils/safetensors.js",
         "src/utils/tag-parser.js",
+        "src/utils/tar-listing-prefs.js",
         "src/utils/tar-thumbnail.js",
         "src/utils/yaml-parser.js",
         "src/components/layout/TheFooter.vue",

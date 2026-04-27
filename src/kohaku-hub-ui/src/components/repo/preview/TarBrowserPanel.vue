@@ -29,6 +29,12 @@ import {
 } from "@/utils/indexed-tar";
 import { classifyError } from "@/utils/http-errors";
 import { useThumbnailToggle, isImageMember } from "@/utils/tar-thumbnail";
+import {
+  readViewMode,
+  writeViewMode,
+  readPageSize,
+  writePageSize,
+} from "@/utils/tar-listing-prefs";
 import ErrorState from "@/components/common/ErrorState.vue";
 import CodeViewer from "@/components/common/CodeViewer.vue";
 import MarkdownViewer from "@/components/common/MarkdownViewer.vue";
@@ -57,8 +63,14 @@ let currentRequestId = 0;
 // Browser navigation state.
 const pathStack = ref([]); // segments inside the tar, e.g. ['sub', 'nested']
 const searchQuery = ref("");
-const viewMode = ref("list");
-const pageSize = ref(100);
+// View mode + page size are user-level preferences persisted in
+// localStorage. Defaults: grid layout at 20 entries / page (per
+// the user's request — bigger thumbs, denser browsing). Watching
+// each ref writes the change back without a separate save action.
+const viewMode = ref(readViewMode());
+const pageSize = ref(readPageSize());
+watch(viewMode, (next) => writeViewMode(next));
+watch(pageSize, (next) => writePageSize(next));
 const currentPage = ref(1);
 
 // Member preview state.
@@ -713,9 +725,9 @@ watch(innerPreviewProps, (val) => {
             size="small"
             class="!w-28"
           >
+            <el-option :value="20" label="20 / page" />
             <el-option :value="50" label="50 / page" />
             <el-option :value="100" label="100 / page" />
-            <el-option :value="200" label="200 / page" />
           </el-select>
         </div>
 
