@@ -241,7 +241,12 @@ function iconForFile(name) {
   if (cls === "video") return "i-carbon-video text-red-500";
   if (cls === "audio") return "i-carbon-music text-green-500";
   if (cls === "pdf") return "i-carbon-document-pdf text-red-600";
-  if (cls === "markdown") return "i-carbon-logo-markdown text-blue-500";
+  // Markdown intentionally does NOT get a dedicated icon — the
+  // user asked for it to share the generic document fallback so
+  // README rows look the same as plain text rows. The earlier
+  // draft used an icon name that does not ship in Carbon, which
+  // collapsed the icon container to zero width and pushed the
+  // row text against the left edge.
   if (cls === "safetensors") return "i-carbon-data-vis-1 text-blue-500";
   if (cls === "parquet") return "i-carbon-data-table text-orange-500";
   if (["js", "ts", "jsx", "tsx"].includes(ext))

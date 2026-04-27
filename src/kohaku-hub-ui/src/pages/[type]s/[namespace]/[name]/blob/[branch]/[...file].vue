@@ -567,7 +567,11 @@ function getFileIcon(filename) {
   if (isVideo.value) return "i-carbon-video text-red-500";
   if (isAudio.value) return "i-carbon-music text-green-500";
   if (isPDF.value) return "i-carbon-document-pdf text-red-600";
-  if (isMarkdown.value) return "i-carbon-logo-markdown text-blue-500";
+  // Markdown shares the generic document fallback — no dedicated
+  // icon. The earlier name did not ship in Carbon (UnoCSS skipped
+  // it silently), and the user asked for visual parity with plain
+  // text files inside the tar listing, so we keep it uniform here
+  // too.
   if (["js", "ts", "jsx", "tsx"].includes(ext))
     return "i-carbon-code text-yellow-500";
   if (["py"].includes(ext)) return "i-carbon-code text-blue-600";
