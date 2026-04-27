@@ -300,6 +300,153 @@ describe("extractThumbnail – orchestrator", () => {
   });
 });
 
+describe("decoder pipeline (mocked Image + canvas)", () => {
+  // jsdom does not actually decode images or rasterise canvas
+  // operations. We stand in a synchronous Image stub and force
+  // `canvas.toBlob` to hand back a small Blob so the strategy
+  // chain's small/medium-image extract paths run end-to-end.
+  let originalImage;
+  let originalCreateElement;
+
+  beforeEach(() => {
+    originalImage = globalThis.Image;
+    globalThis.Image = class {
+      constructor() {
+        this._src = "";
+        this.naturalWidth = 320;
+        this.naturalHeight = 240;
+      }
+      set src(v) {
+        this._src = v;
+        // Fire onload on a microtask boundary so the awaiter is
+        // attached before resolution.
+        Promise.resolve().then(() => this.onload?.());
+      }
+      get src() {
+        return this._src;
+      }
+    };
+    originalCreateElement = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      if (tag === "canvas") {
+        return {
+          width: 0,
+          height: 0,
+          getContext: () => ({
+            drawImage: vi.fn(),
+          }),
+          toBlob: (cb, type, quality) => {
+            cb(new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], { type }));
+          },
+        };
+      }
+      return originalCreateElement(tag);
+    };
+  });
+
+  afterEach(() => {
+    globalThis.Image = originalImage;
+    document.createElement = originalCreateElement;
+  });
+
+  it("runs the small-image strategy end-to-end on a JPEG without EXIF", async () => {
+    server.use(
+      http.get(TAR_URL, async ({ request }) => {
+        const range = request.headers.get("range");
+        const m = /^bytes=(\d+)-(\d+)$/.exec(range || "");
+        const start = Number(m[1]);
+        const end = Math.min(Number(m[2]), JPEG_NO_EXIF.length - 1);
+        return new HttpResponse(JPEG_NO_EXIF.subarray(start, end + 1), {
+          status: 206,
+        });
+      }),
+    );
+    const member = {
+      name: "no-exif.jpg",
+      offset: 0,
+      size: JPEG_NO_EXIF.length,
+    };
+    const cache = _createCache(10);
+    const pool = _createPool(2);
+    const url = await extractThumbnail({
+      tarUrl: TAR_URL,
+      member,
+      cache,
+      pool,
+    });
+    expect(url).toMatch(/^blob:/);
+  });
+
+  it("runs the medium-image strategy on a >256 KB image (synthesised)", async () => {
+    // Build a synthetic JPEG blob of ~300 KB by padding the no-exif
+    // fixture. Magic bytes survive because we prepend the original
+    // SOI/SOS bytes; the ext-based small/medium strategies route by
+    // size, not by trailing-byte validity. The mocked Image above
+    // returns onload regardless of the bytes.
+    const padding = new Uint8Array(300 * 1024);
+    padding.set(JPEG_NO_EXIF, 0);
+    const member = {
+      name: "medium.jpg",
+      offset: 0,
+      size: padding.length,
+    };
+    server.use(
+      http.get(TAR_URL, async ({ request }) => {
+        const range = request.headers.get("range");
+        const m = /^bytes=(\d+)-(\d+)$/.exec(range || "");
+        const start = Number(m[1]);
+        const end = Math.min(Number(m[2]), padding.length - 1);
+        return new HttpResponse(padding.subarray(start, end + 1), {
+          status: 206,
+        });
+      }),
+    );
+    const cache = _createCache(10);
+    const pool = _createPool(2);
+    const url = await extractThumbnail({
+      tarUrl: TAR_URL,
+      member,
+      cache,
+      pool,
+    });
+    expect(url).toMatch(/^blob:/);
+  });
+
+  it("rejects with a synthetic decode failure (Image.onerror fires)", async () => {
+    // Replace the Image stub for this single test with one that
+    // emits onerror — covers decodeImageToThumbnail's reject arm.
+    globalThis.Image = class {
+      set src(_v) {
+        Promise.resolve().then(() => this.onerror?.());
+      }
+    };
+    server.use(
+      http.get(TAR_URL, async ({ request }) => {
+        const range = request.headers.get("range");
+        const m = /^bytes=(\d+)-(\d+)$/.exec(range || "");
+        const start = Number(m[1]);
+        const end = Math.min(Number(m[2]), JPEG_NO_EXIF.length - 1);
+        return new HttpResponse(JPEG_NO_EXIF.subarray(start, end + 1), {
+          status: 206,
+        });
+      }),
+    );
+    const member = {
+      name: "broken.jpg",
+      offset: 0,
+      size: JPEG_NO_EXIF.length,
+    };
+    await expect(
+      extractThumbnail({
+        tarUrl: TAR_URL,
+        member,
+        cache: _createCache(2),
+        pool: _createPool(2),
+      }),
+    ).rejects.toThrow(/image failed to decode/);
+  });
+});
+
 describe("LRU cache", () => {
   it("evicts the oldest entry past `max` capacity and revokes its blob URL", () => {
     const revoked = [];
