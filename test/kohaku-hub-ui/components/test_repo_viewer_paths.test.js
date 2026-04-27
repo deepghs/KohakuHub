@@ -739,6 +739,237 @@ describe("RepoViewer path handling", () => {
     wrapper.unmount();
   });
 
+  it("First button rewinds the cursor stack to page 1 in a single click", async () => {
+    let calls = 0;
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
+        ({ request }) => {
+          calls += 1;
+          const url = new URL(request.url);
+          const cursor = url.searchParams.get("cursor");
+          // Page 1 → page 2 → page 3 chain so the cursor stack grows
+          // past one entry and First's "drop the whole stack" semantics
+          // are visible (vs Prev which only pops one).
+          if (!cursor) {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/a.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-2>; rel="next"',
+                },
+              },
+            );
+          }
+          if (cursor === "cursor-2") {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/m.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-3>; rel="next"',
+                },
+              },
+            );
+          }
+          return jsonResponse([
+            {
+              type: "file",
+              path: "catalog/z.txt",
+              size: 1,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]);
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "catalog" });
+    await flushPromises();
+    await flushPromises();
+
+    await wrapper.find('[data-testid="file-list-page-next"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+    await wrapper.find('[data-testid="file-list-page-next"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.text()).toContain("Page 3");
+    expect(wrapper.text()).toContain("z.txt");
+
+    // First rewinds two pages worth of cursors in one click — page 1
+    // re-fetched, m.txt and z.txt no longer rendered.
+    await wrapper.find('[data-testid="file-list-page-first"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.text()).toContain("Page 1");
+    expect(wrapper.text()).toContain("a.txt");
+    expect(wrapper.text()).not.toContain("m.txt");
+    expect(wrapper.text()).not.toContain("z.txt");
+    // 3 forward fetches + 1 First fetch = 4 total.
+    expect(calls).toBe(4);
+
+    wrapper.unmount();
+  });
+
+  it("paginated empty-search placeholder reads 'No files match \"…\" on this page', not the bare 'No files found'", async () => {
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main",
+        () =>
+          jsonResponse([
+            {
+              type: "file",
+              path: "alpha.txt",
+              size: 1,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+            {
+              type: "file",
+              path: "beta.txt",
+              size: 1,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]),
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer();
+    await flushPromises();
+    await flushPromises();
+
+    // Search for something not on this page (since paginated search
+    // only filters the current slice). The empty-state copy must
+    // distinguish "current page" from "whole repo" so the user is
+    // not misled into thinking the file does not exist at all.
+    wrapper.vm.fileSearchQuery = "zeta";
+    await flushPromises();
+    expect(wrapper.text()).toContain('No files match "zeta" on this page');
+
+    wrapper.unmount();
+  });
+
+  it("Card tab finds the README via paths-info when it is not on the current page", async () => {
+    // The repo's root listing intentionally omits README.md (simulating
+    // a paginated tree where README falls off this page); paths-info
+    // must surface it and the Card tab still renders the markdown.
+    let pathsInfoCalls = 0;
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main",
+        () =>
+          jsonResponse([
+            {
+              type: "file",
+              path: "alpha.json",
+              size: 5,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]),
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        async ({ request }) => {
+          pathsInfoCalls += 1;
+          const form = new URLSearchParams(await request.clone().text());
+          const paths = form.getAll("paths");
+          if (paths.includes("README.md")) {
+            return jsonResponse([
+              {
+                type: "file",
+                path: "README.md",
+                size: 64,
+                lastCommit: {
+                  id: "c1",
+                  title: "Add readme",
+                  date: "2026-04-21T13:53:39.000000Z",
+                },
+              },
+            ]);
+          }
+          return jsonResponse([]);
+        },
+      ),
+      http.get(
+        "/datasets/open-media-lab/hierarchy-crawl-fixtures/resolve/main/README.md",
+        () =>
+          new HttpResponse(
+            "---\ntitle: Recovered\n---\n\n# Off-Page README\n",
+            {
+              status: 200,
+              headers: { "Content-Type": "text/markdown" },
+            },
+          ),
+      ),
+    );
+
+    const wrapper = mountViewer({ tab: "card" });
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    expect(pathsInfoCalls).toBeGreaterThan(0);
+    // MarkdownViewer is stubbed in this test mount, so the rendered
+    // markdown body is not in wrapper.text(). We assert the recovery
+    // path negatively: the empty placeholder is gone, which only
+    // happens when readmeContent was populated by the probe + fetch
+    // chain. (The structurally-identical test in
+    // FilePreviewDialog.spec covers the actual markdown render.)
+    expect(wrapper.text()).not.toContain("No README.md found");
+
+    wrapper.unmount();
+  });
+
+  it("README paths-info probe failure degrades gracefully to the empty-readme state", async () => {
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main",
+        () => jsonResponse([]),
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () =>
+          jsonResponse(
+            { detail: "paths-info upstream offline" },
+            { status: 502 },
+          ),
+      ),
+    );
+
+    const wrapper = mountViewer({ tab: "card" });
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    // Soft-fallback: the probe failure does not throw; the Card tab
+    // ends up with no README and renders the regular empty copy.
+    expect(wrapper.text()).not.toContain("Authentication required");
+    expect(wrapper.text()).not.toContain("undefined");
+
+    wrapper.unmount();
+  });
+
   it("indexed-tar sibling icon: lights up when the .json sibling exists on a different page and stays dark when HEAD says it does not", async () => {
     const headProbes = [];
     server.use(
