@@ -608,3 +608,49 @@ export function hasIndexSibling(tarPath, siblings) {
   }
   return false;
 }
+
+/**
+ * Compute the expected `.json` sidecar path for a given `.tar` path.
+ * Returns null when `tarPath` is not a `.tar` file (case-insensitive),
+ * so callers can early-out without re-running the suffix check.
+ */
+export function tarSidecarPath(tarPath) {
+  if (typeof tarPath !== "string" || !tarPath.toLowerCase().endsWith(".tar"))
+    return null;
+  const dot = tarPath.lastIndexOf(".");
+  if (dot < 0) return null;
+  return `${tarPath.slice(0, dot)}.json`;
+}
+
+/**
+ * Async sibling check that first looks at the loaded listing
+ * (`hasIndexSibling`) and, on a miss, asks `probe(jsonPath)` to
+ * confirm existence over the network. Returns true only when one of
+ * the two paths agrees the sidecar is present.
+ *
+ * The repo file list is now paginated, so a `.tar` and its `.json`
+ * sibling can land on different pages — without the probe the icon
+ * would silently not light up on the second page. Caller is expected
+ * to memoize positive results so a back-and-forth between pages does
+ * not re-issue the HEAD.
+ *
+ * `probe` must return a Promise<boolean>. Throws or rejects from the
+ * probe degrade to "no sidecar" (false) so a transient network error
+ * never blocks the row from rendering.
+ *
+ * @param {string} tarPath
+ * @param {Iterable|null} siblings
+ * @param {(jsonPath: string) => Promise<boolean>} probe
+ * @returns {Promise<boolean>}
+ */
+export async function hasIndexSiblingWithProbe(tarPath, siblings, probe) {
+  if (hasIndexSibling(tarPath, siblings)) return true;
+  if (typeof probe !== "function") return false;
+  const jsonPath = tarSidecarPath(tarPath);
+  if (!jsonPath) return false;
+  try {
+    return Boolean(await probe(jsonPath));
+  } catch {
+    return false;
+  }
+}

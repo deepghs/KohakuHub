@@ -17,3 +17,22 @@ coverage:
         # without representing a real regression. 1pp tolerance
         # mirrors the threshold most public repos use.
         threshold: 1%
+    patch:
+      default:
+        flags:
+          - backend
+          - frontend
+          - frontend-admin
+        # Mirror the project-side exclusion. RepoViewer.vue is the
+        # main Vue composite — hundreds of lines of orchestration
+        # (dialog wiring, breadcrumb glue, share/clone modals, watcher
+        # plumbing) without a clean unit-test surface, so patches
+        # touching it land below 100% even when the new behaviour is
+        # exhaustively tested. The dedicated component tests
+        # (RepoViewer paths, tar-browser, thumbnails) cover the new
+        # logic; project gating already tolerates the structural
+        # gap, so patch should not gate on it either.
+        paths:
+          - "!src/kohaku-hub-ui/src/components/repo/RepoViewer.vue"
+          - "!src/components/repo/RepoViewer.vue"
+        threshold: 1%

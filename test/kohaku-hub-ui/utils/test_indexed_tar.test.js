@@ -14,8 +14,10 @@ import {
   extractMemberBytes,
   guessMimeType,
   hasIndexSibling,
+  hasIndexSiblingWithProbe,
   listDirectory,
   parseTarIndex,
+  tarSidecarPath,
 } from "@/utils/indexed-tar";
 
 const INDEX_URL = "https://s3.test.local/bucket/archive.json";
@@ -463,6 +465,103 @@ describe("hasIndexSibling", () => {
   it("returns false for non-tar paths", () => {
     expect(hasIndexSibling("bundle.json", [])).toBe(false);
     expect(hasIndexSibling("bundle.zip", [])).toBe(false);
+  });
+});
+
+describe("tarSidecarPath", () => {
+  it("returns the basename.json variant for a .tar path", () => {
+    expect(tarSidecarPath("archives/gallery/bundle.tar")).toBe(
+      "archives/gallery/bundle.json",
+    );
+  });
+
+  it("preserves uppercase basenames but only matches the .tar suffix case-insensitively", () => {
+    // The file-list shows the user the same case the repo carries; we
+    // build the sidecar by swapping only the trailing ".tar" → ".json".
+    expect(tarSidecarPath("Archives/MIXED.TAR")).toBe("Archives/MIXED.json");
+  });
+
+  it("returns null for non-tar paths", () => {
+    expect(tarSidecarPath("bundle.json")).toBeNull();
+    expect(tarSidecarPath("bundle.zip")).toBeNull();
+    expect(tarSidecarPath("README")).toBeNull();
+    expect(tarSidecarPath("")).toBeNull();
+    expect(tarSidecarPath(null)).toBeNull();
+  });
+});
+
+describe("hasIndexSiblingWithProbe", () => {
+  it("short-circuits on a loaded-listing hit without invoking the probe", async () => {
+    const probe = vi.fn();
+    const siblings = [
+      { type: "file", path: "archives/gallery/bundle.tar" },
+      { type: "file", path: "archives/gallery/bundle.json" },
+    ];
+    const result = await hasIndexSiblingWithProbe(
+      "archives/gallery/bundle.tar",
+      siblings,
+      probe,
+    );
+    expect(result).toBe(true);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the probe when the loaded listing has no sibling", async () => {
+    const probe = vi.fn(async (jsonPath) => {
+      expect(jsonPath).toBe("archives/gallery/bundle.json");
+      return true;
+    });
+    const result = await hasIndexSiblingWithProbe(
+      "archives/gallery/bundle.tar",
+      [],
+      probe,
+    );
+    expect(result).toBe(true);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns false when the probe says the sidecar does not exist", async () => {
+    const probe = vi.fn(async () => false);
+    const result = await hasIndexSiblingWithProbe(
+      "archives/gallery/bundle.tar",
+      null,
+      probe,
+    );
+    expect(result).toBe(false);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a probe rejection as 'no sidecar'", async () => {
+    // Pin the soft-fallback contract — a transient HEAD failure must
+    // not surface as a user-visible exception when all the SPA wants
+    // to know is "should the indexed-tar icon light up?"
+    const probe = vi.fn(async () => {
+      throw new Error("network down");
+    });
+    const result = await hasIndexSiblingWithProbe(
+      "archives/gallery/bundle.tar",
+      null,
+      probe,
+    );
+    expect(result).toBe(false);
+  });
+
+  it("never probes for non-tar paths", async () => {
+    const probe = vi.fn(async () => true);
+    expect(
+      await hasIndexSiblingWithProbe("bundle.json", null, probe),
+    ).toBe(false);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("never probes when the caller did not supply a probe function", async () => {
+    expect(
+      await hasIndexSiblingWithProbe(
+        "archives/gallery/bundle.tar",
+        [],
+        null,
+      ),
+    ).toBe(false);
   });
 });
 

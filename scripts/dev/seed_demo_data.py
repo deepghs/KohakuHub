@@ -3342,11 +3342,118 @@ def build_open_media_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
     return tuple(repos)
 
 
+def build_big_indexed_tar_pagination_seeds() -> tuple[RepoSeed, ...]:
+    """Pagination UAT fixture.
+
+    A single dataset whose root carries 250 hfutils.index-compatible
+    tar/json pairs (so 500 entries plus a README) — enough for the
+    file-list pager to walk through 10 pages at the default 50/page,
+    and 3 pages at the 200/page setting, while keeping the initial
+    seed under a minute. Reusing one identical bundle across every
+    pair keeps the seed cheap (single tar+index materialization)
+    while still exercising the listing surface against real LakeFS
+    object counts: LakeFS dedupes by content hash, so the underlying
+    storage stays small even though the repo metadata grows. The two
+    halves of each pair are adjacent alphabetically, which is the
+    "loaded-listing fast path" the sidecar predicate prefers — the
+    HEAD-probe fallback is exercised separately by the unit tests.
+    """
+
+    bundle_count = 250
+
+    bundle_cache: dict[str, tuple[bytes, bytes]] = {}
+
+    def shared_bundle() -> tuple[bytes, bytes]:
+        cached = bundle_cache.get("bundle")
+        if cached is not None:
+            return cached
+        cached = make_indexed_tar_bundle(
+            "big-indexed-tar-pagination-shared",
+            (
+                ("member.json", json_bytes({"shard": "demo", "version": 1})),
+            ),
+        )
+        bundle_cache["bundle"] = cached
+        return cached
+
+    files: list[SeedFile] = [
+        (
+            "README.md",
+            text_bytes(
+                f"""
+                ---
+                license: cc-by-4.0
+                pretty_name: Indexed-Tar Pagination Bench
+                tags:
+                  - indexed-tar
+                  - pagination
+                  - dev-fixture
+                ---
+
+                # big-indexed-tar-bench
+
+                Pagination UAT fixture: {bundle_count} hfutils.index-compatible
+                tar/json pairs sit under `archives/` so the new file-list
+                pager can be exercised against a directory that genuinely
+                needs paging. Default 50 entries/page → 10 pages; 200/page
+                → 3. The two halves of each pair are alphabetically
+                adjacent so the indexed-tar icon lights up via the loaded
+                listing — the HEAD-probe fallback is covered by the unit
+                tests in `test_repo_viewer_paths.test.js`.
+
+                Every bundle is a clone of the same minimal tar (one
+                trivial JSON member). LakeFS dedupes by content hash so
+                the underlying object storage is one bundle, not 1000.
+                """
+            ),
+        ),
+    ]
+    for idx in range(bundle_count):
+        tag = f"{idx:04d}"
+        files.append(
+            seed_file(
+                f"archives/bundle-{tag}.tar",
+                lambda: shared_bundle()[0],
+            )
+        )
+        files.append(
+            seed_file(
+                f"archives/bundle-{tag}.json",
+                lambda: shared_bundle()[1],
+            )
+        )
+
+    return (
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="dataset",
+            namespace="mai_lin",
+            name="big-indexed-tar-bench",
+            private=False,
+            commits=(
+                CommitSeed(
+                    summary=f"Seed {bundle_count} indexed-tar pairs for pagination UAT",
+                    description=(
+                        f"Plant {bundle_count} adjacent tar/json pairs so the "
+                        "repo file-list pager has a real-shape directory to "
+                        "navigate. All bundles share one underlying tar so "
+                        "the seed stays cheap on both upload and storage."
+                    ),
+                    files=tuple(files),
+                ),
+            ),
+            download_path="archives/bundle-0000.tar",
+            download_sessions=0,
+        ),
+    )
+
+
 REPO_SEEDS = (
     build_repo_seeds()
     + build_open_media_core_repo_seeds()
     + build_indexed_tar_showcase_repo_seeds()
     + build_open_media_showcase_repo_seeds()
+    + build_big_indexed_tar_pagination_seeds()
 )
 
 LIKES: tuple[tuple[str, str, str, str], ...] = (

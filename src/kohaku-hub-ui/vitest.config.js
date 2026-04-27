@@ -80,6 +80,7 @@ export default defineConfig({
         "src/utils/lfs.js",
         "src/utils/metadata-helpers.js",
         "src/utils/parquet.js",
+        "src/utils/repo-list-pagination.js",
         "src/utils/repoSortPreference.js",
         "src/utils/safetensors.js",
         "src/utils/tag-parser.js",
