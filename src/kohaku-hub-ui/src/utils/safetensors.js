@@ -17,11 +17,18 @@
 //             `parameters` is derived client-side as product(shape) so the
 //             UI can bucket by dtype and sum totals without a second pass.
 //
-// `fetch()` is used directly (not the axios `api` helper) because:
-//   - axios interceptors re-attach auth cookies that would defeat the CORS
-//     `*` preflight on presigned S3/MinIO URLs
-//   - the browser follows the backend 302 to the presigned URL
-//     transparently, preserving the Range request header per RFC 7231 §6.4.3
+// `fetch()` is used directly (not the axios `api` helper) because the
+// browser follows the backend 302 to the presigned URL transparently,
+// preserving the Range request header per RFC 7231 §6.4.3.
+//
+// `credentials: "same-origin"` is required for private repos: the first
+// hop is `/resolve/...` on the SPA's own origin, where the session cookie
+// is the only thing identifying the user — without it the backend's
+// HF-compat anti-enumeration path returns 404 even though the user is
+// logged in. The browser drops cookies on the cross-origin redirect to
+// S3/MinIO, so the presigned URL still works against an
+// `Access-Control-Allow-Origin: *` response without violating the
+// credentialed-CORS rule.
 
 const SAFETENSORS_FIRST_READ_BYTES = 100000; // HF constant
 const SAFETENSORS_MAX_HEADER_LENGTH = 100 * 1024 * 1024; // HF constant
@@ -68,11 +75,12 @@ export async function parseSafetensorsMetadata(url, options = {}) {
   const firstResp = await fetch(url, {
     headers: { Range: `bytes=0-${SAFETENSORS_FIRST_READ_BYTES}` },
     signal,
-    // `cors` is the default; explicit for clarity. Presigned URLs do not
-    // need cookies and sending them would break the Allow-Credentials
-    // contract downstream.
+    // `mode: "cors"` is the default; explicit for clarity. `same-origin`
+    // forwards the SPA session cookie on the same-origin /resolve/ hop
+    // (private repos return 404 without it) and is dropped on the
+    // cross-origin redirect to the presigned object URL.
     mode: "cors",
-    credentials: "omit",
+    credentials: "same-origin",
   });
   if (firstResp.status !== 200 && firstResp.status !== 206) {
     throw await SafetensorsFetchError.fromResponse(firstResp);
@@ -107,7 +115,7 @@ export async function parseSafetensorsMetadata(url, options = {}) {
       headers: { Range: `bytes=8-${headerLen + 7}` },
       signal,
       mode: "cors",
-      credentials: "omit",
+      credentials: "same-origin",
     });
     if (secondResp.status !== 200 && secondResp.status !== 206) {
       throw await SafetensorsFetchError.fromResponse(secondResp);

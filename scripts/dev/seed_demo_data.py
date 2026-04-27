@@ -2622,6 +2622,124 @@ def build_open_media_core_repo_seeds() -> tuple[RepoSeed, ...]:
             download_path="model-00001-of-00003.safetensors",
             download_sessions=4,
         ),
+        # Private mirror of the multimodal benchmark — exercises range-read
+        # previews (parquet + hfutils.index tar + safetensors) on a repo
+        # that only the logged-in owner can resolve. Regression coverage
+        # for the 404-on-missing-session bug seen on private datasets in
+        # production.
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="dataset",
+            namespace="mai_lin",
+            name="private-range-preview-bench",
+            private=True,
+            commits=(
+                CommitSeed(
+                    summary="Seed private range-preview fixtures",
+                    description=(
+                        "One real parquet shard and one hfutils.index tar pair "
+                        "so the SPA's range-read preview paths can be exercised "
+                        "against a repo that requires the session cookie."
+                    ),
+                    files=(
+                        (
+                            "README.md",
+                            text_bytes(
+                                """
+                                ---
+                                license: cc-by-4.0
+                                pretty_name: Private Range-Preview Bench
+                                tags:
+                                  - parquet
+                                  - indexed-tar
+                                  - private
+                                ---
+
+                                # private-range-preview-bench
+
+                                Private dataset used to verify that the SPA's
+                                client-side parquet, indexed-tar, and tar-thumbnail
+                                preview paths still resolve when the only thing
+                                identifying the user is the same-origin session
+                                cookie. Owner-only by design.
+                                """
+                            ),
+                        ),
+                        seed_file(
+                            "parquet/sample-00000-of-00001.parquet",
+                            lambda: make_parquet_bytes(
+                                "private-range-preview", row_count=512, payload_size=512
+                            ),
+                        ),
+                        seed_file(
+                            "archives/raw-bundle-0000.tar",
+                            lambda: archive_bundle()[0],
+                        ),
+                        seed_file(
+                            "archives/raw-bundle-0000.json",
+                            lambda: archive_bundle()[1],
+                        ),
+                    ),
+                ),
+            ),
+            download_path="parquet/sample-00000-of-00001.parquet",
+            download_sessions=0,
+        ),
+        # Private safetensors checkpoint — same regression coverage but
+        # for the model side. One shard + index keeps the seed cheap;
+        # the standalone-blob safetensors preview still has a real header
+        # to parse over a Range read.
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="model",
+            namespace="mai_lin",
+            name="private-vision-checkpoint",
+            private=True,
+            commits=(
+                CommitSeed(
+                    summary="Seed private safetensors shard",
+                    description=(
+                        "One sharded safetensors file plus its index manifest, "
+                        "private, so the safetensors header preview can be "
+                        "exercised against a session-gated /resolve/ path."
+                    ),
+                    files=(
+                        (
+                            "README.md",
+                            text_bytes(
+                                """
+                                ---
+                                license: apache-2.0
+                                library_name: transformers
+                                tags:
+                                  - private
+                                  - safetensors
+                                ---
+
+                                # private-vision-checkpoint
+
+                                Private mirror of one shard from the public
+                                vision-language-assistant-3b bundle. Exists so
+                                the SPA's safetensors header preview can be
+                                verified against a private repo where the only
+                                identity hint is the session cookie.
+                                """
+                            ),
+                        ),
+                        seed_file(
+                            "model.safetensors.index.json",
+                            lambda: model_bundle()["model.safetensors.index.json"],
+                        ),
+                        seed_file(
+                            "model-00001-of-00003.safetensors",
+                            lambda: model_bundle()["model-00001-of-00003.safetensors"],
+                        ),
+                    ),
+                ),
+            ),
+            download_path="model-00001-of-00003.safetensors",
+            download_sessions=0,
+        ),
         RepoSeed(
             actor="mai_lin",
             repo_type="dataset",

@@ -6,9 +6,12 @@
 //
 // Design notes:
 //   - hyparquet's asyncBufferFromUrl does HEAD + tail Range reads on its
-//     own. It accepts `requestInit` so we can pin the cross-origin CORS
-//     contract (mode "cors", credentials "omit") for presigned S3/MinIO
-//     URLs that only allow anonymous access.
+//     own. It accepts `requestInit` so we can pin the CORS contract
+//     (mode "cors", credentials "same-origin"). same-origin forwards the
+//     SPA session cookie on the /resolve/ hop — private repos return 404
+//     without it — and the browser drops cookies on the cross-origin
+//     redirect, so the presigned S3/MinIO URL is still answered with
+//     `Access-Control-Allow-Origin: *` without breaking credentialed CORS.
 //   - The default initial tail fetch is 512 KB, which easily covers the
 //     footer-only cases measured in issue #27 (≤ 264 KB). We leave the
 //     default alone; hyparquet will issue a second Range if the footer
@@ -52,7 +55,7 @@ export async function parseParquetMetadata(url, options = {}) {
 
   const requestInit = {
     mode: "cors",
-    credentials: "omit",
+    credentials: "same-origin",
     ...(signal ? { signal } : {}),
   };
 
