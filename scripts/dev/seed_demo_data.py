@@ -526,10 +526,163 @@ SAFEBOORU_IMAGE_ASSETS: tuple[RemoteAsset, ...] = (
     ),
 )
 
+# Real Danbooru fetches that back the indexed-tar showcase repo. Four
+# Arknights posts at each of the four Danbooru ratings (g/s/q/e per the
+# ratings wiki), plus eight mixed-IP posts spanning the same rating
+# spectrum so the gallery exercises rating diversity inside one tar.
+DANBOORU_INDEXED_TAR_ASSETS: tuple[RemoteAsset, ...] = (
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-4670495.jpg",
+        url="https://cdn.donmai.us/original/ec/3c/ec3c916ed93030b519ddac467e9cf1ca.jpg",
+        sha256="b5af1d9cf48974acdee99340ad5ad60e428e4f27f6c5fb96eae8468a44af96b8",
+        source_url="https://danbooru.donmai.us/posts/4670495",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-5466880.jpg",
+        url="https://cdn.donmai.us/original/b3/a9/b3a9190677c39031048cd271795696de.jpg",
+        sha256="8c4d116cb1e0a19974c3fe3539b9e55c2ff2e7aca0c569a7845f522ac25b1d24",
+        source_url="https://danbooru.donmai.us/posts/5466880",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-9106605.jpg",
+        url="https://cdn.donmai.us/original/c1/bb/c1bb22e771347c4467f43725f2ae62c4.jpg",
+        sha256="4aa76923de04b8a976fe77e89e3880e0019571d5da16952b98765285cba773f1",
+        source_url="https://danbooru.donmai.us/posts/9106605",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-9457445.jpg",
+        url="https://cdn.donmai.us/original/cd/a4/cda466c2d71c3e252e34b73377ace0e1.jpg",
+        sha256="4b8dd816cbb6d611e696817b4a18025755f18d8abed83e2bfe697cf13280f138",
+        source_url="https://danbooru.donmai.us/posts/9457445",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-7576297.jpg",
+        url="https://cdn.donmai.us/original/87/b7/87b7ab2aa407403a86761bbcceab1a12.jpg",
+        sha256="91b636a5974629b889a007ad91f0413d3fa5b4873df9c26dce00a518edaeb918",
+        source_url="https://danbooru.donmai.us/posts/7576297",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-8318664.jpg",
+        url="https://cdn.donmai.us/original/06/ef/06ef3487c9cb6d3391eef61cdaf5c1f9.jpg",
+        sha256="cdf065647dac294d9981c9c99cec04d7761ea41fd7fceb41708c082855f8b6f1",
+        source_url="https://danbooru.donmai.us/posts/8318664",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-8422542.jpg",
+        url="https://cdn.donmai.us/original/71/3c/713cbd309fff56c0d1203ff92531dd70.jpg",
+        sha256="a41c4a62761aea3e73dd662afee302c13eff7b8c680c2a14e75107af6adc9811",
+        source_url="https://danbooru.donmai.us/posts/8422542",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-9280691.jpg",
+        url="https://cdn.donmai.us/original/b8/8a/b88a38f12180704ffcc97cddac338ae1.jpg",
+        sha256="b4da597358b5a9930d1b893e7388fc9366ba527bd681f58c51af0b231aecf023",
+        source_url="https://danbooru.donmai.us/posts/9280691",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-3850730.jpg",
+        url="https://cdn.donmai.us/original/3e/ce/3eced4d3bbfaa70b2fccfdc9d64e81ee.jpg",
+        sha256="c4f246b6916dfe2b9ed7fdce50523b4e5e4627144125e9da525a0f8f137c5694",
+        source_url="https://danbooru.donmai.us/posts/3850730",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-3898266.jpg",
+        url="https://cdn.donmai.us/original/c5/c0/c5c04d5831e27533569ddd0cb105a6dd.jpg",
+        sha256="8a1c89f96506c70ebc5f413c591724ce61651952c0c6409054d77facf60cb7da",
+        source_url="https://danbooru.donmai.us/posts/3898266",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-5296250.jpg",
+        url="https://cdn.donmai.us/original/dc/bf/dcbf73bca941b7f9e2ac88dbbb1f8897.jpg",
+        sha256="403615e52d908da36fc3e196e66112fca7abc9924d14d41d418729d15ae986b1",
+        source_url="https://danbooru.donmai.us/posts/5296250",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-6495120.jpg",
+        url="https://cdn.donmai.us/original/9b/b3/9bb33d31cc5cc744786aaa3892bc7da7.jpg",
+        sha256="caabedf2c2f6a2641285796f4e4012b0663e08ffccc8ee8d3236c34162dd882c",
+        source_url="https://danbooru.donmai.us/posts/6495120",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-3856111.jpg",
+        url="https://cdn.donmai.us/original/ec/5e/ec5e0c5a84f81309713290499d4a2965.jpg",
+        sha256="b7fb84d6629d1793ffa39da807e0b64ac1ad760ae21b5d31f70aae452d7c8538",
+        source_url="https://danbooru.donmai.us/posts/3856111",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-4151927.jpg",
+        url="https://cdn.donmai.us/original/d7/d3/d7d3f29d336015c910e856861d205bb3.jpg",
+        sha256="9cc422fcb224a682c9165204966a450b031e98b6df2e22459050eb39e8e6b760",
+        source_url="https://danbooru.donmai.us/posts/4151927",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-6143658.jpg",
+        url="https://cdn.donmai.us/original/2a/3c/2a3ca65af1528c38022e60f145354c4b.jpg",
+        sha256="ad1e41e90e2590002fbec384a2ae5327dd0a70b118bfefa3af3bee69acbf5fd7",
+        source_url="https://danbooru.donmai.us/posts/6143658",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-10784078.jpg",
+        url="https://cdn.donmai.us/original/3b/cb/3bcbce16bc507306821abbe85269127b.jpg",
+        sha256="9b720042fd63c1e5558c939f8eb065fe0ae6e1769d0f41c5af5427ff2fe95d64",
+        source_url="https://danbooru.donmai.us/posts/10784078",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-genshin-impact-g-7293585.png",
+        url="https://cdn.donmai.us/original/01/8f/018f785ee3789953094e0a4feb65ed27.png",
+        sha256="e499bb38d915394641452349ad310b70b2063fcdc03c9b783aa0b40ed8f3a9ce",
+        source_url="https://danbooru.donmai.us/posts/7293585",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-genshin-impact-g-8524789.jpg",
+        url="https://cdn.donmai.us/original/b8/92/b892a8b367606b16b57d6e3305208f14.jpg",
+        sha256="73af216e63dd8470edaf6e30b7a1a3f3b317fd4cd8509709204c916d1a02425e",
+        source_url="https://danbooru.donmai.us/posts/8524789",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-blue-archive-s-8990007.jpg",
+        url="https://cdn.donmai.us/original/7e/05/7e05e05f71749f9c5a8d775364fb0668.jpg",
+        sha256="0935cfdbd902142a8f97453ebf8b20cdee9a8426cfed324969461f7ce9e55325",
+        source_url="https://danbooru.donmai.us/posts/8990007",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-blue-archive-s-9286565.jpg",
+        url="https://cdn.donmai.us/original/13/f8/13f8f67b5c1a37ad50523b698f82c252.jpg",
+        sha256="57544143adee46fd0a5151225b7982267ccd4af21c73fa0a7ca55b77fb939af6",
+        source_url="https://danbooru.donmai.us/posts/9286565",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-hololive-q-3648775.png",
+        url="https://cdn.donmai.us/original/72/ea/72ea404ecf8aa2c0a8414d612e3e30f1.png",
+        sha256="251ddab56bbe3f05b7c794b84e16e59923a8a43a95efdeba436667794e61aa07",
+        source_url="https://danbooru.donmai.us/posts/3648775",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-hololive-q-6336205.jpg",
+        url="https://cdn.donmai.us/original/a0/c8/a0c844e0f8e49754cedd7affd8d0a6c2.jpg",
+        sha256="abcdb17e3f02908dc6bb593e138d45aca50870190742bb54fbd2e5e8a26d9071",
+        source_url="https://danbooru.donmai.us/posts/6336205",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-original-e-11239919.jpg",
+        url="https://cdn.donmai.us/original/db/75/db75c5b50d1a98a2d7a1505e0140fc14.jpg",
+        sha256="8b5d109e07a8fc722f0086c58382bd54cd3b3c864cea6d97abc8be4c6b193693",
+        source_url="https://danbooru.donmai.us/posts/11239919",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-original-e-11240082.jpg",
+        url="https://cdn.donmai.us/original/0a/25/0a259c798419e77e7d7b06d641985f0c.jpg",
+        sha256="fd8b769867dcd4117cb6a8af392322ffd1d391380891ac9c98f0998c487b5b81",
+        source_url="https://danbooru.donmai.us/posts/11240082",
+    ),
+)
+
+
 REMOTE_MEDIA_ASSETS: dict[str, RemoteAsset] = {
     asset.cache_name: asset
     for asset in (
         *SAFEBOORU_IMAGE_ASSETS,
+        *DANBOORU_INDEXED_TAR_ASSETS,
         RemoteAsset(
             cache_name="voices-speech.wav",
             url=(
@@ -823,6 +976,59 @@ def make_indexed_tar_bundle(
 
     index_bytes = json_bytes(index_info)
     return tar_bytes, index_bytes
+
+
+def make_sine_wav_bytes(
+    label: str,
+    *,
+    duration_seconds: float = 0.4,
+    sample_rate: int = 8000,
+) -> bytes:
+    """Tiny mono PCM WAV with a deterministic sine pitch derived from the
+    label. Avoids pulling in scipy/wave round-trips — the RIFF header is
+    written by hand."""
+    digest = hashlib.sha256(label.encode("utf-8")).digest()
+    base_freq = 220.0 + (digest[0] % 64) * 4
+    sample_count = int(duration_seconds * sample_rate)
+    t = np.arange(sample_count, dtype=np.float32) / sample_rate
+    samples = (np.sin(2 * np.pi * base_freq * t) * 0.4 * 32767).astype(np.int16)
+
+    pcm = samples.tobytes()
+    byte_rate = sample_rate * 2
+    block_align = 2
+    riff = b"RIFF"
+    chunk_size = 36 + len(pcm)
+    fmt_chunk = (
+        b"fmt \x10\x00\x00\x00"
+        + b"\x01\x00"  # PCM
+        + b"\x01\x00"  # mono
+        + sample_rate.to_bytes(4, "little")
+        + byte_rate.to_bytes(4, "little")
+        + block_align.to_bytes(2, "little")
+        + b"\x10\x00"  # 16-bit
+    )
+    data_chunk = b"data" + len(pcm).to_bytes(4, "little") + pcm
+    return riff + chunk_size.to_bytes(4, "little") + b"WAVE" + fmt_chunk + data_chunk
+
+
+def make_indexed_tar_with_overrides(
+    label: str,
+    files: tuple[tuple[str, bytes], ...],
+    *,
+    overrides: dict | None = None,
+) -> tuple[bytes, bytes]:
+    """Same as `make_indexed_tar_bundle`, but post-processes the index
+    JSON before serialization. Used to seed the "stale" (hash_lfs forced
+    to a wrong value) and "no-hash" (hash + hash_lfs stripped) showcase
+    cases without having to handcraft the JSON shape."""
+    tar_bytes, index_bytes = make_indexed_tar_bundle(label, files)
+    if overrides is None:
+        return tar_bytes, index_bytes
+
+    payload = json.loads(index_bytes.decode("utf-8"))
+    for key, value in overrides.items():
+        payload[key] = value
+    return tar_bytes, json_bytes(payload)
 
 
 def make_deep_tree_files(label: str) -> tuple[SeedFile, ...]:
@@ -2460,6 +2666,410 @@ def build_open_media_core_repo_seeds() -> tuple[RepoSeed, ...]:
     )
 
 
+def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
+    """Showcase repo for the read-only indexed-tar browser.
+
+    Each tar+sidecar pair lives in its own subfolder so the sibling
+    detection (file-preview.js → hasIndexSibling) lights the icon
+    only on the .tar in that folder. The five subfolders cover, in
+    order: rich nested navigation, pagination scale, hash-mismatch
+    warning, no-hash notice, and inner safetensors / parquet
+    metadata reuse from inside the archive.
+    """
+
+    # Per-rating Arknights buckets + mixed-IP supplement so the
+    # in-archive listing exercises each Danbooru rating (g/s/q/e) and
+    # the breadcrumb navigates a real-looking 24-image gallery.
+    arknights_by_rating = {
+        "g": (
+            "danbooru-arknights-g-4670495.jpg",
+            "danbooru-arknights-g-5466880.jpg",
+            "danbooru-arknights-g-9106605.jpg",
+            "danbooru-arknights-g-9457445.jpg",
+        ),
+        "s": (
+            "danbooru-arknights-s-7576297.jpg",
+            "danbooru-arknights-s-8318664.jpg",
+            "danbooru-arknights-s-8422542.jpg",
+            "danbooru-arknights-s-9280691.jpg",
+        ),
+        "q": (
+            "danbooru-arknights-q-3850730.jpg",
+            "danbooru-arknights-q-3898266.jpg",
+            "danbooru-arknights-q-5296250.jpg",
+            "danbooru-arknights-q-6495120.jpg",
+        ),
+        "e": (
+            "danbooru-arknights-e-3856111.jpg",
+            "danbooru-arknights-e-4151927.jpg",
+            "danbooru-arknights-e-6143658.jpg",
+            "danbooru-arknights-e-10784078.jpg",
+        ),
+    }
+    misc_ip_assets = (
+        ("genshin-impact", "g", "danbooru-genshin-impact-g-7293585.png"),
+        ("genshin-impact", "g", "danbooru-genshin-impact-g-8524789.jpg"),
+        ("blue-archive", "s", "danbooru-blue-archive-s-8990007.jpg"),
+        ("blue-archive", "s", "danbooru-blue-archive-s-9286565.jpg"),
+        ("hololive", "q", "danbooru-hololive-q-3648775.png"),
+        ("hololive", "q", "danbooru-hololive-q-6336205.jpg"),
+        ("original", "e", "danbooru-original-e-11239919.jpg"),
+        ("original", "e", "danbooru-original-e-11240082.jpg"),
+    )
+
+    gallery_members_list: list[SeedFile] = [
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar gallery
+
+                Mixed-content archive used by the local dev browser to
+                exercise breadcrumb navigation and per-member preview
+                routing (image / audio / text / markdown). The image
+                tree mirrors Danbooru's four ratings (g/s/q/e per the
+                howto:rate wiki) for Arknights, plus a mixed-IP
+                supplement at the same rating spread.
+                """
+            ),
+        ),
+        ("text/notes.txt", text_bytes("alpha\nbeta\ngamma\n")),
+        (
+            "text/log.csv",
+            csv_bytes(
+                (
+                    ("timestamp", "level", "message"),
+                    ("2026-04-27T08:00:00Z", "INFO", "browser opened"),
+                    ("2026-04-27T08:00:01Z", "INFO", "ranged read 1"),
+                    ("2026-04-27T08:00:02Z", "INFO", "ranged read 2"),
+                )
+            ),
+        ),
+        (
+            "text/config.toml",
+            text_bytes(
+                """
+                [browser]
+                page_size = 100
+                view = "list"
+
+                [browser.icons]
+                tar = "carbon-archive"
+                """
+            ),
+        ),
+        (
+            "docs/guide.md",
+            text_bytes(
+                """
+                # Member preview guide
+
+                Click any leaf node in the listing to open a member.
+                Use the **Back** button to return to the listing
+                without losing your in-tar path stack.
+                """
+            ),
+        ),
+        (
+            "docs/examples/sample.json",
+            json_bytes(
+                {
+                    "id": "sample-001",
+                    "labels": ["alpha", "beta", "gamma"],
+                    "score": 0.42,
+                }
+            ),
+        ),
+        (
+            "docs/examples/schema.yaml",
+            text_bytes(
+                """
+                version: 1
+                fields:
+                  - name: id
+                    type: string
+                  - name: score
+                    type: float32
+                """
+            ),
+        ),
+        (
+            "audio/bell.wav",
+            make_sine_wav_bytes("indexed-tar-bell"),
+        ),
+        (
+            "audio/notes/intro.md",
+            text_bytes("# Audio bundle\n\nA short sine tone for preview testing.\n"),
+        ),
+    ]
+    for rating, asset_names in arknights_by_rating.items():
+        for asset_name in asset_names:
+            ext = asset_name.rsplit(".", 1)[1]
+            post_id = asset_name.rsplit("-", 1)[1].rsplit(".", 1)[0]
+            path = f"images/arknights/{rating}/{post_id}.{ext}"
+            gallery_members_list.append(
+                seed_file(path, lambda n=asset_name: remote_asset_bytes(n))
+            )
+    for ip_slug, rating, asset_name in misc_ip_assets:
+        ext = asset_name.rsplit(".", 1)[1]
+        post_id = asset_name.rsplit("-", 1)[1].rsplit(".", 1)[0]
+        path = f"images/misc/{ip_slug}/{rating}/{post_id}.{ext}"
+        gallery_members_list.append(
+            seed_file(path, lambda n=asset_name: remote_asset_bytes(n))
+        )
+    # Materialize once so the tar is built deterministically and the
+    # callable closures do not have to be re-invoked downstream.
+    gallery_members: tuple[tuple[str, bytes], ...] = tuple(
+        materialize_seed_file(entry) for entry in gallery_members_list
+    )
+
+    # Tar 2 — synthetic pagination corpus. ~600 tiny JSON files split
+    # across ten folders so the browser exercises both folder-level
+    # navigation and the page-size selector.
+    large_members_list: list[tuple[str, bytes]] = [
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar large bundle
+
+                Synthetic 600-entry archive used to exercise the
+                pagination + search filter inside the indexed-tar
+                browser modal.
+                """
+            ),
+        ),
+    ]
+    for page in range(1, 11):
+        for item in range(1, 61):
+            path = f"catalog/page-{page:03d}/item-{item:04d}.json"
+            large_members_list.append(
+                (
+                    path,
+                    json_bytes(
+                        {
+                            "page": page,
+                            "item": item,
+                            "label": f"entry-{page:03d}-{item:04d}",
+                            "checksum": hashlib.sha256(path.encode("utf-8"))
+                            .hexdigest()[:16],
+                        }
+                    ),
+                )
+            )
+    large_members: tuple[tuple[str, bytes], ...] = tuple(large_members_list)
+
+    # Tar 3 — same shape as gallery but the index advertises a deliberately
+    # wrong sha256 so the modal banner exercises the "hash mismatch"
+    # warning path. The actual tar bytes here are still valid and
+    # browseable; only the hash recorded inside the JSON is poisoned.
+    stale_members: tuple[tuple[str, bytes], ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar with stale sidecar hash
+
+                The .json sidecar in this folder advertises a sha256
+                that does not match the .tar bytes. Opening the
+                archive in the browser should surface a warning
+                banner before showing the listing.
+                """
+            ),
+        ),
+        ("text/note.txt", text_bytes("stale-hash demo entry\n")),
+        (
+            "images/sample.jpg",
+            remote_asset_bytes("danbooru-genshin-impact-g-8524789.jpg"),
+        ),
+    )
+
+    # Tar 4 — hash + hash_lfs stripped from the index so the modal
+    # exercises the "unknown hash" notice (info banner, not warning).
+    no_hash_members: tuple[tuple[str, bytes], ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar without hash metadata
+
+                The sidecar for this archive has its `hash` and
+                `hash_lfs` fields cleared, so the browser cannot
+                verify consistency. Listings still work — only the
+                top banner is downgraded to a notice.
+                """
+            ),
+        ),
+        ("text/manifest.txt", text_bytes("entries:\n  - alpha\n  - beta\n")),
+        (
+            "audio/note.wav",
+            make_sine_wav_bytes("indexed-tar-no-hash"),
+        ),
+        (
+            "images/sample.jpg",
+            remote_asset_bytes("danbooru-blue-archive-s-8990007.jpg"),
+        ),
+    )
+
+    # Tar 5 — archive containing a real safetensors and a real parquet
+    # so the inner-preview reuses FilePreviewDialog directly on the
+    # extracted blob. Demonstrates that the safetensors / parquet
+    # metadata view works for in-archive members.
+    models_members: tuple[tuple[str, bytes], ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar with model artifacts
+
+                Real safetensors + parquet members so the inner
+                metadata preview can be exercised end to end from
+                inside the archive.
+                """
+            ),
+        ),
+        (
+            "weights/router.safetensors",
+            make_single_checkpoint_bytes(
+                "indexed-tar-router",
+                (
+                    ("encoder.embed.weight", (256, 64)),
+                    ("encoder.layer0.attn.q_proj.weight", (64, 64)),
+                ),
+            ),
+        ),
+        (
+            "data/sample.parquet",
+            make_parquet_bytes(
+                "indexed-tar-models",
+                row_count=512,
+                payload_size=512,
+            ),
+        ),
+        (
+            "metadata/feature-card.json",
+            json_bytes(
+                {
+                    "shards": [
+                        "weights/router.safetensors",
+                        "data/sample.parquet",
+                    ],
+                    "purpose": "in-archive metadata preview demo",
+                }
+            ),
+        ),
+    )
+
+    gallery_tar, gallery_idx = make_indexed_tar_bundle(
+        "indexed-tar-gallery", gallery_members
+    )
+    large_tar, large_idx = make_indexed_tar_bundle(
+        "indexed-tar-large", large_members
+    )
+    fake_sha256 = "0" * 64
+    stale_tar, stale_idx = make_indexed_tar_with_overrides(
+        "indexed-tar-stale",
+        stale_members,
+        overrides={"hash_lfs": fake_sha256},
+    )
+    no_hash_tar, no_hash_idx = make_indexed_tar_with_overrides(
+        "indexed-tar-no-hash",
+        no_hash_members,
+        overrides={"hash": "", "hash_lfs": ""},
+    )
+    models_tar, models_idx = make_indexed_tar_bundle(
+        "indexed-tar-models", models_members
+    )
+
+    files: tuple[SeedFile, ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                ---
+                license: cc-by-4.0
+                pretty_name: Indexed Tar Showcase
+                tags:
+                  - indexed-tar
+                  - hfutils-index
+                  - local-dev-fixture
+                ---
+
+                # indexed-tar-showcase
+
+                Local-dev dataset for the read-only indexed-tar browser.
+                Each subfolder under `archives/` holds a .tar + .json
+                sidecar pair that surfaces a different facet of the
+                modal:
+
+                | Folder            | Demonstrates                                              |
+                |-------------------|-----------------------------------------------------------|
+                | archives/gallery  | Nested folders + 24 real Danbooru fan-art (4 ratings)     |
+                | archives/large    | Pagination + search inside a single archive (~600 entries)|
+                | archives/stale    | Tar bytes diverging from sidecar hash → warning banner    |
+                | archives/no-hash  | Sidecar with stripped hashes → info notice banner         |
+                | archives/models   | Safetensors / parquet metadata preview from inside the tar|
+
+                The gallery archive has its image members organised by
+                Danbooru's four ratings (g/s/q/e per the howto:rate wiki):
+                sixteen Arknights posts (four per rating) plus an
+                eight-image mixed-IP supplement spanning the same
+                rating spread (Genshin Impact / Blue Archive / Hololive
+                / original).
+                """
+            ),
+        ),
+        (
+            "metadata/showcase.json",
+            json_bytes(
+                {
+                    "subfolders": [
+                        "archives/gallery",
+                        "archives/large",
+                        "archives/stale",
+                        "archives/no-hash",
+                        "archives/models",
+                    ],
+                    "format": "hfutils.index",
+                }
+            ),
+        ),
+        seed_file("archives/gallery/bundle.tar", lambda: gallery_tar),
+        seed_file("archives/gallery/bundle.json", lambda: gallery_idx),
+        seed_file("archives/large/bundle.tar", lambda: large_tar),
+        seed_file("archives/large/bundle.json", lambda: large_idx),
+        seed_file("archives/stale/bundle.tar", lambda: stale_tar),
+        seed_file("archives/stale/bundle.json", lambda: stale_idx),
+        seed_file("archives/no-hash/bundle.tar", lambda: no_hash_tar),
+        seed_file("archives/no-hash/bundle.json", lambda: no_hash_idx),
+        seed_file("archives/models/bundle.tar", lambda: models_tar),
+        seed_file("archives/models/bundle.json", lambda: models_idx),
+    )
+
+    return (
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="dataset",
+            namespace="open-media-lab",
+            name="indexed-tar-showcase",
+            private=False,
+            commits=(
+                CommitSeed(
+                    summary="Seed indexed-tar showcase",
+                    description=(
+                        "Plant five tar+sidecar pairs that cover navigation, "
+                        "pagination, hash mismatch, missing-hash notice, and "
+                        "in-archive safetensors / parquet metadata preview."
+                    ),
+                    files=files,
+                ),
+            ),
+            download_path="archives/gallery/bundle.json",
+            download_sessions=3,
+        ),
+    )
+
+
 def build_open_media_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
     specs = (
         ("model", "dock-caption-lite", False, "dock captioning smoke-test model"),
@@ -2578,6 +3188,7 @@ def build_open_media_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
 REPO_SEEDS = (
     build_repo_seeds()
     + build_open_media_core_repo_seeds()
+    + build_indexed_tar_showcase_repo_seeds()
     + build_open_media_showcase_repo_seeds()
 )
 

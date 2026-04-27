@@ -122,6 +122,53 @@ export async function parseSafetensorsMetadata(url, options = {}) {
   }
 
   onProgress("parsing");
+  const result = decodeSafetensorsHeader(headerBytes);
+  onProgress("done");
+  return result;
+}
+
+/**
+ * Parse a safetensors header from a fully in-memory file buffer.
+ *
+ * Used for the in-archive preview path inside TarBrowserDialog: a
+ * member is extracted via a single tar Range read into a Uint8Array,
+ * and the resulting bytes are handed straight to this function. The
+ * URL-based parser is not reusable there because hyparquet's helper
+ * (and our own Range-second-read fallback) issue HEAD or Range
+ * requests against the source URL, and `blob:` URLs do not honour
+ * those reliably across browsers — the failure surfaces as a
+ * "Browser blocked the request" CORS-shaped error.
+ *
+ * @param {Uint8Array|ArrayBuffer} buffer
+ * @returns {{metadata: object|null, tensors: object}}
+ */
+export function parseSafetensorsMetadataFromBuffer(buffer) {
+  const bytes =
+    buffer instanceof Uint8Array
+      ? buffer
+      : new Uint8Array(buffer);
+  if (bytes.byteLength < 8) {
+    throw new SafetensorsFormatError(
+      `Truncated buffer (${bytes.byteLength} bytes), expected at least 8 for header length prefix`,
+    );
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const headerLen = Number(view.getBigUint64(0, /* littleEndian */ true));
+  if (headerLen > SAFETENSORS_MAX_HEADER_LENGTH) {
+    throw new SafetensorsFormatError(
+      `Safetensors header too large: ${headerLen} > ${SAFETENSORS_MAX_HEADER_LENGTH}`,
+    );
+  }
+  if (8 + headerLen > bytes.byteLength) {
+    throw new SafetensorsFormatError(
+      `Buffer is shorter than declared header (need ${8 + headerLen} bytes, have ${bytes.byteLength})`,
+    );
+  }
+  const headerBytes = bytes.subarray(8, 8 + headerLen);
+  return decodeSafetensorsHeader(headerBytes);
+}
+
+function decodeSafetensorsHeader(headerBytes) {
   let raw;
   try {
     raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(headerBytes));
@@ -150,8 +197,6 @@ export async function parseSafetensorsMetadata(url, options = {}) {
       parameters,
     };
   }
-
-  onProgress("done");
   return { metadata, tensors };
 }
 
