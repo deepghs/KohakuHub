@@ -62,6 +62,29 @@ describe("admin API client", () => {
     await api.getDependencyHealth("admin-token");
     await api.getDependencyHealth("admin-token", { timeoutSeconds: 1.5 });
 
+    await api.listAdminSessions("admin-token");
+    await api.listAdminSessions("admin-token", {
+      user: "outsider",
+      activeOnly: true,
+      createdAfter: "2026-01-01T00:00:00Z",
+      limit: 5,
+      offset: 10,
+    });
+    await api.revokeAdminSession("admin-token", 42);
+    await api.revokeAdminSessionsBulk("admin-token", { user: "outsider" });
+
+    await api.listAdminTokens("admin-token", {
+      user: "owner",
+      unusedForDays: 30,
+    });
+    await api.revokeAdminToken("admin-token", 7);
+
+    await api.listAdminSshKeys("admin-token", {
+      user: "owner",
+      unusedForDays: 90,
+    });
+    await api.revokeAdminSshKey("admin-token", 3);
+
     await api.listRepositories("admin-token", {
       search: "lineart",
       repo_type: "model",
@@ -207,6 +230,30 @@ describe("admin API client", () => {
     expect(client.get).toHaveBeenCalledWith("/health/dependencies", {
       params: { timeout_seconds: 1.5 },
     });
+    expect(client.get).toHaveBeenCalledWith("/sessions", {
+      params: { limit: 100, offset: 0 },
+    });
+    expect(client.get).toHaveBeenCalledWith("/sessions", {
+      params: {
+        limit: 5,
+        offset: 10,
+        user: "outsider",
+        active_only: true,
+        created_after: "2026-01-01T00:00:00Z",
+      },
+    });
+    expect(client.delete).toHaveBeenCalledWith("/sessions/42");
+    expect(client.post).toHaveBeenCalledWith("/sessions/revoke-bulk", {
+      user: "outsider",
+    });
+    expect(client.get).toHaveBeenCalledWith("/tokens", {
+      params: { limit: 100, offset: 0, user: "owner", unused_for_days: 30 },
+    });
+    expect(client.delete).toHaveBeenCalledWith("/tokens/7");
+    expect(client.get).toHaveBeenCalledWith("/ssh-keys", {
+      params: { limit: 100, offset: 0, user: "owner", unused_for_days: 90 },
+    });
+    expect(client.delete).toHaveBeenCalledWith("/ssh-keys/3");
     expect(client.get).toHaveBeenCalledWith("/repositories", {
       params: {
         search: "lineart",

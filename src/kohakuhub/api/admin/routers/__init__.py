@@ -1,6 +1,7 @@
 """Admin routers."""
 
 from kohakuhub.api.admin.routers.commits import router as commits_router
+from kohakuhub.api.admin.routers.credentials import router as credentials_router
 from kohakuhub.api.admin.routers.database import router as database_router
 from kohakuhub.api.admin.routers.fallback import router as fallback_router
 from kohakuhub.api.admin.routers.health import router as health_router
@@ -14,6 +15,7 @@ from kohakuhub.api.admin.routers.users import router as users_router
 
 __all__ = [
     "commits_router",
+    "credentials_router",
     "database_router",
     "fallback_router",
     "health_router",
