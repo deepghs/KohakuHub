@@ -825,6 +825,95 @@ def make_indexed_tar_bundle(
     return tar_bytes, index_bytes
 
 
+def make_solid_color_image_bytes(
+    label: str,
+    *,
+    size: tuple[int, int] = (320, 200),
+    fmt: str = "PNG",
+) -> bytes:
+    """Render a deterministic labeled rectangle so the indexed-tar
+    showcase can carry varied image members without depending on
+    network-fetched assets."""
+    digest = hashlib.sha256(label.encode("utf-8")).digest()
+    bg = (digest[0], digest[1], digest[2])
+    fg = (255 - digest[3], 255 - digest[4], 255 - digest[5])
+
+    image = Image.new("RGB", size, bg)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(
+        (8, 8, size[0] - 8, size[1] - 8),
+        outline=fg,
+        width=4,
+    )
+    font = ImageFont.load_default()
+    box = draw.textbbox((0, 0), label, font=font)
+    text_width = box[2] - box[0]
+    text_height = box[3] - box[1]
+    draw.text(
+        ((size[0] - text_width) / 2, (size[1] - text_height) / 2),
+        label,
+        fill=fg,
+        font=font,
+    )
+
+    buffer = io.BytesIO()
+    image.save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+def make_sine_wav_bytes(
+    label: str,
+    *,
+    duration_seconds: float = 0.4,
+    sample_rate: int = 8000,
+) -> bytes:
+    """Tiny mono PCM WAV with a deterministic sine pitch derived from the
+    label. Avoids pulling in scipy/wave round-trips — the RIFF header is
+    written by hand."""
+    digest = hashlib.sha256(label.encode("utf-8")).digest()
+    base_freq = 220.0 + (digest[0] % 64) * 4
+    sample_count = int(duration_seconds * sample_rate)
+    t = np.arange(sample_count, dtype=np.float32) / sample_rate
+    samples = (np.sin(2 * np.pi * base_freq * t) * 0.4 * 32767).astype(np.int16)
+
+    pcm = samples.tobytes()
+    byte_rate = sample_rate * 2
+    block_align = 2
+    riff = b"RIFF"
+    chunk_size = 36 + len(pcm)
+    fmt_chunk = (
+        b"fmt \x10\x00\x00\x00"
+        + b"\x01\x00"  # PCM
+        + b"\x01\x00"  # mono
+        + sample_rate.to_bytes(4, "little")
+        + byte_rate.to_bytes(4, "little")
+        + block_align.to_bytes(2, "little")
+        + b"\x10\x00"  # 16-bit
+    )
+    data_chunk = b"data" + len(pcm).to_bytes(4, "little") + pcm
+    return riff + chunk_size.to_bytes(4, "little") + b"WAVE" + fmt_chunk + data_chunk
+
+
+def make_indexed_tar_with_overrides(
+    label: str,
+    files: tuple[tuple[str, bytes], ...],
+    *,
+    overrides: dict | None = None,
+) -> tuple[bytes, bytes]:
+    """Same as `make_indexed_tar_bundle`, but post-processes the index
+    JSON before serialization. Used to seed the "stale" (hash_lfs forced
+    to a wrong value) and "no-hash" (hash + hash_lfs stripped) showcase
+    cases without having to handcraft the JSON shape."""
+    tar_bytes, index_bytes = make_indexed_tar_bundle(label, files)
+    if overrides is None:
+        return tar_bytes, index_bytes
+
+    payload = json.loads(index_bytes.decode("utf-8"))
+    for key, value in overrides.items():
+        payload[key] = value
+    return tar_bytes, json_bytes(payload)
+
+
 def make_deep_tree_files(label: str) -> tuple[SeedFile, ...]:
     files: list[SeedFile] = []
     for section in range(1, 7):
@@ -2460,6 +2549,357 @@ def build_open_media_core_repo_seeds() -> tuple[RepoSeed, ...]:
     )
 
 
+def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
+    """Showcase repo for the read-only indexed-tar browser.
+
+    Each tar+sidecar pair lives in its own subfolder so the sibling
+    detection (file-preview.js → hasIndexSibling) lights the icon
+    only on the .tar in that folder. The five subfolders cover, in
+    order: rich nested navigation, pagination scale, hash-mismatch
+    warning, no-hash notice, and inner safetensors / parquet
+    metadata reuse from inside the archive.
+    """
+
+    # Tar 1 — rich nested gallery covering every preview renderer.
+    gallery_members: tuple[tuple[str, bytes], ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar gallery
+
+                Mixed-content archive used by the local dev browser to
+                exercise breadcrumb navigation and per-member preview
+                routing (image / video / audio / pdf / text / markdown).
+                """
+            ),
+        ),
+        ("text/notes.txt", text_bytes("alpha\nbeta\ngamma\n")),
+        (
+            "text/log.csv",
+            csv_bytes(
+                (
+                    ("timestamp", "level", "message"),
+                    ("2026-04-27T08:00:00Z", "INFO", "browser opened"),
+                    ("2026-04-27T08:00:01Z", "INFO", "ranged read 1"),
+                    ("2026-04-27T08:00:02Z", "INFO", "ranged read 2"),
+                )
+            ),
+        ),
+        (
+            "text/config.toml",
+            text_bytes(
+                """
+                [browser]
+                page_size = 100
+                view = "list"
+
+                [browser.icons]
+                tar = "carbon-archive"
+                """
+            ),
+        ),
+        (
+            "docs/guide.md",
+            text_bytes(
+                """
+                # Member preview guide
+
+                Click any leaf node in the listing to open a member.
+                Use the **Back** button to return to the listing
+                without losing your in-tar path stack.
+                """
+            ),
+        ),
+        (
+            "docs/examples/sample.json",
+            json_bytes(
+                {
+                    "id": "sample-001",
+                    "labels": ["alpha", "beta", "gamma"],
+                    "score": 0.42,
+                }
+            ),
+        ),
+        (
+            "docs/examples/schema.yaml",
+            text_bytes(
+                """
+                version: 1
+                fields:
+                  - name: id
+                    type: string
+                  - name: score
+                    type: float32
+                """
+            ),
+        ),
+        (
+            "images/cover.png",
+            make_solid_color_image_bytes("indexed-tar-cover", size=(480, 240)),
+        ),
+        (
+            "images/thumb.jpg",
+            make_solid_color_image_bytes(
+                "indexed-tar-thumb",
+                size=(160, 160),
+                fmt="JPEG",
+            ),
+        ),
+        (
+            "images/photos/nature/forest.jpg",
+            remote_asset_bytes("safebooru-forest-lake.jpg"),
+        ),
+        (
+            "images/photos/nature/lake.jpg",
+            remote_asset_bytes("safebooru-mountain-church.jpg"),
+        ),
+        (
+            "audio/bell.wav",
+            make_sine_wav_bytes("indexed-tar-bell"),
+        ),
+        (
+            "audio/notes/intro.md",
+            text_bytes("# Audio bundle\n\nA short sine tone for preview testing.\n"),
+        ),
+    )
+
+    # Tar 2 — synthetic pagination corpus. ~600 tiny JSON files split
+    # across ten folders so the browser exercises both folder-level
+    # navigation and the page-size selector.
+    large_members_list: list[tuple[str, bytes]] = [
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar large bundle
+
+                Synthetic 600-entry archive used to exercise the
+                pagination + search filter inside the indexed-tar
+                browser modal.
+                """
+            ),
+        ),
+    ]
+    for page in range(1, 11):
+        for item in range(1, 61):
+            path = f"catalog/page-{page:03d}/item-{item:04d}.json"
+            large_members_list.append(
+                (
+                    path,
+                    json_bytes(
+                        {
+                            "page": page,
+                            "item": item,
+                            "label": f"entry-{page:03d}-{item:04d}",
+                            "checksum": hashlib.sha256(path.encode("utf-8"))
+                            .hexdigest()[:16],
+                        }
+                    ),
+                )
+            )
+    large_members: tuple[tuple[str, bytes], ...] = tuple(large_members_list)
+
+    # Tar 3 — same shape as gallery but the index advertises a deliberately
+    # wrong sha256 so the modal banner exercises the "hash mismatch"
+    # warning path. The actual tar bytes here are still valid and
+    # browseable; only the hash recorded inside the JSON is poisoned.
+    stale_members: tuple[tuple[str, bytes], ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar with stale sidecar hash
+
+                The .json sidecar in this folder advertises a sha256
+                that does not match the .tar bytes. Opening the
+                archive in the browser should surface a warning
+                banner before showing the listing.
+                """
+            ),
+        ),
+        ("text/note.txt", text_bytes("stale-hash demo entry\n")),
+        (
+            "images/sample.png",
+            make_solid_color_image_bytes("indexed-tar-stale", size=(240, 160)),
+        ),
+    )
+
+    # Tar 4 — hash + hash_lfs stripped from the index so the modal
+    # exercises the "unknown hash" notice (info banner, not warning).
+    no_hash_members: tuple[tuple[str, bytes], ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar without hash metadata
+
+                The sidecar for this archive has its `hash` and
+                `hash_lfs` fields cleared, so the browser cannot
+                verify consistency. Listings still work — only the
+                top banner is downgraded to a notice.
+                """
+            ),
+        ),
+        ("text/manifest.txt", text_bytes("entries:\n  - alpha\n  - beta\n")),
+        (
+            "audio/note.wav",
+            make_sine_wav_bytes("indexed-tar-no-hash"),
+        ),
+    )
+
+    # Tar 5 — archive containing a real safetensors and a real parquet
+    # so the inner-preview reuses FilePreviewDialog directly on the
+    # extracted blob. Demonstrates that the safetensors / parquet
+    # metadata view works for in-archive members.
+    models_members: tuple[tuple[str, bytes], ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Indexed tar with model artifacts
+
+                Real safetensors + parquet members so the inner
+                metadata preview can be exercised end to end from
+                inside the archive.
+                """
+            ),
+        ),
+        (
+            "weights/router.safetensors",
+            make_single_checkpoint_bytes(
+                "indexed-tar-router",
+                (
+                    ("encoder.embed.weight", (256, 64)),
+                    ("encoder.layer0.attn.q_proj.weight", (64, 64)),
+                ),
+            ),
+        ),
+        (
+            "data/sample.parquet",
+            make_parquet_bytes(
+                "indexed-tar-models",
+                row_count=512,
+                payload_size=512,
+            ),
+        ),
+        (
+            "metadata/feature-card.json",
+            json_bytes(
+                {
+                    "shards": [
+                        "weights/router.safetensors",
+                        "data/sample.parquet",
+                    ],
+                    "purpose": "in-archive metadata preview demo",
+                }
+            ),
+        ),
+    )
+
+    gallery_tar, gallery_idx = make_indexed_tar_bundle(
+        "indexed-tar-gallery", gallery_members
+    )
+    large_tar, large_idx = make_indexed_tar_bundle(
+        "indexed-tar-large", large_members
+    )
+    fake_sha256 = "0" * 64
+    stale_tar, stale_idx = make_indexed_tar_with_overrides(
+        "indexed-tar-stale",
+        stale_members,
+        overrides={"hash_lfs": fake_sha256},
+    )
+    no_hash_tar, no_hash_idx = make_indexed_tar_with_overrides(
+        "indexed-tar-no-hash",
+        no_hash_members,
+        overrides={"hash": "", "hash_lfs": ""},
+    )
+    models_tar, models_idx = make_indexed_tar_bundle(
+        "indexed-tar-models", models_members
+    )
+
+    files: tuple[SeedFile, ...] = (
+        (
+            "README.md",
+            text_bytes(
+                """
+                ---
+                license: cc-by-4.0
+                pretty_name: Indexed Tar Showcase
+                tags:
+                  - indexed-tar
+                  - hfutils-index
+                  - local-dev-fixture
+                ---
+
+                # indexed-tar-showcase
+
+                Local-dev dataset for the read-only indexed-tar browser.
+                Each subfolder under `archives/` holds a .tar + .json
+                sidecar pair that surfaces a different facet of the
+                modal:
+
+                | Folder            | Demonstrates                                              |
+                |-------------------|-----------------------------------------------------------|
+                | archives/gallery  | Nested folders, mixed media (image/audio/markdown/text)   |
+                | archives/large    | Pagination + search inside a single archive (~600 entries)|
+                | archives/stale    | Tar bytes diverging from sidecar hash → warning banner    |
+                | archives/no-hash  | Sidecar with stripped hashes → info notice banner         |
+                | archives/models   | Safetensors / parquet metadata preview from inside the tar|
+                """
+            ),
+        ),
+        (
+            "metadata/showcase.json",
+            json_bytes(
+                {
+                    "subfolders": [
+                        "archives/gallery",
+                        "archives/large",
+                        "archives/stale",
+                        "archives/no-hash",
+                        "archives/models",
+                    ],
+                    "format": "hfutils.index",
+                }
+            ),
+        ),
+        seed_file("archives/gallery/bundle.tar", lambda: gallery_tar),
+        seed_file("archives/gallery/bundle.json", lambda: gallery_idx),
+        seed_file("archives/large/bundle.tar", lambda: large_tar),
+        seed_file("archives/large/bundle.json", lambda: large_idx),
+        seed_file("archives/stale/bundle.tar", lambda: stale_tar),
+        seed_file("archives/stale/bundle.json", lambda: stale_idx),
+        seed_file("archives/no-hash/bundle.tar", lambda: no_hash_tar),
+        seed_file("archives/no-hash/bundle.json", lambda: no_hash_idx),
+        seed_file("archives/models/bundle.tar", lambda: models_tar),
+        seed_file("archives/models/bundle.json", lambda: models_idx),
+    )
+
+    return (
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="dataset",
+            namespace="open-media-lab",
+            name="indexed-tar-showcase",
+            private=False,
+            commits=(
+                CommitSeed(
+                    summary="Seed indexed-tar showcase",
+                    description=(
+                        "Plant five tar+sidecar pairs that cover navigation, "
+                        "pagination, hash mismatch, missing-hash notice, and "
+                        "in-archive safetensors / parquet metadata preview."
+                    ),
+                    files=files,
+                ),
+            ),
+            download_path="archives/gallery/bundle.json",
+            download_sessions=3,
+        ),
+    )
+
+
 def build_open_media_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
     specs = (
         ("model", "dock-caption-lite", False, "dock captioning smoke-test model"),
@@ -2578,6 +3018,7 @@ def build_open_media_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
 REPO_SEEDS = (
     build_repo_seeds()
     + build_open_media_core_repo_seeds()
+    + build_indexed_tar_showcase_repo_seeds()
     + build_open_media_showcase_repo_seeds()
 )
 

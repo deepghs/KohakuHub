@@ -30,6 +30,31 @@ describe("file-preview helpers", () => {
       expect(getPreviewKind("archive.tar.gz")).toBeNull();
     });
 
+    it("returns null for a .tar file with no listing siblings", () => {
+      // Bare .tar files are extremely common; the icon should stay
+      // dark unless the same listing carries a sibling .json that
+      // looks like an hfutils.index sidecar.
+      expect(getPreviewKind("archives/bundle.tar")).toBeNull();
+    });
+
+    it("returns 'indexed-tar' when the listing contains a sibling .json", () => {
+      const siblings = [
+        { type: "file", path: "archives/bundle.tar" },
+        { type: "file", path: "archives/bundle.json" },
+      ];
+      expect(getPreviewKind("archives/bundle.tar", siblings)).toBe(
+        "indexed-tar",
+      );
+    });
+
+    it("does not light up bare .tar even when an unrelated .json exists", () => {
+      const siblings = [
+        { type: "file", path: "archives/bundle.tar" },
+        { type: "file", path: "archives/something-else.json" },
+      ];
+      expect(getPreviewKind("archives/bundle.tar", siblings)).toBeNull();
+    });
+
     it("returns null for bad inputs", () => {
       expect(getPreviewKind("")).toBeNull();
       expect(getPreviewKind(null)).toBeNull();
@@ -59,6 +84,22 @@ describe("file-preview helpers", () => {
 
     it("rejects files with non-preview extensions", () => {
       expect(canPreviewFile({ type: "file", path: "README.md" })).toBe(false);
+    });
+
+    it("rejects bare .tar without a sibling .json", () => {
+      expect(canPreviewFile({ type: "file", path: "archive.tar" })).toBe(
+        false,
+      );
+    });
+
+    it("accepts .tar with a sibling .json passed via siblings", () => {
+      const siblings = [
+        { type: "file", path: "archive.tar" },
+        { type: "file", path: "archive.json" },
+      ];
+      expect(
+        canPreviewFile({ type: "file", path: "archive.tar" }, siblings),
+      ).toBe(true);
     });
 
     it("rejects bad inputs defensively", () => {

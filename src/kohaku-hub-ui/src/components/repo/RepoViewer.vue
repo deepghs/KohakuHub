@@ -521,14 +521,14 @@
                   <div class="font-medium truncate flex items-center gap-2">
                     <span class="truncate">{{ getFileName(file.path) }}</span>
                     <button
-                      v-if="canPreviewFile(file)"
+                      v-if="canPreviewFile(file, fileTree)"
                       type="button"
                       class="relative z-20 flex-shrink-0 text-gray-400 hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
-                      :title="`Preview ${getPreviewKind(file.path)} metadata (Range-read, no download)`"
+                      :title="previewIconTitle(file)"
                       :aria-label="`Preview metadata for ${getFileName(file.path)}`"
                       @click.stop="openFilePreview(file)"
                     >
-                      <div class="i-carbon-chart-line-data text-base" />
+                      <div :class="previewIconClass(file)" class="text-base" />
                     </button>
                   </div>
                   <div
@@ -898,6 +898,15 @@ huggingface-cli download {{ repoInfo?.id }}</pre
       :resolve-url="previewTarget.resolveUrl"
       :filename="previewTarget.filename"
     />
+
+    <TarBrowserDialog
+      v-if="tarBrowserTarget"
+      v-model:visible="tarBrowserDialogVisible"
+      :tar-url="tarBrowserTarget.tarUrl"
+      :index-url="tarBrowserTarget.indexUrl"
+      :filename="tarBrowserTarget.filename"
+      :tar-tree-entry="tarBrowserTarget.tarTreeEntry"
+    />
   </div>
 </template>
 
@@ -924,6 +933,7 @@ import SidebarRelationshipsCard from "@/components/repo/metadata/SidebarRelation
 import DatasetViewerTab from "@/components/repo/DatasetViewerTab.vue";
 import ErrorState from "@/components/common/ErrorState.vue";
 import FilePreviewDialog from "@/components/repo/preview/FilePreviewDialog.vue";
+import TarBrowserDialog from "@/components/repo/preview/TarBrowserDialog.vue";
 import {
   buildResolveUrl,
   canPreviewFile,
@@ -983,22 +993,63 @@ const fileTreeRequestId = ref(0);
 // file header via HTTP Range against /resolve/ (no backend parsing).
 // Predicate + URL builder live in @/utils/file-preview so they stay
 // directly unit-testable; everything here is Vue glue.
+//
+// Indexed-tar (.tar + sibling .json) reuses the same icon-on-row idiom
+// but routes to TarBrowserDialog — the icon only lights up when the
+// sibling .json sits in the same fileTree listing.
 const previewDialogVisible = ref(false);
 const previewTarget = ref(null); // { kind, resolveUrl, filename }
+const tarBrowserDialogVisible = ref(false);
+const tarBrowserTarget = ref(null); // { tarUrl, indexUrl, filename, tarTreeEntry }
+
+const PREVIEW_ICON_BY_KIND = {
+  safetensors: "i-carbon-chart-line-data",
+  parquet: "i-carbon-chart-line-data",
+  "indexed-tar": "i-carbon-archive",
+};
+
+function previewIconClass(file) {
+  const kind = getPreviewKind(file.path, fileTree.value);
+  return PREVIEW_ICON_BY_KIND[kind] || "i-carbon-chart-line-data";
+}
+
+function previewIconTitle(file) {
+  const kind = getPreviewKind(file.path, fileTree.value);
+  if (kind === "indexed-tar") {
+    return "Browse indexed tar contents (Range-read, no full download)";
+  }
+  return `Preview ${kind} metadata (Range-read, no download)`;
+}
+
+function buildResolveForPath(path) {
+  return buildResolveUrl({
+    baseUrl,
+    repoType: props.repoType,
+    namespace: props.namespace,
+    name: props.name,
+    branch: currentBranch.value,
+    path,
+  });
+}
 
 function openFilePreview(file) {
-  const kind = getPreviewKind(file.path);
+  const kind = getPreviewKind(file.path, fileTree.value);
   if (!kind) return;
+  if (kind === "indexed-tar") {
+    const dot = file.path.lastIndexOf(".");
+    const indexPath = `${file.path.slice(0, dot)}.json`;
+    tarBrowserTarget.value = {
+      tarUrl: buildResolveForPath(file.path),
+      indexUrl: buildResolveForPath(indexPath),
+      filename: getFileName(file.path),
+      tarTreeEntry: file,
+    };
+    tarBrowserDialogVisible.value = true;
+    return;
+  }
   previewTarget.value = {
     kind,
-    resolveUrl: buildResolveUrl({
-      baseUrl,
-      repoType: props.repoType,
-      namespace: props.namespace,
-      name: props.name,
-      branch: currentBranch.value,
-      path: file.path,
-    }),
+    resolveUrl: buildResolveForPath(file.path),
     filename: getFileName(file.path),
   };
   previewDialogVisible.value = true;

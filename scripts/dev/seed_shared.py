@@ -1,3 +1,3 @@
 """Shared constants for local demo seed tooling."""
 
-SEED_VERSION = "local-dev-demo-v5"
+SEED_VERSION = "local-dev-demo-v6"
