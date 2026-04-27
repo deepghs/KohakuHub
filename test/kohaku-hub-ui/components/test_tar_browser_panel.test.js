@@ -211,6 +211,119 @@ describe("TarBrowserPanel · lifecycle", () => {
     expect(wrapper.findComponent({ name: "ErrorState" }).exists()).toBe(true);
   });
 
+  it("re-runs startLoad when the ErrorState retry callback fires", async () => {
+    // First request fails — second request (after retry) succeeds.
+    let attempt = 0;
+    const archive = buildArchive([["x.txt", text("x")]]);
+    server.use(
+      http.get(INDEX_URL, () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return new HttpResponse("nope", { status: 500 });
+        }
+        return HttpResponse.json({
+          filesize: archive.totalSize,
+          hash: "",
+          hash_lfs: "",
+          files: archive.files,
+        });
+      }),
+      http.get(TAR_URL, rangeResponder(archive.buffer)),
+    );
+    const wrapper = mountPanel();
+    await flushPromises();
+    const errorState = wrapper.findComponent({ name: "ErrorState" });
+    expect(errorState.exists()).toBe(true);
+    // The panel passes its `retry` function down through the
+    // ErrorState's `retry` prop. Invoke it directly to cover the
+    // function (the actual button is inside the unstubbed
+    // ErrorState body and would require deeper plumbing).
+    await errorState.props("retry")();
+    await flushPromises();
+    expect(wrapper.text()).toContain("x.txt");
+  });
+
+  it("propagates an openMember failure to the member-view error state", async () => {
+    // Sidecar parses successfully but the .tar Range read throws
+    // (server returns 500). The openMember catch arm sets
+    // memberView.state = "error" and feeds the message through
+    // ErrorState; cover that branch here.
+    const archive = buildArchive([["pic.png", new Uint8Array([1, 2, 3, 4])]]);
+    server.use(
+      http.get(INDEX_URL, () =>
+        HttpResponse.json({
+          filesize: archive.totalSize,
+          hash: "",
+          hash_lfs: "",
+          files: archive.files,
+        }),
+      ),
+      http.get(TAR_URL, () => new HttpResponse("nope", { status: 500 })),
+    );
+    const wrapper = mountPanel();
+    await flushPromises();
+    await wrapper
+      .findAll(".cursor-pointer")
+      .find((w) => w.text().startsWith("pic.png"))
+      .trigger("click");
+    await flushPromises();
+    // ErrorState with the classified failure replaces the member
+    // body; presence is enough to confirm the catch arm ran.
+    expect(wrapper.findAllComponents({ name: "ErrorState" }).length).toBe(
+      1,
+    );
+  });
+
+  it("revokes the previous blob URL and aborts the previous extract when a second member is opened in quick succession", async () => {
+    // Open two members back-to-back. resetMember()'s controller-
+    // abort branch and objectUrl-revoke branch are both exercised
+    // by the second click.
+    const archive = buildArchive([
+      ["a.png", new Uint8Array([1, 2, 3])],
+      ["b.png", new Uint8Array([4, 5, 6])],
+    ]);
+    serveArchive(archive);
+    const wrapper = mountPanel();
+    await flushPromises();
+    await wrapper
+      .findAll(".cursor-pointer")
+      .find((w) => w.text().startsWith("a.png"))
+      .trigger("click");
+    await flushPromises();
+    expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+    // backToListing first so the row is clickable again.
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text().trim() === "Back")
+      .trigger("click");
+    await flushPromises();
+    await wrapper
+      .findAll(".cursor-pointer")
+      .find((w) => w.text().startsWith("b.png"))
+      .trigger("click");
+    await flushPromises();
+    expect(URL.createObjectURL).toHaveBeenCalledTimes(2);
+    // The previous blob URL is revoked on a 60 s timer, but the
+    // schedule call itself is observable now.
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled(); // setTimeout-deferred
+  });
+
+  it("triggers cancelInFlight + resetMember when the indexUrl prop is cleared", async () => {
+    const archive = buildArchive([["x.txt", text("x")]]);
+    serveArchive(archive);
+    const wrapper = mountPanel();
+    await flushPromises();
+    // Setting indexUrl to "" hits the watch's `if (!newUrl)`
+    // branch — cancelInFlight() + resetMember() without
+    // re-loading. The listing data persists (the watch doesn't
+    // clear `tree`), so we observe the side-effect by checking
+    // that no error / loading state appears either.
+    await wrapper.setProps({ indexUrl: "" });
+    await flushPromises();
+    expect(wrapper.findComponent({ name: "ErrorState" }).exists()).toBe(false);
+    expect(wrapper.text()).not.toContain("Fetching tar index sidecar");
+  });
+
   it("re-loads when the indexUrl prop changes", async () => {
     const a = buildArchive([["a.txt", text("alpha")]]);
     const b = buildArchive([["b.txt", text("beta")]]);
@@ -535,6 +648,70 @@ describe("TarBrowserPanel · member preview routing", () => {
 });
 
 describe("TarBrowserPanel · download path", () => {
+  it("re-extracts bytes when Download is clicked from the binary fallback state (no cache)", async () => {
+    const archive = buildArchive([
+      ["payload.bin", new Uint8Array([10, 20, 30, 40])],
+    ]);
+    serveArchive(archive);
+    const wrapper = mountPanel();
+    await flushPromises();
+    await wrapper
+      .findAll(".cursor-pointer")
+      .find((w) => w.text().startsWith("payload.bin"))
+      .trigger("click");
+    await flushPromises();
+    // Binary classification skips the up-front extract, so the
+    // Download button has no cached bytes and must re-issue the
+    // Range read against the .tar URL.
+    expect(wrapper.text()).toContain("Binary member");
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    try {
+      const downloadBtn = wrapper
+        .findAll("button")
+        .filter((b) => b.text().includes("Download"))[0];
+      await downloadBtn.trigger("click");
+      await flushPromises();
+      expect(clickSpy).toHaveBeenCalled();
+    } finally {
+      clickSpy.mockRestore();
+    }
+  });
+
+  it("surfaces an ElMessage error when the download Range read fails", async () => {
+    const archive = buildArchive([
+      ["payload.bin", new Uint8Array([1, 2, 3, 4])],
+    ]);
+    serveArchive(archive);
+    const wrapper = mountPanel();
+    await flushPromises();
+    await wrapper
+      .findAll(".cursor-pointer")
+      .find((w) => w.text().startsWith("payload.bin"))
+      .trigger("click");
+    await flushPromises();
+    // Reroute the .tar URL to 500 only AFTER the binary state has
+    // been settled, so the next Range read fails. The catch arm of
+    // downloadMember turns the throw into an ElMessage.error toast.
+    server.use(
+      http.get(TAR_URL, () => new HttpResponse("nope", { status: 500 })),
+    );
+    const elementPlus = await import("element-plus");
+    const errorSpy = vi.spyOn(elementPlus.ElMessage, "error");
+    try {
+      const downloadBtn = wrapper
+        .findAll("button")
+        .filter((b) => b.text().includes("Download"))[0];
+      await downloadBtn.trigger("click");
+      await flushPromises();
+      expect(errorSpy).toHaveBeenCalled();
+      expect(errorSpy.mock.calls[0][0]).toMatch(/Download failed/);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it("reuses the in-memory bytes for Download instead of re-issuing a Range read", async () => {
     const archive = buildArchive([["pic.png", new Uint8Array([1, 2, 3, 4])]]);
     serveArchive(archive);

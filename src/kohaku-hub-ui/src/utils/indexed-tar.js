@@ -171,6 +171,7 @@ export function buildTreeFromIndex(files) {
     if (segments.length === 0) continue;
 
     let cursor = root;
+    let collision = false;
     for (let i = 0; i < segments.length - 1; i++) {
       const seg = segments[i];
       let next = cursor.children.get(seg);
@@ -184,9 +185,16 @@ export function buildTreeFromIndex(files) {
           children: new Map(),
         };
         cursor.children.set(seg, next);
+      } else if (next.type !== "dir") {
+        // The path passes through a leaf — e.g. tar contains both
+        // `a/b.txt` and `a/b.txt/extra`. Drop the extra entry to
+        // keep the listing deterministic; first insertion wins.
+        collision = true;
+        break;
       }
       cursor = next;
     }
+    if (collision) continue;
 
     const leafName = segments[segments.length - 1];
     if (cursor.children.has(leafName)) {

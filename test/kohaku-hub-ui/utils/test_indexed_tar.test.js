@@ -186,6 +186,56 @@ describe("buildTreeFromIndex + listDirectory", () => {
       "normal.txt",
     ]);
   });
+
+  it("returns an empty listing when a path segment hits a file instead of a folder", () => {
+    // tar contains both `a/b/c.txt` AND `a` (file). Walking into
+    // path ["a", "b"] crosses through a leaf node and must
+    // bottom out in an empty listing rather than throw.
+    const tree = buildTreeFromIndex({
+      "a/b/c.txt": { offset: 0, size: 4 },
+    });
+    const result = listDirectory(tree, ["a", "b", "c.txt"]);
+    expect(result).toEqual({ folders: [], files: [], node: null });
+  });
+
+  it("returns an empty listing when the walk continues past a file node", () => {
+    // Walk: root → a (dir) → b (dir) → c.txt (file) → "extra".
+    // The next-iteration `if (!cursor || cursor.type !== "dir")`
+    // fires because cursor is a file node, not a directory.
+    const tree = buildTreeFromIndex({
+      "a/b/c.txt": { offset: 0, size: 4 },
+    });
+    const result = listDirectory(tree, ["a", "b", "c.txt", "extra"]);
+    expect(result).toEqual({ folders: [], files: [], node: null });
+  });
+
+  it("skips a duplicate leaf when two source keys normalise to the same path", () => {
+    // `./a/b` and `a/b` are different JSON keys but normalise to
+    // the same segments after stripping `.` / `..`. The
+    // tree-builder's leaf-collision branch keeps the first
+    // insertion and drops the duplicate.
+    const tree = buildTreeFromIndex({
+      "./a/b.txt": { offset: 0, size: 4, sha256: "1" },
+      "a/b.txt": { offset: 4, size: 4, sha256: "2" },
+    });
+    const sub = listDirectory(tree, ["a"]);
+    expect(sub.files.length).toBe(1);
+    expect(sub.files[0].sha256).toBe("1");
+  });
+
+  it("skips a duplicate path that collides with an existing tree node", () => {
+    // hfutils.index files map keys are unique by definition, but a
+    // hand-edited or merged sidecar can repeat a path. The
+    // tree-builder swallows the second occurrence so listing
+    // remains deterministic.
+    const tree = buildTreeFromIndex({
+      "a/b.txt": { offset: 0, size: 4 },
+      "a/b.txt/extra": { offset: 4, size: 4 },
+    });
+    const sub = listDirectory(tree, ["a"]);
+    expect(sub.files.map((f) => f.name)).toEqual(["b.txt"]);
+    expect(sub.folders).toEqual([]);
+  });
 });
 
 describe("buildMemberRangeHeader + extractMemberBytes", () => {
