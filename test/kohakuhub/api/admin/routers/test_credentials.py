@@ -6,6 +6,14 @@ import sys
 
 import pytest
 
+from test.kohakuhub.support.seed_credentials import (
+    SEED_KEYPAIR_PRIMARY,
+    SEED_KEYPAIR_SECONDARY,
+    SEED_KEYPAIR_TERTIARY,
+    SEED_SSH_KEYS,
+    SEED_TOKENS,
+)
+
 SESSIONS_URL = "/admin/api/sessions"
 TOKENS_URL = "/admin/api/tokens"
 SSH_KEYS_URL = "/admin/api/ssh-keys"
@@ -364,3 +372,148 @@ async def test_invalid_unused_for_days_is_rejected(admin_client):
         TOKENS_URL, params={"unused_for_days": -1}
     )
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Seeded credentials — assertions against the deterministic baseline
+# ---------------------------------------------------------------------------
+
+
+async def test_seeded_tokens_appear_in_admin_list(admin_client):
+    """Every plant in ``SEED_TOKENS`` must surface on the admin API."""
+    found_names: set[tuple[str, str]] = set()
+    offset = 0
+    while True:
+        response = await admin_client.get(
+            TOKENS_URL, params={"limit": 200, "offset": offset}
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        for row in payload["tokens"]:
+            found_names.add((row["username"], row["name"]))
+        if len(payload["tokens"]) < 200:
+            break
+        offset += 200
+
+    expected = {(spec.user, spec.name) for spec in SEED_TOKENS}
+    missing = expected - found_names
+    assert not missing, f"seeded tokens missing from admin list: {sorted(missing)}"
+
+
+async def test_seeded_token_plaintext_authenticates_real_requests(client):
+    """The plaintext shipped by the seed must work as a real Bearer token."""
+    target = next(spec for spec in SEED_TOKENS if spec.user == "owner" and spec.name == "ci-token")
+    response = await client.get(
+        "/api/whoami-v2",
+        headers={"Authorization": f"Bearer {target.plaintext}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "owner"
+
+
+async def test_seeded_token_plaintext_is_distinct_per_token(client):
+    """A second seeded token authenticates as the correct user too."""
+    target = next(spec for spec in SEED_TOKENS if spec.user == "outsider")
+    response = await client.get(
+        "/api/whoami-v2",
+        headers={"Authorization": f"Bearer {target.plaintext}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "outsider"
+
+
+async def test_seeded_ssh_key_fingerprint_matches_canonical_value(admin_client):
+    """API-recomputed fingerprint must match the constant in the fixture."""
+    response = await admin_client.get(
+        SSH_KEYS_URL, params={"user": "owner", "limit": 200}
+    )
+    assert response.status_code == 200
+    by_title = {row["title"]: row for row in response.json()["ssh_keys"]}
+
+    workstation = by_title["Workstation"]
+    assert workstation["fingerprint"] == SEED_KEYPAIR_PRIMARY.fingerprint
+    assert workstation["key_type"] == "ssh-ed25519"
+    archived = by_title["Archived MBP"]
+    assert archived["fingerprint"] == SEED_KEYPAIR_TERTIARY.fingerprint
+
+
+async def test_seeded_ssh_keys_isolate_per_user(admin_client):
+    """Member's seeded key must not leak into owner's filtered list."""
+    member_response = await admin_client.get(
+        SSH_KEYS_URL, params={"user": "member", "limit": 200}
+    )
+    assert member_response.status_code == 200
+    member_titles = {row["title"] for row in member_response.json()["ssh_keys"]}
+    assert "Member's MBP" in member_titles
+    assert "Workstation" not in member_titles  # owner-only seed entry
+
+
+async def test_seeded_unused_for_days_filter_picks_stale_tokens(admin_client):
+    """``unused_for_days=120`` should match the >180d stale plant + the never-used row."""
+    response = await admin_client.get(
+        TOKENS_URL, params={"user": "owner", "unused_for_days": 120, "limit": 200}
+    )
+    assert response.status_code == 200
+    names = {row["name"] for row in response.json()["tokens"]}
+    # The owner has three seeded tokens; "ci-token" was used 1 day ago and
+    # must NOT appear, while the 180-day-old cron and the never-used row
+    # both must.
+    assert "archived-cron" in names
+    assert "never-used" in names
+    assert "ci-token" not in names
+
+
+async def test_seeded_unused_for_days_filter_picks_stale_ssh_keys(admin_client):
+    """Owner's archived key was last used ~200 days ago — filter must catch it."""
+    response = await admin_client.get(
+        SSH_KEYS_URL, params={"user": "owner", "unused_for_days": 100, "limit": 200}
+    )
+    assert response.status_code == 200
+    titles = {row["title"] for row in response.json()["ssh_keys"]}
+    assert "Archived MBP" in titles
+    # The recently-used Workstation key (last_used 2 days ago) must NOT match.
+    assert "Workstation" not in titles
+
+
+@pytest.mark.backend_per_test
+async def test_seeded_token_plaintext_revoke_invalidates_subsequent_auth(
+    admin_client, client
+):
+    """Revoking the seeded token via the admin API must kill the Bearer auth."""
+    db = _live_db_module()
+    target = next(
+        spec for spec in SEED_TOKENS if spec.user == "member" and spec.name == "personal"
+    )
+
+    user = db.User.get_or_none(db.User.username == "member")
+    token_row = db.Token.get_or_none(
+        (db.Token.user == user) & (db.Token.name == target.name)
+    )
+    assert token_row is not None
+    try:
+        # Sanity: token works before revoke.
+        before = await client.get(
+            "/api/whoami-v2",
+            headers={"Authorization": f"Bearer {target.plaintext}"},
+        )
+        assert before.status_code == 200
+
+        revoke = await admin_client.delete(f"{TOKENS_URL}/{token_row.id}")
+        assert revoke.status_code == 200
+        assert revoke.json() == {"revoked": 1}
+
+        after = await client.get(
+            "/api/whoami-v2",
+            headers={"Authorization": f"Bearer {target.plaintext}"},
+        )
+        assert after.status_code == 401
+    finally:
+        # Restore the seed row so unrelated tests still see the baseline.
+        if not db.Token.select().where(db.Token.id == token_row.id).exists():
+            from kohakuhub.auth.utils import hash_token
+
+            db.Token.create(
+                user=user,
+                token_hash=hash_token(target.plaintext),
+                name=target.name,
+            )

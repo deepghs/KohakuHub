@@ -114,6 +114,37 @@ class RemoteAsset:
     source_url: str
 
 
+@dataclass(frozen=True)
+class SeedKeypair:
+    """A real ed25519 keypair shipped with the seed.
+
+    The private half is included so manual local testing (e.g. `git push`
+    over SSH) can sign with the matching key without having to generate
+    one. These are explicitly *not* production credentials — they only
+    ever live in the dev seed and the test baseline.
+    """
+
+    public_key: str
+    private_key: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class SeedSshKeyPlant:
+    user: str
+    title: str
+    keypair: SeedKeypair
+    last_used_days_ago: int | None  # None = never used
+
+
+@dataclass(frozen=True)
+class SeedTokenPlant:
+    user: str
+    name: str
+    plaintext: str
+    last_used_days_ago: int | None  # None = never used
+
+
 SEED_ASSET_CACHE_DIR = ROOT_DIR / "hub-meta" / "cache" / "seed-assets"
 
 
@@ -2583,6 +2614,132 @@ FALLBACK_SOURCE_SEEDS: tuple[dict, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Credential plants (API tokens + SSH keys)
+# ---------------------------------------------------------------------------
+#
+# Three real ed25519 keypairs share by both the dev seed and the test
+# baseline. Hardcoding them here means every fresh `make reset-and-seed`
+# run produces the same fingerprints, so local SSH-based smoke testing
+# can rely on a known good private half.
+
+SEED_KEYPAIR_PRIMARY = SeedKeypair(
+    public_key=(
+        "ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAICkTsun+Px+5LKYR5hM1PFHI07H0mEdBCkjnieQBa8La "
+        "seed-primary"
+    ),
+    private_key=(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUx\n"
+        "OQAAACApE7Lp/j8fuSymEeYTNTxRyNOx9JhHQQpI54nkAWvC2gAAAIgSvm6wEr5usAAAAAtzc2gt\n"
+        "ZWQyNTUxOQAAACApE7Lp/j8fuSymEeYTNTxRyNOx9JhHQQpI54nkAWvC2gAAAEAR+JseVIp318U4\n"
+        "qACfo8LGhfSE0tgeEyg4ieaaxYZMdCkTsun+Px+5LKYR5hM1PFHI07H0mEdBCkjnieQBa8LaAAAA\n"
+        "AAECAwQF\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    ),
+    fingerprint="SHA256:iK3NzYswWRZyxvuXMcA5x7DscKDXBqdcJDHcnsAmSl0",
+)
+
+SEED_KEYPAIR_SECONDARY = SeedKeypair(
+    public_key=(
+        "ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIM9LPgCG2V6b6eusP4Ds32HSeT9XI5kEh8znwZJL8Kon "
+        "seed-secondary"
+    ),
+    private_key=(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUx\n"
+        "OQAAACDPSz4Ahtlem+nrrD+A7N9h0nk/VyOZBIfM58GSS/CqJwAAAIgdEjqnHRI6pwAAAAtzc2gt\n"
+        "ZWQyNTUxOQAAACDPSz4Ahtlem+nrrD+A7N9h0nk/VyOZBIfM58GSS/CqJwAAAEARKCxI67mFiA8F\n"
+        "KohS5CM4TZ3Yr1XmegpG6k39BVGyz89LPgCG2V6b6eusP4Ds32HSeT9XI5kEh8znwZJL8KonAAAA\n"
+        "AAECAwQF\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    ),
+    fingerprint="SHA256:V64HYiVM8qORIqyxawv2j9z+f001Zlb2Gfe6es+1yME",
+)
+
+SEED_KEYPAIR_TERTIARY = SeedKeypair(
+    public_key=(
+        "ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIEE6+Zx4EGmF78hvFxw7V99nO+2AMlMq4P3HwC2J1JLl "
+        "seed-tertiary"
+    ),
+    private_key=(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUx\n"
+        "OQAAACBBOvmceBBphe/IbxccO1ffZzvtgDJTKuD9x8AtidSS5QAAAIjPifOsz4nzrAAAAAtzc2gt\n"
+        "ZWQyNTUxOQAAACBBOvmceBBphe/IbxccO1ffZzvtgDJTKuD9x8AtidSS5QAAAEABkNyXrWp46jN2\n"
+        "rlPPMjrdliTdytyHw4SrwcmwUFFwzkE6+Zx4EGmF78hvFxw7V99nO+2AMlMq4P3HwC2J1JLlAAAA\n"
+        "AAECAwQF\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    ),
+    fingerprint="SHA256:UHiMFHDl1bHuDziVnLOYlAHSDQlah+DAk6yVUe10ZWI",
+)
+
+# Demo accounts get a mix of recent / stale / never-used credentials so the
+# admin Credentials page exercises every filter against real seeded rows.
+SEED_SSH_KEY_PLANTS: tuple[SeedSshKeyPlant, ...] = (
+    SeedSshKeyPlant(
+        user="mai_lin",
+        title="Workstation",
+        keypair=SEED_KEYPAIR_PRIMARY,
+        last_used_days_ago=1,
+    ),
+    SeedSshKeyPlant(
+        user="mai_lin",
+        title="Archived MBP",
+        keypair=SEED_KEYPAIR_TERTIARY,
+        last_used_days_ago=210,
+    ),
+    SeedSshKeyPlant(
+        user="leo_park",
+        title="Leo's Frontend Box",
+        keypair=SEED_KEYPAIR_SECONDARY,
+        last_used_days_ago=None,
+    ),
+)
+
+SEED_TOKEN_PLANTS: tuple[SeedTokenPlant, ...] = (
+    SeedTokenPlant(
+        user="mai_lin",
+        name="ci-token",
+        plaintext="khub_dev_mai_lin_ci_token_d8f1a2",
+        last_used_days_ago=1,
+    ),
+    SeedTokenPlant(
+        user="mai_lin",
+        name="archived-cron",
+        plaintext="khub_dev_mai_lin_archived_cron_3b91c4",
+        last_used_days_ago=180,
+    ),
+    SeedTokenPlant(
+        user="mai_lin",
+        name="never-used",
+        plaintext="khub_dev_mai_lin_never_used_91dd2e",
+        last_used_days_ago=None,
+    ),
+    SeedTokenPlant(
+        user="leo_park",
+        name="frontend-deploy",
+        plaintext="khub_dev_leo_park_frontend_deploy_4f2c0a",
+        last_used_days_ago=7,
+    ),
+    SeedTokenPlant(
+        user="sara_chen",
+        name="annotation-import",
+        plaintext="khub_dev_sara_chen_annotation_import_77ab09",
+        last_used_days_ago=30,
+    ),
+    SeedTokenPlant(
+        user="ivy_ops",
+        name="release-bot",
+        plaintext="khub_dev_ivy_ops_release_bot_a17e93",
+        last_used_days_ago=None,
+    ),
+)
+
+
 def account_index() -> dict[str, AccountSeed]:
     return {account.username: account for account in ACCOUNTS}
 
@@ -2729,6 +2886,100 @@ async def login_account(client: httpx.AsyncClient, account: AccountSeed) -> None
 
     if "session_id" not in client.cookies:
         raise SeedError(f"login {account.username} did not set a session cookie")
+
+
+def plant_seed_tokens() -> None:
+    """Insert deterministic API tokens directly into the database.
+
+    Going through ``POST /api/auth/tokens/create`` would generate random
+    plaintexts, which means the seed manifest could not name the canonical
+    Bearer values. We bypass the API and write rows directly so the
+    plaintexts in ``SEED_TOKEN_PLANTS`` are the authoritative answer to
+    "which tokens does the dev seed leave behind".
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from kohakuhub.auth.utils import hash_token
+    from kohakuhub.db import Token, User
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for spec in SEED_TOKEN_PLANTS:
+        user = User.get_or_none(User.username == spec.user)
+        if user is None:
+            raise SeedError(
+                f"plant token for unknown user '{spec.user}'"
+            )
+
+        token_hash = hash_token(spec.plaintext)
+        if Token.select().where(Token.token_hash == token_hash).exists():
+            # Idempotent: re-running the seed without a full reset is a
+            # no-op for already-planted tokens.
+            continue
+
+        last_used = (
+            None
+            if spec.last_used_days_ago is None
+            else now - timedelta(days=spec.last_used_days_ago)
+        )
+        Token.create(
+            user=user,
+            token_hash=token_hash,
+            name=spec.name,
+            last_used=last_used,
+        )
+
+
+async def plant_seed_ssh_keys(
+    authed_clients: dict[str, httpx.AsyncClient],
+) -> None:
+    """Plant SSH keys via the public API so fingerprints are computed.
+
+    Using the same endpoint a real user would hit means the planted
+    fingerprints are the canonical ones — admin tooling and future
+    Git-over-SSH smokes can assert against the values in
+    ``SEED_SSH_KEY_PLANTS`` without having to recompute them.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from kohakuhub.db import SSHKey, User
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for spec in SEED_SSH_KEY_PLANTS:
+        client = authed_clients.get(spec.user)
+        if client is None:
+            raise SeedError(
+                f"plant ssh key for non-authed user '{spec.user}'"
+            )
+
+        user = User.get_or_none(User.username == spec.user)
+        if user is None:
+            raise SeedError(
+                f"plant ssh key for unknown user '{spec.user}'"
+            )
+
+        already = (
+            SSHKey.select()
+            .where(
+                (SSHKey.user == user)
+                & (SSHKey.fingerprint == spec.keypair.fingerprint)
+            )
+            .exists()
+        )
+        if not already:
+            response = await client.post(
+                "/api/user/keys",
+                json={"title": spec.title, "key": spec.keypair.public_key},
+            )
+            await ensure_response(
+                response, f"plant ssh key '{spec.title}' for {spec.user}"
+            )
+
+        if spec.last_used_days_ago is not None:
+            cutoff = now - timedelta(days=spec.last_used_days_ago)
+            SSHKey.update(last_used=cutoff).where(
+                (SSHKey.user == user)
+                & (SSHKey.fingerprint == spec.keypair.fingerprint)
+            ).execute()
 
 
 async def upload_avatar(
@@ -3156,6 +3407,26 @@ def build_manifest() -> dict:
             }
             for source in FALLBACK_SOURCE_SEEDS
         ],
+        "api_tokens": [
+            {
+                "user": spec.user,
+                "name": spec.name,
+                "plaintext": spec.plaintext,
+                "last_used_days_ago": spec.last_used_days_ago,
+            }
+            for spec in SEED_TOKEN_PLANTS
+        ],
+        "ssh_keys": [
+            {
+                "user": spec.user,
+                "title": spec.title,
+                "fingerprint": spec.keypair.fingerprint,
+                "public_key": spec.keypair.public_key,
+                "private_key": spec.keypair.private_key,
+                "last_used_days_ago": spec.last_used_days_ago,
+            }
+            for spec in SEED_SSH_KEY_PLANTS
+        ],
     }
 
 
@@ -3240,6 +3511,9 @@ async def seed_demo_data() -> None:
 
         for liker, repo_type, namespace, name in LIKES:
             await like_repo(authed_clients[liker], repo_type, namespace, name)
+
+        plant_seed_tokens()
+        await plant_seed_ssh_keys(authed_clients)
 
         anon_client = await stack.enter_async_context(
             httpx.AsyncClient(
