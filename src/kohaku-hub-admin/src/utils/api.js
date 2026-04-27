@@ -251,6 +251,26 @@ export async function verifyAdminToken(token) {
   }
 }
 
+// ===== Dependency Health =====
+
+/**
+ * Probe Postgres / MinIO / LakeFS / SMTP and return their status.
+ *
+ * @param {string} token - Admin token
+ * @param {Object} [options]
+ * @param {number} [options.timeoutSeconds] - Per-probe timeout in seconds
+ * @returns {Promise<Object>} Aggregated probe report
+ */
+export async function getDependencyHealth(token, { timeoutSeconds } = {}) {
+  const client = createAdminClient(token);
+  const params = {};
+  if (timeoutSeconds !== undefined && timeoutSeconds !== null) {
+    params.timeout_seconds = timeoutSeconds;
+  }
+  const response = await client.get("/health/dependencies", { params });
+  return response.data;
+}
+
 // ===== Repository Management =====
 
 /**

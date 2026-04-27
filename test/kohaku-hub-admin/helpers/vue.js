@@ -156,4 +156,79 @@ export const ElementPlusStubs = {
   ElMain: passthroughDiv("ElMain", { "data-el-main": "true" }),
   ElMenu: passthroughDiv("ElMenu", { "data-el-menu": "true" }),
   ElMenuItem: passthroughDiv("ElMenuItem", { "data-el-menu-item": "true" }),
+  ElCard: defineComponent({
+    name: "ElCard",
+    props: {
+      shadow: { type: String, default: "" },
+    },
+    setup(props, { slots }) {
+      return () =>
+        h(
+          "section",
+          { "data-el-card": "true", "data-shadow": props.shadow },
+          [
+            slots.header
+              ? h("header", { "data-el-card-header": "true" }, slots.header())
+              : null,
+            slots.default
+              ? h("div", { "data-el-card-body": "true" }, slots.default())
+              : null,
+          ],
+        );
+    },
+  }),
+  ElEmpty: defineComponent({
+    name: "ElEmpty",
+    props: {
+      description: { type: String, default: "" },
+    },
+    setup(props, { slots }) {
+      return () =>
+        h(
+          "div",
+          {
+            "data-el-empty": "true",
+            "data-description": props.description,
+          },
+          slots.default ? slots.default() : [],
+        );
+    },
+  }),
+  ElSelect: defineComponent({
+    name: "ElSelect",
+    props: {
+      modelValue: { type: [String, Number, Array, Boolean], default: null },
+      placeholder: { type: String, default: "" },
+    },
+    emits: ["update:modelValue", "change"],
+    setup(props, { slots, emit }) {
+      return () =>
+        h(
+          "select",
+          {
+            "data-el-select": "true",
+            value: props.modelValue,
+            placeholder: props.placeholder,
+            onChange: (event) => {
+              const raw = event.target.value;
+              const parsed = raw === "" ? "" : Number.isNaN(Number(raw)) ? raw : Number(raw);
+              emit("update:modelValue", parsed);
+              emit("change", parsed);
+            },
+          },
+          slots.default ? slots.default() : [],
+        );
+    },
+  }),
+  ElOption: defineComponent({
+    name: "ElOption",
+    props: {
+      label: { type: String, default: "" },
+      value: { type: [String, Number, Boolean], default: "" },
+    },
+    setup(props) {
+      return () =>
+        h("option", { value: props.value }, props.label);
+    },
+  }),
 };

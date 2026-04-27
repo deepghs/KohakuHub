@@ -59,6 +59,9 @@ describe("admin API client", () => {
     await api.getTimeseriesStats("admin-token", 14);
     await api.getTopRepositories("admin-token", 5, "size");
 
+    await api.getDependencyHealth("admin-token");
+    await api.getDependencyHealth("admin-token", { timeoutSeconds: 1.5 });
+
     await api.listRepositories("admin-token", {
       search: "lineart",
       repo_type: "model",
@@ -197,6 +200,12 @@ describe("admin API client", () => {
     });
     expect(client.get).toHaveBeenCalledWith("/stats/top-repos", {
       params: { limit: 5, by: "size" },
+    });
+    expect(client.get).toHaveBeenCalledWith("/health/dependencies", {
+      params: {},
+    });
+    expect(client.get).toHaveBeenCalledWith("/health/dependencies", {
+      params: { timeout_seconds: 1.5 },
     });
     expect(client.get).toHaveBeenCalledWith("/repositories", {
       params: {
