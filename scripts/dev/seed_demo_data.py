@@ -526,10 +526,163 @@ SAFEBOORU_IMAGE_ASSETS: tuple[RemoteAsset, ...] = (
     ),
 )
 
+# Real Danbooru fetches that back the indexed-tar showcase repo. Four
+# Arknights posts at each of the four Danbooru ratings (g/s/q/e per the
+# ratings wiki), plus eight mixed-IP posts spanning the same rating
+# spectrum so the gallery exercises rating diversity inside one tar.
+DANBOORU_INDEXED_TAR_ASSETS: tuple[RemoteAsset, ...] = (
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-11252909.jpg",
+        url="https://cdn.donmai.us/original/42/8e/428eaa71d9b02edbd737b04613b85015.jpg",
+        sha256="a23491a58db1c08a932ad2175a0b72c824cd5ca80050d5ed8b4d2b96b1bdcd13",
+        source_url="https://danbooru.donmai.us/posts/11252909",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-11252821.jpg",
+        url="https://cdn.donmai.us/original/fd/4e/fd4e8d8a98aaa6f4df385b85f9ec2157.jpg",
+        sha256="3e97fa075110c3088e99f70fb3782ad442a37d8f3e23a9e240313253184265c0",
+        source_url="https://danbooru.donmai.us/posts/11252821",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-11252789.jpg",
+        url="https://cdn.donmai.us/original/70/e6/70e66dc2688df33434a286e4a52dbecd.jpg",
+        sha256="96939f260c81145f9bdca0bec0151bd15f79c73adb6f62309d72eccdda21d11e",
+        source_url="https://danbooru.donmai.us/posts/11252789",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-g-11252774.jpg",
+        url="https://cdn.donmai.us/original/e6/f9/e6f98bfb0c63d22fd8881a063ed7cb49.jpg",
+        sha256="1abdf3e0715937e567b59ae5a410ee8ca93854197374e3dbface401f17bbece1",
+        source_url="https://danbooru.donmai.us/posts/11252774",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-11252942.jpg",
+        url="https://cdn.donmai.us/original/49/6e/496e40ebb7c27ca98cea1e038df1c4c4.jpg",
+        sha256="5df6199a9c7d593cddc5e2d9743314ff8ffc93d998901b7eb3b157cdccc57ef3",
+        source_url="https://danbooru.donmai.us/posts/11252942",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-11252852.jpg",
+        url="https://cdn.donmai.us/original/d5/88/d5888db1eff7f7b2b50d7f0bbc789d18.jpg",
+        sha256="c60d5df6720abcac6d45026f62c8f7245620aec8b1ee4e8f867d58f1e5a49c09",
+        source_url="https://danbooru.donmai.us/posts/11252852",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-11252674.jpg",
+        url="https://cdn.donmai.us/original/3c/6b/3c6b2a4d6495b2e9e4a7eab151f8ded7.jpg",
+        sha256="548cb238825650d8cc143641a52cac66ba801b953162a07570e567c2bb937154",
+        source_url="https://danbooru.donmai.us/posts/11252674",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-s-11252670.jpg",
+        url="https://cdn.donmai.us/original/74/49/7449c08e2c07f3ae85b2851b006a4fe8.jpg",
+        sha256="1d778bcac6cb9a788dbc6a2dd643480639e03d4a17f72a6b6c7abd285cc7bc95",
+        source_url="https://danbooru.donmai.us/posts/11252670",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-11251969.jpg",
+        url="https://cdn.donmai.us/original/bd/20/bd2085ba56e9bdbc39433471e469e3fc.jpg",
+        sha256="6c9b9dd7b8fdfab1319798f97950c35bb3544284786fd74c6df1dbb05bac5d02",
+        source_url="https://danbooru.donmai.us/posts/11251969",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-11251967.jpg",
+        url="https://cdn.donmai.us/original/60/1b/601b6c829de6fd0a7be174bb72bb3f89.jpg",
+        sha256="e505076024f43a98d13bbe760617cdc1a0d9109a22a9aa53bb1186e32faa8878",
+        source_url="https://danbooru.donmai.us/posts/11251967",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-11251966.jpg",
+        url="https://cdn.donmai.us/original/c7/05/c705e206a73f6d38890a35d5441b12aa.jpg",
+        sha256="6a8e40ebe198d9849fe14cc82bc2f8ac3934e826e984a548b70024b72bc19251",
+        source_url="https://danbooru.donmai.us/posts/11251966",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-q-11251811.jpg",
+        url="https://cdn.donmai.us/original/6e/50/6e504275c9200e5b91b99f37b045125a.jpg",
+        sha256="4015e09e23f6bb1fc30411c8e56e3c7e93c6756bea77898af085d3f8bef3be63",
+        source_url="https://danbooru.donmai.us/posts/11251811",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-11251965.jpg",
+        url="https://cdn.donmai.us/original/62/37/6237d30776f1f088d40085d661b3bf39.jpg",
+        sha256="da3c7dafc61c2610d1f3981394f684ee0a9b680f58119b60ee6a8ee61e2a77d5",
+        source_url="https://danbooru.donmai.us/posts/11251965",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-11251964.jpg",
+        url="https://cdn.donmai.us/original/8f/6c/8f6cf7c0bfb115ab8a123f0341d99707.jpg",
+        sha256="4599ce5d1cabc53ea67afd63458eb5997b3a5cc28f0779a1e76c7ba034b1779c",
+        source_url="https://danbooru.donmai.us/posts/11251964",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-11250345.jpg",
+        url="https://cdn.donmai.us/original/12/bf/12bfbe72d9b20b5677bbea1bb340ef20.jpg",
+        sha256="799a9bfede1e9a7e45fe30b8862f75d335bab86ffa2f72a0798ed6b699c64d04",
+        source_url="https://danbooru.donmai.us/posts/11250345",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-arknights-e-11248713.jpg",
+        url="https://cdn.donmai.us/original/81/fe/81fed23624a8cfb1749e0ffcb75e00ec.jpg",
+        sha256="4776ddf7216804afa8a817b2dab2af7d62d801fb5453f8df09a9ad787fd43ec9",
+        source_url="https://danbooru.donmai.us/posts/11248713",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-genshin-impact-g-11252790.jpg",
+        url="https://cdn.donmai.us/original/b9/02/b9023b343c7996961ee8c336ba77785b.jpg",
+        sha256="9e4d67109fb7b2df0d9cb496f70770a3a4a250cf6610c77afec5037f15001da1",
+        source_url="https://danbooru.donmai.us/posts/11252790",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-genshin-impact-g-11252634.jpg",
+        url="https://cdn.donmai.us/original/22/f6/22f67c3377955ca2b2ef73d062966aaf.jpg",
+        sha256="392050f6f0982579d4d7f626c4d412e2204a81f29c381b410f88520a6eb232e1",
+        source_url="https://danbooru.donmai.us/posts/11252634",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-blue-archive-s-11252875.jpg",
+        url="https://cdn.donmai.us/original/19/0d/190d0dfb6a1f761ccc3eabd8393f7f0f.jpg",
+        sha256="e4765843f728477cf0b4f92b0e7a448a8c3a07a07fed68cef637d13f7ce181a6",
+        source_url="https://danbooru.donmai.us/posts/11252875",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-blue-archive-s-11252842.jpg",
+        url="https://cdn.donmai.us/original/46/d3/46d31d6326a9fe072de9031bcc9e418e.jpg",
+        sha256="99b9618a8444a2d3629ec2ea3c2a6e45e45116adf89843c2a312c63d4233dfea",
+        source_url="https://danbooru.donmai.us/posts/11252842",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-hololive-q-11250787.png",
+        url="https://cdn.donmai.us/original/6a/ed/6aedb85e1e6a4ea37c3263477bc94e20.png",
+        sha256="da40344847764402caa6f988caa32d341c3ea1ca120cb5321637618693d33b1d",
+        source_url="https://danbooru.donmai.us/posts/11250787",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-hololive-q-11250500.png",
+        url="https://cdn.donmai.us/original/c2/5b/c25bf1f390b4b2fe267c63a916581bbf.png",
+        sha256="2931cb66585b5ee0592c6c8130618a902fcf68f91e4af77935085fe4786b8d1d",
+        source_url="https://danbooru.donmai.us/posts/11250500",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-original-e-11252832.jpg",
+        url="https://cdn.donmai.us/original/a9/55/a9555374895651c52a0a00bd690a4bbc.jpg",
+        sha256="f3778179018ff24f15ccb25dfa8e1ef3701163a515ad22775b1c47fad6f308bd",
+        source_url="https://danbooru.donmai.us/posts/11252832",
+    ),
+    RemoteAsset(
+        cache_name="danbooru-original-e-11252816.jpg",
+        url="https://cdn.donmai.us/original/28/0a/280a5050ed7dfd6b225ee6ef1ed0532a.jpg",
+        sha256="4fa45a639dd4b7d0654b7e94cf4006fd5689f1540bb2afab202ba3d9789885c4",
+        source_url="https://danbooru.donmai.us/posts/11252816",
+    ),
+)
+
+
 REMOTE_MEDIA_ASSETS: dict[str, RemoteAsset] = {
     asset.cache_name: asset
     for asset in (
         *SAFEBOORU_IMAGE_ASSETS,
+        *DANBOORU_INDEXED_TAR_ASSETS,
         RemoteAsset(
             cache_name="voices-speech.wav",
             url=(
@@ -823,42 +976,6 @@ def make_indexed_tar_bundle(
 
     index_bytes = json_bytes(index_info)
     return tar_bytes, index_bytes
-
-
-def make_solid_color_image_bytes(
-    label: str,
-    *,
-    size: tuple[int, int] = (320, 200),
-    fmt: str = "PNG",
-) -> bytes:
-    """Render a deterministic labeled rectangle so the indexed-tar
-    showcase can carry varied image members without depending on
-    network-fetched assets."""
-    digest = hashlib.sha256(label.encode("utf-8")).digest()
-    bg = (digest[0], digest[1], digest[2])
-    fg = (255 - digest[3], 255 - digest[4], 255 - digest[5])
-
-    image = Image.new("RGB", size, bg)
-    draw = ImageDraw.Draw(image)
-    draw.rectangle(
-        (8, 8, size[0] - 8, size[1] - 8),
-        outline=fg,
-        width=4,
-    )
-    font = ImageFont.load_default()
-    box = draw.textbbox((0, 0), label, font=font)
-    text_width = box[2] - box[0]
-    text_height = box[3] - box[1]
-    draw.text(
-        ((size[0] - text_width) / 2, (size[1] - text_height) / 2),
-        label,
-        fill=fg,
-        font=font,
-    )
-
-    buffer = io.BytesIO()
-    image.save(buffer, format=fmt)
-    return buffer.getvalue()
 
 
 def make_sine_wav_bytes(
@@ -2560,8 +2677,47 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
     metadata reuse from inside the archive.
     """
 
-    # Tar 1 — rich nested gallery covering every preview renderer.
-    gallery_members: tuple[tuple[str, bytes], ...] = (
+    # Per-rating Arknights buckets + mixed-IP supplement so the
+    # in-archive listing exercises each Danbooru rating (g/s/q/e) and
+    # the breadcrumb navigates a real-looking 24-image gallery.
+    arknights_by_rating = {
+        "g": (
+            "danbooru-arknights-g-11252909.jpg",
+            "danbooru-arknights-g-11252821.jpg",
+            "danbooru-arknights-g-11252789.jpg",
+            "danbooru-arknights-g-11252774.jpg",
+        ),
+        "s": (
+            "danbooru-arknights-s-11252942.jpg",
+            "danbooru-arknights-s-11252852.jpg",
+            "danbooru-arknights-s-11252674.jpg",
+            "danbooru-arknights-s-11252670.jpg",
+        ),
+        "q": (
+            "danbooru-arknights-q-11251969.jpg",
+            "danbooru-arknights-q-11251967.jpg",
+            "danbooru-arknights-q-11251966.jpg",
+            "danbooru-arknights-q-11251811.jpg",
+        ),
+        "e": (
+            "danbooru-arknights-e-11251965.jpg",
+            "danbooru-arknights-e-11251964.jpg",
+            "danbooru-arknights-e-11250345.jpg",
+            "danbooru-arknights-e-11248713.jpg",
+        ),
+    }
+    misc_ip_assets = (
+        ("genshin-impact", "g", "danbooru-genshin-impact-g-11252790.jpg"),
+        ("genshin-impact", "g", "danbooru-genshin-impact-g-11252634.jpg"),
+        ("blue-archive", "s", "danbooru-blue-archive-s-11252875.jpg"),
+        ("blue-archive", "s", "danbooru-blue-archive-s-11252842.jpg"),
+        ("hololive", "q", "danbooru-hololive-q-11250787.png"),
+        ("hololive", "q", "danbooru-hololive-q-11250500.png"),
+        ("original", "e", "danbooru-original-e-11252832.jpg"),
+        ("original", "e", "danbooru-original-e-11252816.jpg"),
+    )
+
+    gallery_members_list: list[SeedFile] = [
         (
             "README.md",
             text_bytes(
@@ -2570,7 +2726,10 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
 
                 Mixed-content archive used by the local dev browser to
                 exercise breadcrumb navigation and per-member preview
-                routing (image / video / audio / pdf / text / markdown).
+                routing (image / audio / text / markdown). The image
+                tree mirrors Danbooru's four ratings (g/s/q/e per the
+                howto:rate wiki) for Arknights, plus a mixed-IP
+                supplement at the same rating spread.
                 """
             ),
         ),
@@ -2635,26 +2794,6 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
             ),
         ),
         (
-            "images/cover.png",
-            make_solid_color_image_bytes("indexed-tar-cover", size=(480, 240)),
-        ),
-        (
-            "images/thumb.jpg",
-            make_solid_color_image_bytes(
-                "indexed-tar-thumb",
-                size=(160, 160),
-                fmt="JPEG",
-            ),
-        ),
-        (
-            "images/photos/nature/forest.jpg",
-            remote_asset_bytes("safebooru-forest-lake.jpg"),
-        ),
-        (
-            "images/photos/nature/lake.jpg",
-            remote_asset_bytes("safebooru-mountain-church.jpg"),
-        ),
-        (
             "audio/bell.wav",
             make_sine_wav_bytes("indexed-tar-bell"),
         ),
@@ -2662,6 +2801,26 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
             "audio/notes/intro.md",
             text_bytes("# Audio bundle\n\nA short sine tone for preview testing.\n"),
         ),
+    ]
+    for rating, asset_names in arknights_by_rating.items():
+        for asset_name in asset_names:
+            ext = asset_name.rsplit(".", 1)[1]
+            post_id = asset_name.rsplit("-", 1)[1].rsplit(".", 1)[0]
+            path = f"images/arknights/{rating}/{post_id}.{ext}"
+            gallery_members_list.append(
+                seed_file(path, lambda n=asset_name: remote_asset_bytes(n))
+            )
+    for ip_slug, rating, asset_name in misc_ip_assets:
+        ext = asset_name.rsplit(".", 1)[1]
+        post_id = asset_name.rsplit("-", 1)[1].rsplit(".", 1)[0]
+        path = f"images/misc/{ip_slug}/{rating}/{post_id}.{ext}"
+        gallery_members_list.append(
+            seed_file(path, lambda n=asset_name: remote_asset_bytes(n))
+        )
+    # Materialize once so the tar is built deterministically and the
+    # callable closures do not have to be re-invoked downstream.
+    gallery_members: tuple[tuple[str, bytes], ...] = tuple(
+        materialize_seed_file(entry) for entry in gallery_members_list
     )
 
     # Tar 2 — synthetic pagination corpus. ~600 tiny JSON files split
@@ -2720,8 +2879,8 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
         ),
         ("text/note.txt", text_bytes("stale-hash demo entry\n")),
         (
-            "images/sample.png",
-            make_solid_color_image_bytes("indexed-tar-stale", size=(240, 160)),
+            "images/sample.jpg",
+            remote_asset_bytes("danbooru-genshin-impact-g-11252790.jpg"),
         ),
     )
 
@@ -2745,6 +2904,10 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
         (
             "audio/note.wav",
             make_sine_wav_bytes("indexed-tar-no-hash"),
+        ),
+        (
+            "images/sample.jpg",
+            remote_asset_bytes("danbooru-blue-archive-s-11252875.jpg"),
         ),
     )
 
@@ -2841,11 +3004,18 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
 
                 | Folder            | Demonstrates                                              |
                 |-------------------|-----------------------------------------------------------|
-                | archives/gallery  | Nested folders, mixed media (image/audio/markdown/text)   |
+                | archives/gallery  | Nested folders + 24 real Danbooru fan-art (4 ratings)     |
                 | archives/large    | Pagination + search inside a single archive (~600 entries)|
                 | archives/stale    | Tar bytes diverging from sidecar hash → warning banner    |
                 | archives/no-hash  | Sidecar with stripped hashes → info notice banner         |
                 | archives/models   | Safetensors / parquet metadata preview from inside the tar|
+
+                The gallery archive has its image members organised by
+                Danbooru's four ratings (g/s/q/e per the howto:rate wiki):
+                sixteen Arknights posts (four per rating) plus an
+                eight-image mixed-IP supplement spanning the same
+                rating spread (Genshin Impact / Blue Archive / Hololive
+                / original).
                 """
             ),
         ),
