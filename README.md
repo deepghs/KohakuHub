@@ -279,8 +279,18 @@ uvicorn kohakuhub.main:app --host 0.0.0.0 --port 48888 --workers 4
 
 **Frontend:**
 ```bash
+# Install deps for both apps once
 npm install --prefix ./src/kohaku-hub-ui
-npm run dev --prefix ./src/kohaku-hub-ui
+npm install --prefix ./src/kohaku-hub-admin
+
+# Recommended: run main UI + admin together on one origin.
+# Main UI on http://localhost:5173, admin mounted at http://localhost:5173/admin.
+# (Internally the admin Vite server runs on :5174 and is reverse-proxied by the main UI.)
+make ui
+
+# Alternatives:
+make ui-only   # Only the main UI on :5173 (no admin)
+make admin     # Only the admin UI on :5174
 ```
 
 **Testing:**
