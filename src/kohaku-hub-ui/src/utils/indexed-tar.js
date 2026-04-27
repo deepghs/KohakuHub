@@ -77,10 +77,15 @@ export async function parseTarIndex(url, options = {}) {
   const { onProgress = () => {}, signal } = options;
 
   onProgress("fetch");
+  // `same-origin` forwards the SPA session cookie on the /resolve/ hop
+  // — private repos return 404 without it — and the browser drops
+  // cookies on the cross-origin redirect to the presigned object URL,
+  // so the S3/MinIO `Access-Control-Allow-Origin: *` response stays
+  // compatible with credentialed CORS.
   const response = await fetch(url, {
     signal,
     mode: "cors",
-    credentials: "omit",
+    credentials: "same-origin",
   });
   if (!response.ok) {
     throw await IndexedTarFetchError.fromResponse(response, "tar index JSON");
@@ -323,11 +328,14 @@ export async function extractMemberBytes(tarUrl, info, options = {}) {
   }
   if (info.size === 0) return new Uint8Array(0);
 
+  // Same credentials story as parseTarIndex above: send the session
+  // cookie on the same-origin /resolve/ hop, drop it on the cross-origin
+  // redirect to the presigned tar URL.
   const response = await fetch(tarUrl, {
     headers: { Range: buildMemberRangeHeader(info) },
     signal,
     mode: "cors",
-    credentials: "omit",
+    credentials: "same-origin",
   });
   if (response.status !== 200 && response.status !== 206) {
     throw await IndexedTarFetchError.fromResponse(response, "tar member");
