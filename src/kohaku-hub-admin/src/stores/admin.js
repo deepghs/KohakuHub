@@ -1,4 +1,4 @@
-import { defineStore } from "pinia";
+import { defineStore, acceptHMRUpdate } from "pinia";
 import { ref, computed } from "vue";
 import { verifyAdminToken } from "@/utils/api";
 
@@ -47,3 +47,10 @@ export const useAdminStore = defineStore("admin", () => {
     logout,
   };
 });
+
+// Hot-replace this store on edit instead of full-reloading the page.
+// Without this, editing admin.js would full-reload and dump the in-memory
+// token, making local development of auth-related code painful.
+if (import.meta.hot) {
+  import.meta.hot.accept(acceptHMRUpdate(useAdminStore, import.meta.hot));
+}
