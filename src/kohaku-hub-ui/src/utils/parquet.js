@@ -63,6 +63,50 @@ export async function parseParquetMetadata(url, options = {}) {
   const raw = await parquetMetadataAsync(buffer);
 
   onProgress("parsing");
+  const result = decodeParquetMetadata(raw, buffer.byteLength);
+  onProgress("done");
+  return result;
+}
+
+/**
+ * Parse parquet metadata from a fully in-memory file buffer.
+ *
+ * Used for the in-archive preview path inside TarBrowserDialog. A
+ * `blob:` URL would not work — hyparquet's `asyncBufferFromUrl`
+ * issues a HEAD for the tail size and a Range request for the
+ * footer, and HEAD on `blob:` URLs is rejected by some browsers
+ * (the failure surfaced for the user as "Browser blocked the
+ * request"). Wrapping the bytes as a synthetic AsyncBuffer skips
+ * the network entirely.
+ *
+ * @param {Uint8Array|ArrayBuffer} buffer
+ * @returns {Promise<ReturnType<typeof parseParquetMetadata>>}
+ */
+export async function parseParquetMetadataFromBuffer(buffer) {
+  // Always copy into a fresh Uint8Array allocated in the current
+  // realm. hyparquet's metadata reader passes the slice straight to
+  // `new DataView(...)`, which throws under jsdom (and any other
+  // multi-realm environment) when the source ArrayBuffer was
+  // created in a different realm. The copy is one O(n) memcpy on
+  // already-in-memory bytes — negligible compared to the network
+  // path the URL variant takes.
+  const owned = new Uint8Array(
+    buffer instanceof Uint8Array ? buffer.byteLength : buffer.byteLength,
+  );
+  owned.set(
+    buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer),
+  );
+  const arrayBuffer = owned.buffer;
+  const asyncBuffer = {
+    byteLength: arrayBuffer.byteLength,
+    slice: async (start, end) =>
+      arrayBuffer.slice(start, end ?? arrayBuffer.byteLength),
+  };
+  const raw = await parquetMetadataAsync(asyncBuffer);
+  return decodeParquetMetadata(raw, arrayBuffer.byteLength);
+}
+
+function decodeParquetMetadata(raw, byteLength) {
   const schemaTree = parquetSchema(raw);
   const keyValueMetadata = (raw.key_value_metadata ?? []).map((kv) => ({
     key: String(kv.key ?? ""),
@@ -72,10 +116,8 @@ export async function parseParquetMetadata(url, options = {}) {
     numRows: normalizeCount(rg.num_rows),
     totalByteSize: normalizeCount(rg.total_byte_size),
   }));
-
-  onProgress("done");
   return {
-    byteLength: buffer.byteLength,
+    byteLength,
     numRows: normalizeCount(raw.num_rows),
     createdBy: raw.created_by ?? null,
     keyValueMetadata,

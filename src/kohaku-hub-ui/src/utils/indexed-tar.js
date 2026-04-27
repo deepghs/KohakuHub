@@ -287,6 +287,32 @@ export function buildMemberRangeHeader(info) {
  */
 export async function extractMemberBytes(tarUrl, info, options = {}) {
   const { signal } = options;
+  // Defensive: a wrapper object that drops .offset (e.g. UI state
+  // copied for display) used to fall through to a Range header with
+  // "undefined" in it; MinIO ignored the header and returned the full
+  // tar. Surface the misuse as a clean TypeError instead of a silent
+  // size mismatch the user has no way to debug.
+  if (
+    !info ||
+    typeof info.offset !== "number" ||
+    !Number.isFinite(info.offset) ||
+    info.offset < 0
+  ) {
+    throw new TypeError(
+      `extractMemberBytes: info.offset must be a non-negative number, got ${
+        info ? JSON.stringify(info.offset) : "no info"
+      }`,
+    );
+  }
+  if (
+    typeof info.size !== "number" ||
+    !Number.isFinite(info.size) ||
+    info.size < 0
+  ) {
+    throw new TypeError(
+      `extractMemberBytes: info.size must be a non-negative number, got ${JSON.stringify(info.size)}`,
+    );
+  }
   if (info.size === 0) return new Uint8Array(0);
 
   const response = await fetch(tarUrl, {
@@ -415,8 +441,34 @@ export function guessMimeType(path) {
 export function classifyMember(path) {
   if (typeof path !== "string") return "binary";
   const lower = path.toLowerCase();
-  const dot = lower.lastIndexOf(".");
-  const ext = dot < 0 ? "" : lower.slice(dot + 1);
+  const baseName = lower.split("/").pop() || "";
+  const dot = baseName.lastIndexOf(".");
+  const ext = dot < 0 ? "" : baseName.slice(dot + 1);
+
+  // README and LICENSE files are commonly checked in without an
+  // extension (Unix style). The standalone blob page renders them
+  // as plain text; classify them the same way so the in-archive
+  // listing shows a meaningful icon and the member view picks the
+  // text renderer instead of bouncing to the "binary — use download"
+  // dead-end.
+  if (dot < 0) {
+    if (baseName === "readme") return "markdown";
+    if (
+      [
+        "license",
+        "licence",
+        "copying",
+        "authors",
+        "contributors",
+        "changelog",
+        "notice",
+        "dockerfile",
+        "makefile",
+      ].includes(baseName)
+    ) {
+      return "text";
+    }
+  }
 
   if (["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "ico"].includes(ext))
     return "image";

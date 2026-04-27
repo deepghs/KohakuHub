@@ -50,6 +50,37 @@ describe("safetensors utilities", () => {
     vi.restoreAllMocks();
   });
 
+  // Regression for the in-archive preview path: when a member is
+  // extracted from a tar via Range read we already have all the bytes
+  // in memory, so the URL-based parser cannot be reused — issuing a
+  // HEAD/Range against `blob:` URLs is unreliable across browsers and
+  // hyparquet's URL helper specifically issues a HEAD for the tail
+  // size lookup. The from-buffer path lets the modal hand the bytes
+  // straight in.
+  describe("parseSafetensorsMetadataFromBuffer", () => {
+    it("parses the same header from in-memory bytes without any fetch", async () => {
+      const { parseSafetensorsMetadataFromBuffer, summarizeSafetensors } =
+        await loadModule();
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const header = parseSafetensorsMetadataFromBuffer(FIXTURE_BYTES);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(Object.keys(header.tensors).sort()).toEqual([
+        "encoder.embed.weight",
+        "encoder.layer0.attn.q_proj.weight",
+        "encoder.layer0.ln.bias",
+      ]);
+      const summary = summarizeSafetensors(header);
+      expect(summary.total).toBe(528);
+    });
+
+    it("rejects a buffer that is too short for the 8-byte length prefix", async () => {
+      const { parseSafetensorsMetadataFromBuffer } = await loadModule();
+      expect(() =>
+        parseSafetensorsMetadataFromBuffer(new Uint8Array(4)),
+      ).toThrow(/header length prefix/);
+    });
+  });
+
   it("parses a real safetensors header via a single Range read", async () => {
     const { parseSafetensorsMetadata } = await loadModule();
     server.use(http.get(FIXTURE_URL, rangeResponder(FIXTURE_BYTES)));

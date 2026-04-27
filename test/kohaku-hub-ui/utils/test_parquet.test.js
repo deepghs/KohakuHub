@@ -64,6 +64,28 @@ describe("parquet utilities", () => {
     vi.restoreAllMocks();
   });
 
+  // Regression for the in-archive preview path. hyparquet's
+  // asyncBufferFromUrl issues a HEAD against the source for the
+  // tail size and Range requests for the footer; both are
+  // unreliable on `blob:` URLs and the user saw "Browser blocked
+  // the request" when previewing a parquet member from inside an
+  // indexed tar. The from-buffer entry point lets the modal hand
+  // hyparquet the already-extracted bytes directly.
+  describe("parseParquetMetadataFromBuffer", () => {
+    it("parses metadata from in-memory bytes without issuing fetches", async () => {
+      const { parseParquetMetadataFromBuffer, summarizeParquetSchema } =
+        await loadModule();
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const metadata = await parseParquetMetadataFromBuffer(FIXTURE_BYTES);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(metadata.byteLength).toBe(FIXTURE_BYTES.length);
+      expect(metadata.numRows).toBe(100);
+      expect(metadata.rowGroups.length).toBeGreaterThanOrEqual(1);
+      const summary = summarizeParquetSchema(metadata);
+      expect(summary.columnCount).toBe(4);
+    });
+  });
+
   it("parses footer metadata, row counts, and top-level columns", async () => {
     const { parseParquetMetadata, summarizeParquetSchema } = await loadModule();
     server.use(http.get(FIXTURE_URL, respondRange(FIXTURE_BYTES)));

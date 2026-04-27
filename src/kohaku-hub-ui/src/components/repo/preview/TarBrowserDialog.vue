@@ -269,11 +269,18 @@ async function openMember(node) {
     path: node.path,
     name: node.name,
     size: node.size,
+    // offset is required by extractMemberBytes for the Download
+    // button. Forgetting it caused MinIO to ignore a malformed Range
+    // header and return the entire tar — the resulting "got X, want
+    // Y" mismatch was confusing because the bug was an undefined
+    // field in the UI wrapper, not a network problem.
+    offset: node.offset,
     sha256: node.sha256,
     cls,
     state: "loading",
     text: null,
     blobUrl: null,
+    bytes: null,
   };
 
   // Empty members: nothing to render but still allow "download" of an
@@ -304,6 +311,12 @@ async function openMember(node) {
     );
     if (memberAbortController !== controller) return; // superseded
 
+    // Cache the in-memory bytes on the memberView so the Download
+    // button can reuse them instead of re-issuing the Range read.
+    // Saves a round-trip and keeps the saved file byte-identical to
+    // what the modal previewed.
+    memberView.value.bytes = bytes;
+
     if (cls === "text" || cls === "markdown") {
       const decoder = new TextDecoder("utf-8", { fatal: false });
       memberView.value.text = decoder.decode(bytes);
@@ -313,9 +326,15 @@ async function openMember(node) {
       memberObjectUrl = URL.createObjectURL(blob);
       memberView.value.blobUrl = memberObjectUrl;
       if (cls === "safetensors" || cls === "parquet") {
+        // Hand the FilePreviewDialog the already-extracted bytes
+        // directly. A blob URL would not work — hyparquet's
+        // asyncBufferFromUrl issues HEAD + Range requests against
+        // the source URL, and HEAD on `blob:` URLs is rejected
+        // (treated as a CORS-style failure by classifyError).
+        // Parsing the in-memory ArrayBuffer skips that dependency.
         innerPreviewProps.value = {
           kind: cls,
-          resolveUrl: memberObjectUrl,
+          bytes,
           filename: node.name,
         };
       }
@@ -330,10 +349,17 @@ async function openMember(node) {
 
 async function downloadMember(node) {
   try {
-    const bytes = await extractMemberBytes(props.tarUrl, {
-      offset: node.offset,
-      size: node.size,
-    });
+    // Reuse the in-memory bytes if openMember already extracted them
+    // (the typical path — ready/loaded state). Skipping a second
+    // Range read makes the saved file byte-identical to what the
+    // user just previewed and avoids re-paying the round-trip.
+    let bytes = node && node.bytes ? node.bytes : null;
+    if (!bytes) {
+      bytes = await extractMemberBytes(props.tarUrl, {
+        offset: node.offset,
+        size: node.size,
+      });
+    }
     downloadBytesAs(bytes, node.name, guessMimeType(node.name));
   } catch (err) {
     ElMessage.error(`Download failed: ${err.message || err}`);
@@ -354,9 +380,15 @@ function isMarkdown(name) {
   return ext === "md" || ext === "markdown";
 }
 
+// Inner FilePreviewDialog stays closed until the user explicitly
+// clicks "Open metadata preview". Auto-opening it on prop change
+// would race with the member view itself, leave the inner overlay
+// stacked over the button, and intercept subsequent clicks (the
+// reproduced symptom: every click on "Open metadata preview" hit
+// the overlay instead of the button).
 const innerPreviewVisible = ref(false);
 watch(innerPreviewProps, (val) => {
-  innerPreviewVisible.value = !!val;
+  if (!val) innerPreviewVisible.value = false;
 });
 </script>
 
@@ -780,15 +812,17 @@ watch(innerPreviewProps, (val) => {
   </el-dialog>
 
   <!-- Sub-dialog used to render safetensors / parquet metadata for a
-       member that has been extracted into an in-memory object URL. The
-       existing FilePreviewDialog accepts any URL as its source, so the
-       in-archive member reuses the same Range-read parser path the
-       standalone preview uses on /resolve/. -->
+       member that has already been extracted into memory. We hand
+       the FilePreviewDialog the raw bytes via its `bytes` prop;
+       the URL-based parsers cannot be reused here because hyparquet
+       issues HEAD + Range against the source URL and `blob:` URLs
+       reject those reliably enough that the user saw the failure as
+       a CORS-shaped error. -->
   <FilePreviewDialog
     v-if="innerPreviewProps && innerPreviewVisible"
     v-model:visible="innerPreviewVisible"
     :kind="innerPreviewProps.kind"
-    :resolve-url="innerPreviewProps.resolveUrl"
+    :bytes="innerPreviewProps.bytes"
     :filename="innerPreviewProps.filename"
   />
 </template>

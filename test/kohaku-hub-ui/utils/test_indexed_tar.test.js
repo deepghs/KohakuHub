@@ -142,6 +142,23 @@ describe("buildMemberRangeHeader + extractMemberBytes", () => {
     ).toThrow();
   });
 
+  it("rejects a member info that is missing offset or size", async () => {
+    // Regression: TarBrowserDialog used to construct a memberView
+    // wrapper that mirrored {path, name, size, sha256} but dropped
+    // .offset. The download button then re-called extractMemberBytes
+    // with offset === undefined; the resulting Range header
+    // ("bytes=undefined-...") was silently ignored by MinIO and the
+    // server returned the entire tar. The user saw "got 26183680
+    // bytes, expected 373519" — the tar's full size, not the member.
+    // The contract now is to throw a clear TypeError on shape misuse.
+    await expect(
+      extractMemberBytes("https://example/tar", { size: 100 }),
+    ).rejects.toThrow(/offset/);
+    await expect(
+      extractMemberBytes("https://example/tar", { offset: 0 }),
+    ).rejects.toThrow(/size/);
+  });
+
   it("Range-reads exactly size bytes from the tar URL", async () => {
     const fullTar = new Uint8Array(64);
     for (let i = 0; i < 64; i++) fullTar[i] = i;
@@ -267,6 +284,19 @@ describe("classifyMember + guessMimeType", () => {
     expect(classifyMember("a.parquet")).toBe("parquet");
     expect(classifyMember("a.json")).toBe("text");
     expect(classifyMember("a.bin")).toBe("binary");
+  });
+
+  it("recognises extension-less README / LICENSE / Dockerfile by basename", () => {
+    // Common Unix-style files were falling through to "binary" so
+    // the listing showed the generic gray document icon and the
+    // member view bounced to "binary — use Download". Both surfaces
+    // now route to the right renderer.
+    expect(classifyMember("README")).toBe("markdown");
+    expect(classifyMember("docs/README")).toBe("markdown");
+    expect(classifyMember("LICENSE")).toBe("text");
+    expect(classifyMember("Dockerfile")).toBe("text");
+    expect(classifyMember("Makefile")).toBe("text");
+    expect(classifyMember("CHANGELOG")).toBe("text");
   });
 
   it("returns standard MIME types for blob construction", () => {
