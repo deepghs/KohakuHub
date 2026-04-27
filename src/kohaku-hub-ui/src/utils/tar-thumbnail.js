@@ -42,8 +42,13 @@ import { extractMemberBytes } from "@/utils/indexed-tar";
 export const HEAD_BYTES = 64 * 1024;
 export const SMALL_IMAGE_BYTES = 256 * 1024;
 export const MEDIUM_IMAGE_BYTES = 5 * 1024 * 1024;
-export const THUMB_MAX_DIM = 128;
-export const THUMB_QUALITY = 0.7;
+// Output thumbnail bound. Bigger than necessary at 128 px (the
+// in-listing images would render too small inside the grid card's
+// ~200-px square slot, leaving a halo of empty space). 256 px keeps
+// the downscale crisp on the larger grid cards while staying under
+// ~25 KB per cached thumbnail.
+export const THUMB_MAX_DIM = 256;
+export const THUMB_QUALITY = 0.78;
 export const THUMB_OUTPUT_MIME = "image/jpeg";
 export const POOL_CONCURRENCY = 4;
 export const CACHE_MAX_ENTRIES = 100;

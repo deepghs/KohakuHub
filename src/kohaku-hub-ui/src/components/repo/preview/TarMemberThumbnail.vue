@@ -26,8 +26,10 @@ const props = defineProps({
   // The Carbon icon class the listing already uses for this entry,
   // shown verbatim while the thumbnail is idle / loading / fallback.
   placeholderIcon: { type: String, required: true },
-  // Pixel size of the rendered thumbnail container (square).
-  size: { type: Number, default: 24 },
+  // Optional fixed pixel size (square). When omitted, the wrapper
+  // stretches to its parent's width and forces a 1:1 aspect ratio
+  // — useful in grid view where each card sets the container width.
+  size: { type: Number, default: null },
 });
 
 const rootRef = ref(null);
@@ -42,10 +44,24 @@ const { state, thumbUrl } = useTarThumbnail({
   rootRef,
 });
 
-const containerStyle = computed(() => ({
-  width: `${props.size}px`,
-  height: `${props.size}px`,
-}));
+// Fixed-size mode (list view) sets explicit width/height in px.
+// Auto-size mode (grid view) lets the wrapper stretch to the
+// parent's inner width and forces a 1:1 box via aspect-square so
+// the thumbnail fills the card horizontally without cropping.
+const containerStyle = computed(() =>
+  props.size != null
+    ? { width: `${props.size}px`, height: `${props.size}px` }
+    : null,
+);
+const containerSizingClass = computed(() =>
+  props.size != null ? "" : "w-full aspect-square",
+);
+// Use a slightly bigger placeholder icon when we're in auto-size
+// mode so it scales with the (now larger) container instead of
+// staying at the original list-row 20-px font size.
+const placeholderSizeClass = computed(() =>
+  props.size != null ? "text-xl" : "text-4xl",
+);
 
 // Placeholder is rendered at icon-font-size scale to match the
 // existing listing icons. Use the same Carbon mask that the panel
@@ -60,21 +76,21 @@ const showThumbnail = computed(
   <div
     ref="rootRef"
     class="flex-shrink-0 inline-flex items-center justify-center overflow-hidden rounded bg-gray-100 dark:bg-gray-800"
+    :class="containerSizingClass"
     :style="containerStyle"
   >
     <img
       v-if="showThumbnail"
       :src="thumbUrl"
       :alt="member.name"
-      class="w-full h-full object-cover"
+      class="w-full h-full object-contain"
       loading="lazy"
       decoding="async"
       draggable="false"
     />
     <div
       v-else
-      :class="placeholderIcon"
-      class="text-xl"
+      :class="[placeholderIcon, placeholderSizeClass]"
     />
   </div>
 </template>

@@ -2823,6 +2823,40 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
         materialize_seed_file(entry) for entry in gallery_members_list
     )
 
+    # Tar 1b — flat-images sibling. All 24 Danbooru images directly at
+    # the tar root (no subfolders). Lives alongside bundle.tar in
+    # archives/gallery/ so a single folder visit produces a long
+    # vertical list of thumbnails — the right shape for eyeballing
+    # the lazy-loading + concurrency-pool behaviour while scrolling.
+    flat_assets: list[str] = []
+    for asset_names in arknights_by_rating.values():
+        flat_assets.extend(asset_names)
+    flat_assets.extend(name for _, _, name in misc_ip_assets)
+    flat_members_list: list[SeedFile] = [
+        (
+            "README.md",
+            text_bytes(
+                """
+                # Flat-image gallery
+
+                Sibling of `bundle.tar` in the same archives/gallery/
+                folder. Holds all 24 Danbooru showcase images at the
+                tar root with no subfolders, so the full set is
+                visible in a single scrollable listing — handy for
+                checking that the in-listing thumbnail lazy-load
+                only kicks in for rows currently on screen.
+                """
+            ),
+        ),
+    ]
+    for asset_name in flat_assets:
+        flat_members_list.append(
+            seed_file(asset_name, lambda n=asset_name: remote_asset_bytes(n))
+        )
+    flat_members: tuple[tuple[str, bytes], ...] = tuple(
+        materialize_seed_file(entry) for entry in flat_members_list
+    )
+
     # Tar 2 — synthetic pagination corpus. ~600 tiny JSON files split
     # across ten folders so the browser exercises both folder-level
     # navigation and the page-size selector.
@@ -2963,6 +2997,9 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
     gallery_tar, gallery_idx = make_indexed_tar_bundle(
         "indexed-tar-gallery", gallery_members
     )
+    flat_tar, flat_idx = make_indexed_tar_bundle(
+        "indexed-tar-flat-images", flat_members
+    )
     large_tar, large_idx = make_indexed_tar_bundle(
         "indexed-tar-large", large_members
     )
@@ -3004,7 +3041,7 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
 
                 | Folder            | Demonstrates                                              |
                 |-------------------|-----------------------------------------------------------|
-                | archives/gallery  | Nested folders + 24 real Danbooru fan-art (4 ratings)     |
+                | archives/gallery  | Nested + flat tar pair: 24 real Danbooru fan-art (4 rates)|
                 | archives/large    | Pagination + search inside a single archive (~600 entries)|
                 | archives/stale    | Tar bytes diverging from sidecar hash → warning banner    |
                 | archives/no-hash  | Sidecar with stripped hashes → info notice banner         |
@@ -3036,6 +3073,8 @@ def build_indexed_tar_showcase_repo_seeds() -> tuple[RepoSeed, ...]:
         ),
         seed_file("archives/gallery/bundle.tar", lambda: gallery_tar),
         seed_file("archives/gallery/bundle.json", lambda: gallery_idx),
+        seed_file("archives/gallery/flat-images.tar", lambda: flat_tar),
+        seed_file("archives/gallery/flat-images.json", lambda: flat_idx),
         seed_file("archives/large/bundle.tar", lambda: large_tar),
         seed_file("archives/large/bundle.json", lambda: large_idx),
         seed_file("archives/stale/bundle.tar", lambda: stale_tar),

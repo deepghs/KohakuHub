@@ -746,7 +746,7 @@ watch(innerPreviewProps, (val) => {
               :tar-url="props.tarUrl"
               :member="entry"
               :placeholder-icon="iconForFile(entry.name)"
-              :size="28"
+              :size="48"
             />
             <div
               v-else
@@ -800,7 +800,6 @@ watch(innerPreviewProps, (val) => {
               :tar-url="props.tarUrl"
               :member="entry"
               :placeholder-icon="iconForFile(entry.name)"
-              :size="56"
               class="mb-2"
             />
             <div
