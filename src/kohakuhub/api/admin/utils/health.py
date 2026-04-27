@@ -9,9 +9,12 @@ outages without one slow component blocking the rest.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import re
 import smtplib
 import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -161,10 +164,168 @@ def _list_buckets_sync() -> str | None:
     return server
 
 
+def _sign_minio_admin_get(
+    *,
+    endpoint: str,
+    path: str,
+    access_key: str,
+    secret_key: str,
+    region: str,
+) -> tuple[str, dict[str, str]]:
+    """Build a signed AWS SigV4 GET request for the MinIO admin API.
+
+    The MinIO admin API uses the same SigV4 service name ("s3") as the
+    S3 data plane, so this implementation matches what `minio-py`'s
+    ``MinioAdmin`` produces (see ``minio/signer.py:sign_v4_s3``). Signing
+    is implemented inline with stdlib ``hmac`` / ``hashlib`` to avoid a
+    new runtime dependency.
+
+    Compatible with MinIO admin API v3 (RELEASE.2019-* and newer); earlier
+    server releases never exposed ``/minio/admin/v3/*`` and are not
+    supported here.
+    """
+    parts = urlsplit(endpoint)
+    host = parts.netloc or parts.path
+    scheme = parts.scheme or "http"
+    url = f"{scheme}://{host}{path}"
+
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    short_date = now.strftime("%Y%m%d")
+    content_sha = hashlib.sha256(b"").hexdigest()
+
+    signed_headers_map = {
+        "content-type": "application/octet-stream",
+        "host": host,
+        "x-amz-content-sha256": content_sha,
+        "x-amz-date": amz_date,
+    }
+    signed_header_keys = sorted(signed_headers_map.keys())
+    canonical_headers = "".join(
+        f"{key}:{signed_headers_map[key]}\n" for key in signed_header_keys
+    )
+    signed_headers = ";".join(signed_header_keys)
+    canonical_request = (
+        f"GET\n{path}\n\n{canonical_headers}\n{signed_headers}\n{content_sha}"
+    )
+
+    scope = f"{short_date}/{region}/s3/aws4_request"
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n"
+        f"{scope}\n"
+        f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+    )
+
+    def _hmac(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + secret_key).encode(), short_date)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, "s3")
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(
+        k_signing, string_to_sign.encode(), hashlib.sha256
+    ).hexdigest()
+
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    headers = {
+        "Host": host,
+        "Content-Type": "application/octet-stream",
+        "x-amz-content-sha256": content_sha,
+        "x-amz-date": amz_date,
+        "Authorization": authorization,
+    }
+    return url, headers
+
+
+def _extract_minio_release(payload: Any) -> str | None:
+    """Pull a release tag out of a MinIO ``/admin/v3/info`` payload.
+
+    The response shape has shifted across MinIO releases: pre-2020 builds
+    surfaced ``mode`` and ``deploymentID`` only, the 2020-2021 line added
+    ``servers[].version`` plus ``servers[].commitID``, and modern builds
+    additionally carry ``servers[].edition``. Look in every documented spot
+    so the probe stays stable across upgrades, and return ``None`` when
+    none of them are present (e.g. on AWS / R2 / Ceph endpoints that 403
+    or 404 the admin path).
+    """
+    if not isinstance(payload, dict):
+        return None
+    servers = payload.get("servers") or payload.get("Servers")
+    if isinstance(servers, list) and servers:
+        first = servers[0] if isinstance(servers[0], dict) else None
+        if first:
+            for key in ("version", "Version", "build", "Build"):
+                value = first.get(key)
+                if value:
+                    return str(value)
+    for key in ("version", "Version"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+async def _fetch_minio_admin_version(timeout: float) -> str | None:
+    """Best-effort lookup of the running MinIO release via the admin API.
+
+    Returns the server-reported release tag (e.g. ``2025-09-07T16:13:09Z``)
+    or ``None`` for non-MinIO S3 endpoints, auth failures, version
+    mismatches, or unexpected payloads. The caller decides whether to fall
+    back to the ``Server`` header from the data-plane response.
+    """
+    region = cfg.s3.region or "us-east-1"
+    try:
+        url, headers = _sign_minio_admin_get(
+            endpoint=cfg.s3.endpoint,
+            path="/minio/admin/v3/info",
+            access_key=cfg.s3.access_key,
+            secret_key=cfg.s3.secret_key,
+            region=region,
+        )
+    except Exception as exc:
+        logger.debug(f"minio admin signing skipped: {exc}")
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url, headers=headers)
+    except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        logger.debug(f"minio admin call failed: {exc}")
+        return None
+
+    if response.status_code != 200:
+        # Non-MinIO endpoints return 403/404 here; older MinIO returns 426
+        # when the admin API version doesn't match. All non-fatal — we
+        # simply skip the lookup and let the Server header speak.
+        logger.debug(
+            f"minio admin call returned {response.status_code}: {response.text[:120]}"
+        )
+        return None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    return _extract_minio_release(payload)
+
+
 async def probe_minio(
     timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Probe S3 / MinIO via list_buckets, capturing the Server header."""
+    """Probe S3 / MinIO via list_buckets, with a best-effort version lookup.
+
+    The S3 ``list_buckets`` call doubles as a liveness check and gives us the
+    ``Server`` header (e.g. ``MinIO``). When the backend identifies itself as
+    MinIO we additionally hit ``/minio/admin/v3/info`` to surface the actual
+    release tag; non-MinIO endpoints (AWS, R2, …) keep the header value as
+    their version string.
+    """
     start = time.perf_counter()
     endpoint = cfg.s3.endpoint
     try:
@@ -188,10 +349,16 @@ async def probe_minio(
             latency_ms=_ms_since(start),
         )
 
+    version: str | None = server
+    if server and server.lower().startswith("minio"):
+        release = await _fetch_minio_admin_version(timeout=timeout)
+        if release:
+            version = f"MinIO {release}"
+
     return _ok(
         "minio",
         start=start,
-        version=server,
+        version=version,
         endpoint=endpoint,
     )
 

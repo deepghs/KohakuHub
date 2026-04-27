@@ -188,6 +188,11 @@ async def test_minio_probe_returns_ok_against_live_service(app):
     assert result["name"] == "minio"
     assert result["status"] == "ok"
     assert result["endpoint"]
+    # The CI MinIO image must report a real release tag in addition to the
+    # default "Server: MinIO" header — that is the regression this whole
+    # admin-probe path exists to prevent.
+    assert result["version"] and result["version"] != "MinIO"
+    assert result["version"].startswith("MinIO ")
 
 
 async def test_lakefs_probe_returns_ok_against_live_service(app):
@@ -204,6 +209,115 @@ async def test_smtp_probe_disabled_by_default_in_tests(app):
     assert result["name"] == "smtp"
     assert result["status"] == "disabled"
     assert result["latency_ms"] is None
+
+
+def test_extract_minio_release_handles_modern_payload():
+    payload = {
+        "mode": "online",
+        "deploymentID": "abc",
+        "servers": [
+            {
+                "state": "online",
+                "version": "2025-09-07T16:13:09Z",
+                "commitID": "deadbeef",
+            }
+        ],
+    }
+    assert (
+        health_utils._extract_minio_release(payload) == "2025-09-07T16:13:09Z"
+    )
+
+
+def test_extract_minio_release_falls_through_legacy_keys():
+    # 2018-era servers used "Build" instead of "version".
+    payload = {"servers": [{"Build": "RELEASE.2018-08-23"}]}
+    assert (
+        health_utils._extract_minio_release(payload) == "RELEASE.2018-08-23"
+    )
+
+
+def test_extract_minio_release_handles_top_level_version():
+    # Some early dev builds and S3-shaped fakes report version at the top.
+    payload = {"version": "2024-01-01T00:00:00Z"}
+    assert (
+        health_utils._extract_minio_release(payload) == "2024-01-01T00:00:00Z"
+    )
+
+
+def test_extract_minio_release_returns_none_for_unknown_payloads():
+    assert health_utils._extract_minio_release(None) is None
+    assert health_utils._extract_minio_release({}) is None
+    assert health_utils._extract_minio_release({"servers": []}) is None
+    assert (
+        health_utils._extract_minio_release(
+            {"servers": [{"state": "online"}]}
+        )
+        is None
+    )
+
+
+async def test_fetch_minio_admin_version_falls_back_when_endpoint_returns_403(
+    app, monkeypatch
+):
+    """Non-MinIO endpoints (AWS, R2, Ceph) typically 403 the admin path."""
+    import httpx as httpx_module
+
+    health_mod = _live_health_module()
+
+    def _handler(_request: httpx_module.Request) -> httpx_module.Response:
+        return httpx_module.Response(403, text="AccessDenied")
+
+    real_async_client = httpx_module.AsyncClient
+    transport = httpx_module.MockTransport(_handler)
+
+    def _factory(*_args, **kwargs):
+        return real_async_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        health_mod.httpx, "AsyncClient", _factory, raising=True
+    )
+    assert await health_mod._fetch_minio_admin_version(timeout=1.0) is None
+
+
+async def test_fetch_minio_admin_version_returns_release_for_signed_response(
+    app, monkeypatch
+):
+    """A 200 OK with a MinIO-shaped payload yields the release tag."""
+    import httpx as httpx_module
+    import json as json_module
+
+    health_mod = _live_health_module()
+
+    def _handler(request: httpx_module.Request) -> httpx_module.Response:
+        # The probe must include an Authorization header for SigV4 — we are
+        # not validating the signature value, only that the wire shape is
+        # what MinIO would expect.
+        assert "Authorization" in request.headers
+        assert request.headers["Authorization"].startswith("AWS4-HMAC-SHA256 ")
+        assert request.headers.get("x-amz-content-sha256")
+        assert request.headers.get("x-amz-date")
+        return httpx_module.Response(
+            200,
+            content=json_module.dumps(
+                {
+                    "mode": "online",
+                    "servers": [{"version": "2024-12-13T22-19-12Z"}],
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    real_async_client = httpx_module.AsyncClient
+    transport = httpx_module.MockTransport(_handler)
+
+    def _factory(*_args, **kwargs):
+        return real_async_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        health_mod.httpx, "AsyncClient", _factory, raising=True
+    )
+    release = await health_mod._fetch_minio_admin_version(timeout=1.0)
+    assert release == "2024-12-13T22-19-12Z"
 
 
 async def test_minio_probe_reports_down_when_list_buckets_raises(app, monkeypatch):

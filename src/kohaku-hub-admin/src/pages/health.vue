@@ -135,17 +135,19 @@ onBeforeUnmount(() => {
 
 <template>
   <AdminLayout>
-    <div class="health-page">
-      <div class="page-header">
+    <div class="page-container">
+      <div class="flex justify-between items-center mb-6 gap-4 flex-wrap">
         <div>
-          <h2 class="text-2xl font-semibold mb-1">Dependency Health</h2>
-          <p class="text-gray-500 dark:text-gray-400 text-sm">
+          <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100">
+            Dependency Health
+          </h1>
+          <p class="text-gray-500 dark:text-gray-400 text-sm mt-1">
             Live probes for the services this hub depends on. Useful for
             quickly answering "is the deployment healthy?" without leaving the
             admin UI.
           </p>
         </div>
-        <div class="actions">
+        <div class="flex items-center gap-3">
           <el-select
             v-model="refreshIntervalSeconds"
             class="refresh-select"
@@ -179,22 +181,26 @@ onBeforeUnmount(() => {
         class="mb-4"
       />
 
-      <div class="overall-banner" v-if="report" data-testid="health-overall">
-        <span class="overall-label">Overall</span>
-        <el-tag
-          :type="statusType(overallStatus)"
-          size="large"
-          effect="dark"
-          class="overall-tag"
-        >
-          {{ statusLabel(overallStatus) }}
-        </el-tag>
-        <span class="overall-meta">
-          checked at {{ formatTimestamp(report.checked_at_ms) }} ·
-          probes ran in {{ formatLatency(report.elapsed_ms) }} ·
-          per-probe timeout {{ report.timeout_seconds }} s
-        </span>
-      </div>
+      <el-card
+        v-if="report"
+        shadow="never"
+        class="mb-4 overall-banner"
+        data-testid="health-overall"
+      >
+        <div class="flex items-center gap-3 flex-wrap">
+          <span class="font-semibold text-gray-700 dark:text-gray-200">
+            Overall
+          </span>
+          <el-tag :type="statusType(overallStatus)" size="large" effect="dark">
+            {{ statusLabel(overallStatus) }}
+          </el-tag>
+          <span class="text-gray-500 dark:text-gray-400 text-sm">
+            checked at {{ formatTimestamp(report.checked_at_ms) }} · probes
+            ran in {{ formatLatency(report.elapsed_ms) }} · per-probe timeout
+            {{ report.timeout_seconds }} s
+          </span>
+        </div>
+      </el-card>
 
       <div v-loading="loading" class="cards-grid" data-testid="health-grid">
         <el-card
@@ -205,8 +211,10 @@ onBeforeUnmount(() => {
           :data-testid="`health-card-${dep.name}`"
         >
           <template #header>
-            <div class="card-header">
-              <span class="card-title">{{ dependencyLabel(dep.name) }}</span>
+            <div class="flex justify-between items-center">
+              <span class="font-semibold text-gray-900 dark:text-gray-100">
+                {{ dependencyLabel(dep.name) }}
+              </span>
               <el-tag :type="statusType(dep.status)" effect="light">
                 {{ statusLabel(dep.status) }}
               </el-tag>
@@ -244,48 +252,8 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.health-page {
-  padding: 8px 0;
-}
-
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 16px;
-  margin-bottom: 24px;
-  flex-wrap: wrap;
-}
-
-.actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
 .refresh-select {
   width: 160px;
-}
-
-.overall-banner {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  background-color: var(--bg-elevated);
-  border: 1px solid var(--border-default);
-  border-radius: 8px;
-  margin-bottom: 20px;
-  flex-wrap: wrap;
-}
-
-.overall-label {
-  font-weight: 600;
-}
-
-.overall-meta {
-  color: var(--text-secondary);
-  font-size: 13px;
 }
 
 .cards-grid {
@@ -297,17 +265,6 @@ onBeforeUnmount(() => {
 
 .dep-card {
   border-radius: 10px;
-}
-
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.card-title {
-  font-size: 16px;
-  font-weight: 600;
 }
 
 .dep-meta {
@@ -326,7 +283,7 @@ onBeforeUnmount(() => {
 }
 
 .meta-label {
-  color: var(--text-secondary);
+  color: var(--el-text-color-secondary);
   font-size: 13px;
   flex-shrink: 0;
 }

@@ -45,7 +45,7 @@ const menuItems = [
   {
     path: "/health",
     label: "Health",
-    icon: "i-carbon-pulse",
+    icon: "i-carbon-activity",
   },
   {
     path: "/DatabaseViewer",
