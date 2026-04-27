@@ -61,6 +61,7 @@ declare module 'vue' {
     SidebarRelationshipsCard: typeof import('./components/repo/metadata/SidebarRelationshipsCard.vue')['default']
     SocialLinks: typeof import('./components/profile/SocialLinks.vue')['default']
     TarBrowserDialog: typeof import('./components/repo/preview/TarBrowserDialog.vue')['default']
+    TarBrowserPanel: typeof import('./components/repo/preview/TarBrowserPanel.vue')['default']
     TARFileList: typeof import('./components/DatasetViewer/TARFileList.vue')['default']
     TheFooter: typeof import('./components/layout/TheFooter.vue')['default']
     TheHeader: typeof import('./components/layout/TheHeader.vue')['default']
