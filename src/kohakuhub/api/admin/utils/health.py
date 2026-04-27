@@ -44,14 +44,7 @@ def _strip_password(url: str) -> str:
     host = parts.hostname or ""
     if parts.port:
         host = f"{host}:{parts.port}"
-
-    if user and host:
-        netloc = f"{user}@{host}"
-    elif host:
-        netloc = host
-    else:
-        netloc = user
-
+    netloc = f"{user}@{host}" if user else host
     return urlunsplit(parts._replace(netloc=netloc))
 
 

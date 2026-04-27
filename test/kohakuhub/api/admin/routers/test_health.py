@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
+import pytest
+
 from kohakuhub.api.admin.utils import health as health_utils
 
 ENDPOINT = "/admin/api/health/dependencies"
@@ -202,6 +204,250 @@ async def test_smtp_probe_disabled_by_default_in_tests(app):
     assert result["name"] == "smtp"
     assert result["status"] == "disabled"
     assert result["latency_ms"] is None
+
+
+async def test_minio_probe_reports_down_when_list_buckets_raises(app, monkeypatch):
+    health_mod = _live_health_module()
+
+    def _raise():
+        raise RuntimeError("simulated s3 failure")
+
+    monkeypatch.setattr(
+        health_mod, "_list_buckets_sync", _raise, raising=True
+    )
+    result = await health_mod.probe_minio()
+    assert result["status"] == "down"
+    assert "simulated s3 failure" in result["detail"]
+    assert result["endpoint"]
+
+
+async def test_minio_probe_reports_timeout(app, monkeypatch):
+    health_mod = _live_health_module()
+
+    async def _slow_to_thread(*_args, **_kwargs):
+        await asyncio.sleep(5)
+        return None
+
+    monkeypatch.setattr(asyncio, "to_thread", _slow_to_thread, raising=True)
+    result = await health_mod.probe_minio(timeout=0.1)
+    assert result["status"] == "down"
+    assert "timeout" in result["detail"]
+
+
+async def test_lakefs_probe_reports_down_when_healthcheck_returns_5xx(
+    app, monkeypatch
+):
+    import httpx as httpx_module
+
+    health_mod = _live_health_module()
+
+    def _handler(request: httpx_module.Request) -> httpx_module.Response:
+        return httpx_module.Response(503, text="boom")
+
+    real_async_client = httpx_module.AsyncClient
+    transport = httpx_module.MockTransport(_handler)
+
+    def _factory(*_args, **kwargs):
+        return real_async_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        health_mod.httpx, "AsyncClient", _factory, raising=True
+    )
+    result = await health_mod.probe_lakefs()
+    assert result["status"] == "down"
+    assert "503" in result["detail"]
+
+
+async def test_lakefs_probe_reports_down_when_healthcheck_raises(
+    app, monkeypatch
+):
+    import httpx as httpx_module
+
+    health_mod = _live_health_module()
+
+    def _handler(_request: httpx_module.Request) -> httpx_module.Response:
+        raise httpx_module.ConnectError("simulated network error")
+
+    real_async_client = httpx_module.AsyncClient
+    transport = httpx_module.MockTransport(_handler)
+
+    def _factory(*_args, **kwargs):
+        return real_async_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        health_mod.httpx, "AsyncClient", _factory, raising=True
+    )
+    result = await health_mod.probe_lakefs()
+    assert result["status"] == "down"
+    assert "simulated network error" in result["detail"]
+
+
+async def test_lakefs_probe_keeps_ok_when_only_version_lookup_fails(
+    app, monkeypatch
+):
+    import httpx as httpx_module
+
+    health_mod = _live_health_module()
+
+    def _handler(request: httpx_module.Request) -> httpx_module.Response:
+        if request.url.path.endswith("/healthcheck"):
+            return httpx_module.Response(204)
+        return httpx_module.Response(401, text="auth required")
+
+    real_async_client = httpx_module.AsyncClient
+    transport = httpx_module.MockTransport(_handler)
+
+    def _factory(*_args, **kwargs):
+        return real_async_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        health_mod.httpx, "AsyncClient", _factory, raising=True
+    )
+    result = await health_mod.probe_lakefs()
+    assert result["status"] == "ok"
+    assert result["version"] is None
+
+
+async def test_smtp_probe_reports_ok_when_enabled_and_banner_is_returned(
+    app, monkeypatch
+):
+    health_mod = _live_health_module()
+
+    monkeypatch.setattr(health_mod.cfg.smtp, "enabled", True, raising=True)
+
+    def _fake_smtp(_timeout):
+        return "mail.example ESMTP ready"
+
+    monkeypatch.setattr(
+        health_mod, "_smtp_probe_sync", _fake_smtp, raising=True
+    )
+    result = await health_mod.probe_smtp()
+    assert result["status"] == "ok"
+    assert result["version"] == "mail.example ESMTP ready"
+    assert result["endpoint"] == f"{health_mod.cfg.smtp.host}:{health_mod.cfg.smtp.port}"
+
+
+async def test_smtp_probe_reports_down_when_ehlo_raises(app, monkeypatch):
+    health_mod = _live_health_module()
+
+    monkeypatch.setattr(health_mod.cfg.smtp, "enabled", True, raising=True)
+
+    def _raise(_timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(
+        health_mod, "_smtp_probe_sync", _raise, raising=True
+    )
+    result = await health_mod.probe_smtp()
+    assert result["status"] == "down"
+    assert "connection refused" in result["detail"]
+
+
+async def test_smtp_probe_reports_timeout(app, monkeypatch):
+    health_mod = _live_health_module()
+
+    monkeypatch.setattr(health_mod.cfg.smtp, "enabled", True, raising=True)
+
+    async def _slow_to_thread(*_args, **_kwargs):
+        await asyncio.sleep(10)
+        return None
+
+    monkeypatch.setattr(asyncio, "to_thread", _slow_to_thread, raising=True)
+    result = await health_mod.probe_smtp(timeout=0.1)
+    assert result["status"] == "down"
+    assert "timeout" in result["detail"]
+
+
+async def test_query_postgres_version_handles_sqlite_branch(app, monkeypatch):
+    health_mod = _live_health_module()
+
+    class _Cursor:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def fetchone(self):
+            return self._payload
+
+    class _FakeDb:
+        def __init__(self):
+            self.calls = []
+
+        def execute_sql(self, sql):
+            self.calls.append(sql.strip())
+            if "sqlite_version" in sql:
+                return _Cursor(("3.40.0",))
+            return _Cursor((1,))
+
+    fake_db = _FakeDb()
+    monkeypatch.setattr(health_mod, "db", fake_db, raising=True)
+    monkeypatch.setattr(health_mod.cfg.app, "db_backend", "sqlite", raising=True)
+    version = health_mod._query_postgres_version()
+    assert version == "SQLite 3.40.0"
+    assert fake_db.calls == ["SELECT 1", "SELECT sqlite_version()"]
+
+
+def test_strip_password_returns_input_when_urlsplit_raises(monkeypatch):
+    """urlsplit raises ValueError on invalid IPv6 literals, e.g. unmatched ``[``."""
+
+    def _raise(_url):
+        raise ValueError("invalid url")
+
+    monkeypatch.setattr(health_utils, "urlsplit", _raise, raising=True)
+    assert health_utils._strip_password("anything") == "anything"
+
+
+async def test_smtp_probe_sync_uses_smtplib_and_returns_first_banner_line(
+    app, monkeypatch
+):
+    health_mod = _live_health_module()
+
+    class _FakeSMTP:
+        instances = []
+
+        def __init__(self, host, port, timeout):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+            self.quit_called = False
+            self.closed = False
+            _FakeSMTP.instances.append(self)
+
+        def ehlo(self):
+            return 250, b"mail.example greets you\nfollow-up line"
+
+        def quit(self):
+            self.quit_called = True
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(health_mod.smtplib, "SMTP", _FakeSMTP, raising=True)
+    banner = health_mod._smtp_probe_sync(2.0)
+    assert banner == "mail.example greets you"
+    assert _FakeSMTP.instances and _FakeSMTP.instances[0].quit_called
+
+
+async def test_smtp_probe_sync_raises_when_ehlo_returns_error_code(
+    app, monkeypatch
+):
+    health_mod = _live_health_module()
+
+    class _ErrorSMTP:
+        def __init__(self, host, port, timeout):
+            pass
+
+        def ehlo(self):
+            return 421, b"go away"
+
+        def quit(self):
+            raise health_mod.smtplib.SMTPException("quit failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(health_mod.smtplib, "SMTP", _ErrorSMTP, raising=True)
+    with pytest.raises(health_mod.smtplib.SMTPResponseException):
+        health_mod._smtp_probe_sync(2.0)
 
 
 def test_strip_password_removes_secret_from_pg_url():

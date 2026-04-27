@@ -170,6 +170,18 @@ describe("admin health page", () => {
     expect(mocks.router.push).toHaveBeenCalledWith("/login");
   });
 
+  it("treats a 403 response the same as 401 (force re-login)", async () => {
+    const failure = new Error("forbidden");
+    failure.response = { status: 403, data: { detail: { error: "denied" } } };
+    mocks.api.getDependencyHealth.mockRejectedValueOnce(failure);
+
+    mountPage();
+    await flushPromises();
+
+    expect(mocks.adminStore.logout).toHaveBeenCalledTimes(1);
+    expect(mocks.router.push).toHaveBeenCalledWith("/login");
+  });
+
   it("redirects to /login when no admin token is present", async () => {
     mocks.adminStore.token = "";
     mountPage();
@@ -202,5 +214,24 @@ describe("admin health page", () => {
     await flushPromises();
     // No additional calls after auto-refresh was reset to "Off".
     expect(mocks.api.getDependencyHealth).toHaveBeenCalledTimes(3);
+  });
+
+  it("clears the auto-refresh timer on unmount", async () => {
+    mocks.api.getDependencyHealth.mockResolvedValue(SAMPLE_PAYLOAD);
+    const wrapper = mountPage();
+    await flushPromises();
+
+    const select = wrapper.get('[data-el-select="true"]');
+    await select.setValue(30);
+    await flushPromises();
+
+    expect(mocks.api.getDependencyHealth).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+
+    vi.advanceTimersByTime(120_000);
+    await flushPromises();
+    // The interval was cancelled by onBeforeUnmount; no further refreshes.
+    expect(mocks.api.getDependencyHealth).toHaveBeenCalledTimes(1);
   });
 });
