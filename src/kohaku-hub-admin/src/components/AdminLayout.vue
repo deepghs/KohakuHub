@@ -43,6 +43,11 @@ const menuItems = [
     icon: "i-carbon-meter",
   },
   {
+    path: "/health",
+    label: "Health",
+    icon: "i-carbon-pulse",
+  },
+  {
     path: "/DatabaseViewer",
     label: "Database",
     icon: "i-carbon-data-table",
