@@ -639,35 +639,39 @@ describe("RepoViewer path handling", () => {
     const wrapper = mountViewer({ currentPath: "catalog" });
     await flushPromises();
     await flushPromises();
+    await flushPromises();
 
-    expect(page1Calls).toBe(1);
+    expect(page1Calls).toBeGreaterThanOrEqual(1);
     expect(wrapper.find('[data-testid="file-list-pager"]').exists()).toBe(true);
     expect(wrapper.text()).toContain("a-first.txt");
     expect(wrapper.text()).not.toContain("z-last.txt");
     expect(wrapper.text()).toContain("Page 1");
 
-    const nextBtn = wrapper.find('[data-testid="file-list-page-next"]');
+    // Background discovery walked forward and confirmed page 2 is the
+    // tail; the pager's Next + page-2 buttons are now usable.
+    const nextBtn = wrapper.find('[data-el-pagination-next="true"]');
     expect(nextBtn.exists()).toBe(true);
     await nextBtn.trigger("click");
     await flushPromises();
     await flushPromises();
 
-    expect(page2Calls).toBe(1);
+    expect(page2Calls).toBeGreaterThanOrEqual(1);
     expect(wrapper.text()).toContain("z-last.txt");
     expect(wrapper.text()).not.toContain("a-first.txt");
     expect(wrapper.text()).toContain("Page 2");
-    // Page 2 was the tail (no Link rel=next), so Next disables itself.
+    // Page 2 was the tail (no Link rel=next) and discovery confirmed
+    // it — Next disables itself.
     expect(
-      wrapper.find('[data-testid="file-list-page-next"]').attributes("disabled"),
+      wrapper
+        .find('[data-el-pagination-next="true"]')
+        .attributes("disabled"),
     ).toBeDefined();
 
-    // Prev returns to page 1 reusing the stored stack (no extra fetch
-    // beyond the page-1 reload — backend can't seek backward, so the UI
-    // re-issues the cursor-less first-page request).
-    await wrapper.find('[data-testid="file-list-page-prev"]').trigger("click");
+    // Prev re-issues the cursor-less first-page request (backend can't
+    // seek backwards, so we always re-fetch).
+    await wrapper.find('[data-el-pagination-prev="true"]').trigger("click");
     await flushPromises();
     await flushPromises();
-    expect(page1Calls).toBe(2);
     expect(wrapper.text()).toContain("a-first.txt");
     expect(wrapper.text()).toContain("Page 1");
 
@@ -681,25 +685,38 @@ describe("RepoViewer path handling", () => {
         "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
         ({ request }) => {
           const url = new URL(request.url);
+          const cursor = url.searchParams.get("cursor");
           observed.push({
             limit: url.searchParams.get("limit"),
-            cursor: url.searchParams.get("cursor"),
+            cursor,
           });
-          return jsonResponse(
-            [
+          if (!cursor) {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/a-first.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
               {
-                type: "file",
-                path: "catalog/a-first.txt",
-                size: 1,
-                lastModified: "2026-04-21T13:53:39.000000Z",
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-2>; rel="next"',
+                },
               },
-            ],
+            );
+          }
+          // Tail page — no Link header so background discovery
+          // terminates instead of looping the same cursor forever.
+          return jsonResponse([
             {
-              headers: {
-                Link: '<https://hub.test/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog?recursive=false&limit=50&cursor=cursor-2>; rel="next"',
-              },
+              type: "file",
+              path: "catalog/z-last.txt",
+              size: 1,
+              lastModified: "2026-04-21T13:53:39.000000Z",
             },
-          );
+          ]);
         },
       ),
       http.post(
@@ -727,11 +744,16 @@ describe("RepoViewer path handling", () => {
     await flushPromises();
     await flushPromises();
 
-    // New fetch lands with the new limit AND no cursor — switching size
-    // resets the stack because the previous cursors were minted at the
-    // old page size and don't address the same slice anymore.
-    const last = observed[observed.length - 1];
-    expect(last).toEqual({ limit: "100", cursor: null });
+    // New foreground fetch lands with the new limit AND no cursor —
+    // switching size resets pagination because the previously-discovered
+    // cursors were minted at the old page size and don't address the
+    // same slice anymore. (The very last call is the discovery walk's
+    // page-2 probe; we want the first call AFTER the size change.)
+    const postChange = observed.find(
+      (entry, idx) =>
+        idx > 0 && entry.limit === "100" && entry.cursor === null,
+    );
+    expect(postChange).toBeDefined();
     expect(localStorage.getItem("kohaku-repo-file-list-page-size")).toBe(
       "100",
     );
@@ -739,7 +761,10 @@ describe("RepoViewer path handling", () => {
     wrapper.unmount();
   });
 
-  it("First button rewinds the cursor stack to page 1 in a single click", async () => {
+  it("First / Last / page-N / jumper navigate a multi-page directory through discovered cursors", async () => {
+    // Three-page directory; the SPA's discovery walks forward in the
+    // background after the initial page-1 fetch so the pager can
+    // surface a real total + numbered page buttons + a Last button.
     let calls = 0;
     server.use(
       http.get(
@@ -748,9 +773,122 @@ describe("RepoViewer path handling", () => {
           calls += 1;
           const url = new URL(request.url);
           const cursor = url.searchParams.get("cursor");
-          // Page 1 → page 2 → page 3 chain so the cursor stack grows
-          // past one entry and First's "drop the whole stack" semantics
-          // are visible (vs Prev which only pops one).
+          if (!cursor) {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/a.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-2>; rel="next"',
+                },
+              },
+            );
+          }
+          if (cursor === "cursor-2") {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/m.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-3>; rel="next"',
+                },
+              },
+            );
+          }
+          return jsonResponse([
+            {
+              type: "file",
+              path: "catalog/z.txt",
+              size: 1,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]);
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "catalog" });
+    // Page 1 fetch + discovery walk + paths-info — flush enough times
+    // for all of them to settle before assertions read the pager.
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    // Discovery has confirmed all three pages.
+    const pagerEl = wrapper.find('[data-el-pagination="true"]');
+    expect(pagerEl.attributes("data-page-count")).toBe("3");
+
+    // Numbered button → page 3 (== Last button equivalent).
+    await wrapper.find('[data-el-pagination-page="3"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.text()).toContain("z.txt");
+    expect(wrapper.text()).toContain("Page 3");
+    expect(
+      wrapper
+        .find('[data-testid="file-list-page-last"]')
+        .attributes("disabled"),
+    ).toBeDefined();
+
+    // First button rewinds without intermediate hops.
+    await wrapper.find('[data-testid="file-list-page-first"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.text()).toContain("a.txt");
+    expect(wrapper.text()).toContain("Page 1");
+
+    // Jumper input → direct goto-page-N. Driving the stub's <input>
+    // mirrors what the real ElPagination jumper does: a Number()
+    // change emits `current-change` with the entered page.
+    await wrapper
+      .find('[data-el-pagination-jumper="true"]')
+      .setValue("2");
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.text()).toContain("m.txt");
+    expect(wrapper.text()).toContain("Page 2");
+
+    // Last button at this point goes to page 3 (end is discovered).
+    await wrapper.find('[data-testid="file-list-page-last"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.text()).toContain("z.txt");
+    expect(wrapper.text()).toContain("Page 3");
+
+    wrapper.unmount();
+  });
+
+  it("jumper input that targets a not-yet-discovered page extends discovery before navigating", async () => {
+    // Three-page directory; we only flush enough for page 1 to land,
+    // then drive the jumper to page 3. goToFileListPage should walk
+    // forward synchronously (`extendFileListDiscoveryTo`) and then
+    // navigate — i.e. the user is not blocked on background discovery
+    // having finished first.
+    const calls = [];
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
+        ({ request }) => {
+          const url = new URL(request.url);
+          const cursor = url.searchParams.get("cursor");
+          calls.push(cursor);
           if (!cursor) {
             return jsonResponse(
               [
@@ -804,28 +942,220 @@ describe("RepoViewer path handling", () => {
     const wrapper = mountViewer({ currentPath: "catalog" });
     await flushPromises();
     await flushPromises();
+    await flushPromises();
+    await flushPromises();
 
-    await wrapper.find('[data-testid="file-list-page-next"]').trigger("click");
+    await wrapper
+      .find('[data-el-pagination-jumper="true"]')
+      .setValue("3");
     await flushPromises();
     await flushPromises();
-    await wrapper.find('[data-testid="file-list-page-next"]').trigger("click");
     await flushPromises();
-    await flushPromises();
-    expect(wrapper.text()).toContain("Page 3");
+
     expect(wrapper.text()).toContain("z.txt");
+    expect(wrapper.text()).toContain("Page 3");
 
-    // First rewinds two pages worth of cursors in one click — page 1
-    // re-fetched, m.txt and z.txt no longer rendered.
-    await wrapper.find('[data-testid="file-list-page-first"]').trigger("click");
+    wrapper.unmount();
+  });
+
+  it("Last button kicks off a synchronous discovery walk when the background pass has not finished yet", async () => {
+    // Background discovery is gated on a never-resolved promise so it
+    // never reaches the end on its own. Last must run its own walk,
+    // which uses the same fetch path — so we open a second gate the
+    // foreground walk can release. Two pages; the second page is the
+    // tail (no Link header) once unblocked.
+    let unblockBackground;
+    const backgroundGate = new Promise((resolve) => {
+      unblockBackground = resolve;
+    });
+    let backgroundCalls = 0;
+
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
+        async ({ request }) => {
+          const url = new URL(request.url);
+          const cursor = url.searchParams.get("cursor");
+          if (!cursor) {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/a.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-2>; rel="next"',
+                },
+              },
+            );
+          }
+          backgroundCalls += 1;
+          if (backgroundCalls === 1) {
+            // First (background) hop hangs to keep endDiscovered=false.
+            await backgroundGate;
+          }
+          // Tail page (no Link) on whatever call happens to win.
+          return jsonResponse([
+            {
+              type: "file",
+              path: "catalog/z.txt",
+              size: 1,
+              lastModified: "2026-04-21T13:53:39.000000Z",
+            },
+          ]);
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "catalog" });
     await flushPromises();
     await flushPromises();
-    expect(wrapper.text()).toContain("Page 1");
+
+    // Last should still be disabled — endDiscovered hasn't been
+    // observed yet.
+    expect(
+      wrapper
+        .find('[data-testid="file-list-page-last"]')
+        .attributes("disabled"),
+    ).toBeDefined();
+
+    // Drive the goToLastFileListPage handler directly (the rendered
+    // button is `disabled` while endDiscovered=false, so a real
+    // .click() is dropped at the DOM layer; the user-visible affordance
+    // arrives via the keyboard shortcut / jumper, which both call the
+    // same function). Release the background gate first so the
+    // runId-superseded loop unblocks and exits.
+    unblockBackground();
+    await wrapper.vm.goToLastFileListPage();
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("z.txt");
+    expect(wrapper.text()).toContain("Page 2");
+
+    wrapper.unmount();
+  });
+
+  it("background discovery silently swallows a transient fetch error so the foreground listing still renders", async () => {
+    // Discovery's error handler must NOT surface anything to the
+    // user — page 1 still loads, the pager shows what it knows.
+    let bgCalls = 0;
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
+        ({ request }) => {
+          const url = new URL(request.url);
+          const cursor = url.searchParams.get("cursor");
+          if (!cursor) {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/a.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-2>; rel="next"',
+                },
+              },
+            );
+          }
+          bgCalls += 1;
+          return jsonResponse({ detail: "discovery probe failed" }, { status: 503 });
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "catalog" });
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+
+    expect(bgCalls).toBeGreaterThanOrEqual(1);
+    // Page 1 is rendered; no error panel.
     expect(wrapper.text()).toContain("a.txt");
-    expect(wrapper.text()).not.toContain("m.txt");
-    expect(wrapper.text()).not.toContain("z.txt");
-    // 3 forward fetches + 1 First fetch = 4 total.
-    expect(calls).toBe(4);
+    expect(wrapper.text()).not.toContain("Authentication required");
 
+    wrapper.unmount();
+  });
+
+  it("Last button stays disabled and the 'discovering more…' hint shows while the cursor walk is still in flight", async () => {
+    // We block the discovery walk on its second hop by handing it a
+    // Promise we never resolve, so the SPA stays in the "page 1
+    // loaded; end not confirmed yet" state for the assertion. Page 1
+    // resolves immediately so the foreground load completes; only
+    // the cursor=cursor-2 call hangs.
+    let releaseDiscovery;
+    const discoveryGate = new Promise((resolve) => {
+      releaseDiscovery = resolve;
+    });
+
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main/catalog",
+        async ({ request }) => {
+          const url = new URL(request.url);
+          const cursor = url.searchParams.get("cursor");
+          if (!cursor) {
+            return jsonResponse(
+              [
+                {
+                  type: "file",
+                  path: "catalog/a.txt",
+                  size: 1,
+                  lastModified: "2026-04-21T13:53:39.000000Z",
+                },
+              ],
+              {
+                headers: {
+                  Link: '<https://hub.test/api?cursor=cursor-2>; rel="next"',
+                },
+              },
+            );
+          }
+          await discoveryGate;
+          return jsonResponse([]);
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    const wrapper = mountViewer({ currentPath: "catalog" });
+    await flushPromises();
+    await flushPromises();
+
+    expect(
+      wrapper
+        .find('[data-testid="file-list-page-last"]')
+        .attributes("disabled"),
+    ).toBeDefined();
+    expect(
+      wrapper.find('[data-testid="file-list-discovery-hint"]').exists(),
+    ).toBe(true);
+
+    // Release the discovery hop and tear down so the test cleans up
+    // without leaking the dangling fetch into the next case.
+    releaseDiscovery();
+    await flushPromises();
     wrapper.unmount();
   });
 

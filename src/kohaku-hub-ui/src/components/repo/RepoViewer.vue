@@ -379,8 +379,8 @@
               <span
                 class="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap"
               >
-                <template v-if="fileListHasPrev || fileListHasNext">
-                  Page {{ fileListPageIndex }} ·
+                <template v-if="fileListShowPager">
+                  Page {{ fileListCurrentPage }} ·
                   {{ fileTree.length }} on this page
                 </template>
                 <template v-else>
@@ -602,14 +602,16 @@
           </div>
 
           <!--
-            File-list pager. Hidden until there is at least one extra
-            page to navigate to (or back from) so a small repo does
-            not see scaffolding it has no use for. Cursor-based: the
-            backend returns LakeFS' opaque `next_offset`, no `total`,
-            so jump-to-page-N is intentionally out of scope here.
+            File-list pager. Hidden until the directory actually
+            paginates so a small repo does not see scaffolding it has
+            no use for. Cursor-based — the backend returns LakeFS'
+            opaque `next_offset` only — so the SPA discovers cursors
+            forward in the background; the pager renders real page
+            numbers (with ellipsis), a jumper input for direct
+            page-N navigation, plus First/Last for quick rewind.
           -->
           <div
-            v-if="!filesLoading && (fileListHasPrev || fileListHasNext)"
+            v-if="!filesLoading && fileListShowPager"
             class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
             data-testid="file-list-pager"
           >
@@ -629,37 +631,54 @@
                   :value="size"
                 />
               </el-select>
+              <span
+                v-if="!fileListEndDiscovered"
+                class="text-xs text-gray-400 dark:text-gray-500"
+                data-testid="file-list-discovery-hint"
+                title="Walking forward through the cursor-based listing — the page count grows as more pages are confirmed."
+              >
+                · discovering more…
+              </span>
             </div>
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 flex-wrap">
               <el-button
                 size="small"
                 :disabled="!fileListHasPrev || filesLoading"
                 data-testid="file-list-page-first"
                 @click="goToFirstFileListPage"
+                title="Jump to the first page"
               >
                 <div class="i-carbon-skip-back inline-block mr-1" />
                 First
               </el-button>
+              <el-pagination
+                :current-page="fileListCurrentPage"
+                :page-count="fileListPageCount"
+                :pager-count="7"
+                :disabled="filesLoading"
+                background
+                hide-on-single-page
+                layout="prev, pager, next, jumper"
+                data-testid="file-list-pagination"
+                @current-change="goToFileListPage"
+              />
               <el-button
                 size="small"
-                :disabled="!fileListHasPrev || filesLoading"
-                data-testid="file-list-page-prev"
-                @click="goToPrevFileListPage"
+                :disabled="
+                  !fileListEndDiscovered ||
+                  fileListCurrentPage === fileListPageCount ||
+                  filesLoading
+                "
+                data-testid="file-list-page-last"
+                @click="goToLastFileListPage"
+                :title="
+                  fileListEndDiscovered
+                    ? 'Jump to the last page'
+                    : 'Last page is still being discovered — try again in a moment'
+                "
               >
-                <div class="i-carbon-chevron-left inline-block mr-1" />
-                Prev
-              </el-button>
-              <span class="text-sm text-gray-600 dark:text-gray-400 px-1">
-                Page {{ fileListPageIndex }}
-              </span>
-              <el-button
-                size="small"
-                :disabled="!fileListHasNext || filesLoading"
-                data-testid="file-list-page-next"
-                @click="goToNextFileListPage"
-              >
-                Next
-                <div class="i-carbon-chevron-right inline-block ml-1" />
+                Last
+                <div class="i-carbon-skip-forward inline-block ml-1" />
               </el-button>
             </div>
           </div>
@@ -1068,23 +1087,41 @@ const deletingFolder = ref(false);
 const fileTreeRequestId = ref(0);
 
 // Paging state for the file list. The backend exposes opaque LakeFS
-// `next_offset` cursors only — random-page jumps would require a count
-// the wire format doesn't carry. So the UI keeps a `cursorStack` of
-// previously-visited cursors for Prev navigation and the page index is
-// derived (1-based) from its length.
+// `next_offset` cursors only — random-page jumps need every cursor to
+// be discovered up to the target page. The SPA tracks a flat array of
+// discovered cursors so direct page-N navigation, jumper input, and
+// "Last page" all work once discovery walks far enough:
 //
-// `nextCursor` mirrors the response's `next_cursor`; presence drives
-// the Next button's enabled state. `currentCursor` is the cursor used
-// to fetch the current page (null on page 1) and is what we re-issue
-// when the user changes page size or refreshes after a delete.
+//   discoveredCursors[i] = cursor TO fetch page (i+1)
+//   discoveredCursors[0] = null  (page 1 is always cursor-less)
+//
+// `endDiscovered` flips true once a fetch returns no nextCursor — at
+// that point `discoveredCursors.length` is the true total page count.
+// Until then `pageCount` reflects the highest known page; navigation
+// past it is gated until discovery walks further (extendDiscoveryTo).
 const fileListPageSize = ref(DEFAULT_FILE_LIST_PAGE_SIZE);
-const fileListCursorStack = ref([]);
-const fileListCurrentCursor = ref(null);
-const fileListNextCursor = ref(null);
-const fileListPageIndex = computed(() => fileListCursorStack.value.length + 1);
-const fileListHasPrev = computed(() => fileListCursorStack.value.length > 0);
-const fileListHasNext = computed(() => Boolean(fileListNextCursor.value));
+const fileListDiscoveredCursors = ref([null]);
+const fileListEndDiscovered = ref(false);
+const fileListCurrentPage = ref(1);
+const fileListPageCount = computed(() =>
+  Math.max(1, fileListDiscoveredCursors.value.length),
+);
+const fileListHasPrev = computed(() => fileListCurrentPage.value > 1);
+const fileListHasNext = computed(
+  () =>
+    fileListCurrentPage.value < fileListDiscoveredCursors.value.length ||
+    !fileListEndDiscovered.value,
+);
+const fileListShowPager = computed(
+  () =>
+    fileListEndDiscovered.value
+      ? fileListPageCount.value > 1
+      : fileListDiscoveredCursors.value.length > 1 ||
+        Boolean(fileListDiscoveredCursors.value[0] !== null),
+);
 const FILE_LIST_PAGE_SIZE_OPTIONS = FILE_LIST_PAGE_SIZES;
+const FILE_LIST_DISCOVERY_MAX_PAGES = 200;
+let fileListDiscoveryRunId = 0;
 
 // Indexed-tar sibling-icon probe state. The sync `hasIndexSibling`
 // lookup runs against the loaded page first (cheap); when a `.tar`
@@ -1500,18 +1537,23 @@ async function toggleLike() {
   }
 }
 
-async function loadFileTree({ cursor = null, resetStack = true } = {}) {
+async function loadFileTree({ resetPagination = true } = {}) {
+  if (resetPagination) {
+    fileListDiscoveredCursors.value = [null];
+    fileListEndDiscovered.value = false;
+    fileListCurrentPage.value = 1;
+    // Bump the discovery run id so any in-flight forward walk from a
+    // previous folder/branch/page-size aborts on its next iteration.
+    fileListDiscoveryRunId += 1;
+  }
   filesLoading.value = true;
   treeErrorClassification.value = null;
   const requestId = fileTreeRequestId.value + 1;
   fileTreeRequestId.value = requestId;
 
-  if (resetStack) {
-    fileListCursorStack.value = [];
-  }
-
   let sortedEntries = [];
-  let nextCursor = null;
+  const targetPage = fileListCurrentPage.value;
+  const cursor = fileListDiscoveredCursors.value[targetPage - 1] ?? null;
 
   try {
     const page = await repoAPI.listTreePage(
@@ -1530,10 +1572,8 @@ async function loadFileTree({ cursor = null, resetStack = true } = {}) {
     if (requestId !== fileTreeRequestId.value) return;
 
     sortedEntries = sortFileEntries(page.entries || []);
-    nextCursor = page.nextCursor || null;
     fileTree.value = sortedEntries;
-    fileListCurrentCursor.value = cursor || null;
-    fileListNextCursor.value = nextCursor;
+    recordDiscoveredCursor(targetPage, page.nextCursor || null);
 
     if (sortedEntries.length === 0) {
       return;
@@ -1542,8 +1582,6 @@ async function loadFileTree({ cursor = null, resetStack = true } = {}) {
     console.error("Failed to load file tree:", err);
     if (requestId === fileTreeRequestId.value) {
       fileTree.value = [];
-      fileListNextCursor.value = null;
-      fileListCurrentCursor.value = cursor || null;
       // Axios interceptor in utils/api.js attaches `.classification`.
       // Prefer it; fall back to classifying the bare error ourselves
       // if a future refactor changes the interceptor.
@@ -1558,6 +1596,14 @@ async function loadFileTree({ cursor = null, resetStack = true } = {}) {
 
   if (sortedEntries.length === 0 || requestId !== fileTreeRequestId.value) {
     return;
+  }
+
+  // Kick off background discovery on the first page load — it walks
+  // forward issuing minimal listTreePage calls so the pager can render
+  // real page numbers (and a usable Last button) on directories with
+  // hundreds of pages without making the user click Next ten times.
+  if (resetPagination) {
+    void runFileListDiscovery();
   }
 
   // Sibling-icon probe pass for `.tar` rows on this page that did NOT
@@ -1660,30 +1706,134 @@ function changeFileListPageSize(nextSize) {
   if (n === fileListPageSize.value) return;
   fileListPageSize.value = n;
   writeFileListPageSize(n);
-  // Resetting to page 1 keeps cursor-stack semantics meaningful — the
-  // previous-page cursors were minted at the old page size and would
-  // not address the same slice with the new one.
-  loadFileTree({ resetStack: true, cursor: null });
+  // Resetting to page 1 keeps cursor semantics meaningful — the
+  // previously-discovered cursors were minted at the old page size
+  // and would not address the same slice with the new one.
+  loadFileTree({ resetPagination: true });
 }
 
-function goToNextFileListPage() {
-  if (!fileListHasNext.value || filesLoading.value) return;
-  const cursorToAdvance = fileListCurrentCursor.value;
-  fileListCursorStack.value = [...fileListCursorStack.value, cursorToAdvance];
-  loadFileTree({ resetStack: false, cursor: fileListNextCursor.value });
+function recordDiscoveredCursor(pageIndex, nextCursor) {
+  // pageIndex is the 1-based page we just loaded — its nextCursor is
+  // the cursor required to fetch page (pageIndex + 1). Store it at
+  // index `pageIndex` so discovered[i] addresses page i+1.
+  if (nextCursor) {
+    if (fileListDiscoveredCursors.value.length === pageIndex) {
+      fileListDiscoveredCursors.value = [
+        ...fileListDiscoveredCursors.value,
+        nextCursor,
+      ];
+    } else if (
+      fileListDiscoveredCursors.value[pageIndex] !== nextCursor &&
+      fileListDiscoveredCursors.value.length > pageIndex
+    ) {
+      // The backend handed back a different cursor than we had cached
+      // — overwrite. Happens after a delete or tree rewrite landed on
+      // top of an already-discovered set.
+      const next = [...fileListDiscoveredCursors.value];
+      next[pageIndex] = nextCursor;
+      fileListDiscoveredCursors.value = next;
+    }
+  } else if (
+    fileListDiscoveredCursors.value.length === pageIndex
+  ) {
+    fileListEndDiscovered.value = true;
+  }
 }
 
-function goToPrevFileListPage() {
-  if (!fileListHasPrev.value || filesLoading.value) return;
-  const stack = [...fileListCursorStack.value];
-  const previousCursor = stack.pop() ?? null;
-  fileListCursorStack.value = stack;
-  loadFileTree({ resetStack: false, cursor: previousCursor });
+async function goToFileListPage(targetPage) {
+  if (filesLoading.value) return;
+  const target = Number(targetPage);
+  if (!Number.isFinite(target) || target < 1) return;
+  if (target === fileListCurrentPage.value) return;
+  if (target > fileListDiscoveredCursors.value.length) {
+    // The user wants a page we haven't discovered yet — extend forward
+    // up to the requested index, then continue. Soft-bound by the
+    // discovery cap so a giant directory does not block the click
+    // forever.
+    await extendFileListDiscoveryTo(target);
+    if (target > fileListDiscoveredCursors.value.length) {
+      // Couldn't reach it — clamp to the highest known page.
+      fileListCurrentPage.value = fileListDiscoveredCursors.value.length;
+    } else {
+      fileListCurrentPage.value = target;
+    }
+  } else {
+    fileListCurrentPage.value = target;
+  }
+  await loadFileTree({ resetPagination: false });
 }
 
 function goToFirstFileListPage() {
-  if (!fileListHasPrev.value || filesLoading.value) return;
-  loadFileTree({ resetStack: true, cursor: null });
+  if (filesLoading.value) return;
+  if (fileListCurrentPage.value === 1) return;
+  fileListCurrentPage.value = 1;
+  loadFileTree({ resetPagination: false });
+}
+
+async function goToLastFileListPage() {
+  if (filesLoading.value) return;
+  if (!fileListEndDiscovered.value) {
+    // Background discovery hasn't reached the end yet; finish the walk
+    // synchronously so "Last" lands on the real last page rather than
+    // the highest known one.
+    await extendFileListDiscoveryTo(FILE_LIST_DISCOVERY_MAX_PAGES);
+  }
+  const last = fileListDiscoveredCursors.value.length;
+  if (last <= 1 || fileListCurrentPage.value === last) return;
+  fileListCurrentPage.value = last;
+  loadFileTree({ resetPagination: false });
+}
+
+async function runFileListDiscovery() {
+  await extendFileListDiscoveryTo(FILE_LIST_DISCOVERY_MAX_PAGES);
+}
+
+async function extendFileListDiscoveryTo(targetPageCount) {
+  // Walk forward from the highest discovered cursor until we either
+  // hit the end or own at least `targetPageCount` cursors. Each step
+  // issues a listTreePage with the same page size — the entries are
+  // discarded; only the next cursor is recorded. Best-effort: any
+  // error stops the loop without surfacing to the user, since the
+  // pager can still navigate to pages we already know about.
+  const myRunId = ++fileListDiscoveryRunId;
+  while (
+    fileListDiscoveryRunId === myRunId &&
+    !fileListEndDiscovered.value &&
+    fileListDiscoveredCursors.value.length < targetPageCount &&
+    fileListDiscoveredCursors.value.length < FILE_LIST_DISCOVERY_MAX_PAGES
+  ) {
+    const lastIdx = fileListDiscoveredCursors.value.length - 1;
+    const cursor = fileListDiscoveredCursors.value[lastIdx];
+    if (lastIdx > 0 && cursor === null) break; // safety: should never happen
+    try {
+      const page = await repoAPI.listTreePage(
+        props.repoType,
+        props.namespace,
+        props.name,
+        currentBranch.value,
+        props.currentPath ? `/${props.currentPath}` : "",
+        {
+          recursive: false,
+          limit: fileListPageSize.value,
+          cursor: cursor || undefined,
+        },
+      );
+      if (fileListDiscoveryRunId !== myRunId) return;
+      if (page.nextCursor) {
+        fileListDiscoveredCursors.value = [
+          ...fileListDiscoveredCursors.value,
+          page.nextCursor,
+        ];
+      } else {
+        fileListEndDiscovered.value = true;
+        return;
+      }
+    } catch {
+      // Swallow — discovery is best-effort. The user can still
+      // navigate to known pages.
+      return;
+    }
+  }
 }
 
 async function loadReadme() {
