@@ -387,41 +387,6 @@
                   loaded
                 </template>
               </span>
-              <!--
-                Per-batch selector lives in the header next to the
-                count rather than down by the Load More button — that
-                way it's discoverable without scrolling past a long
-                listing, and the visual relationship "this controls
-                the next fetch" is established up front. Visible only
-                while more is fetchable; changing the value persists
-                to localStorage but does not refetch (issue #56).
-              -->
-              <template v-if="fileListHasMore">
-                <span
-                  class="text-sm text-gray-400 dark:text-gray-500 whitespace-nowrap"
-                >
-                  ·
-                </span>
-                <span
-                  class="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap"
-                >
-                  Per batch:
-                </span>
-                <el-select
-                  :model-value="fileListPageSize"
-                  size="small"
-                  class="w-20"
-                  data-testid="file-list-page-size"
-                  @change="changeFileListBatchSize"
-                >
-                  <el-option
-                    v-for="size in FILE_LIST_PAGE_SIZE_OPTIONS"
-                    :key="size"
-                    :label="String(size)"
-                    :value="size"
-                  />
-                </el-select>
-              </template>
             </div>
 
             <div
@@ -1013,12 +978,13 @@ import {
   getPreviewKind,
 } from "@/utils/file-preview";
 import { tarSidecarPath } from "@/utils/indexed-tar";
-import {
-  DEFAULT_PAGE_SIZE as DEFAULT_FILE_LIST_PAGE_SIZE,
-  VALID_PAGE_SIZES as FILE_LIST_PAGE_SIZES,
-  readPageSize as readFileListPageSize,
-  writePageSize as writeFileListPageSize,
-} from "@/utils/repo-list-pagination";
+
+// Fixed batch size for the file-list Load More button. The earlier
+// numbered-pager UI had a 50/100/200 selector, but with Load More the
+// affordance "click to extend" is the entire knob — a per-batch
+// dropdown collided with the surrounding header chrome and earned
+// nothing in return, so it was removed (issue #56 follow-up).
+const FILE_LIST_BATCH_SIZE = 50;
 
 /**
  * @typedef {Object} Props
@@ -1076,14 +1042,9 @@ const fileTreeRequestId = ref(0);
 //   * a separate `loadingMore` flag for the append path so the user
 //     sees the Load More button enter a loading state without
 //     blanking out the already-rendered listing.
-// `fileListPageSize` is reused as the batch-size knob for subsequent
-// Load More clicks — already-loaded entries are not re-fetched when
-// the user changes it (acceptance criteria from issue #56).
-const fileListPageSize = ref(DEFAULT_FILE_LIST_PAGE_SIZE);
 const fileListNextCursor = ref(null);
 const fileListLoadingMore = ref(false);
 const fileListHasMore = computed(() => fileListNextCursor.value !== null);
-const FILE_LIST_PAGE_SIZE_OPTIONS = FILE_LIST_PAGE_SIZES;
 
 // Indexed-tar sibling-icon probe state. The sync `hasIndexSibling`
 // lookup runs against the loaded page first (cheap); when a `.tar`
@@ -1574,7 +1535,7 @@ async function loadFileTree({ resetPagination = true } = {}) {
       props.currentPath ? `/${props.currentPath}` : "",
       {
         recursive: false,
-        limit: fileListPageSize.value,
+        limit: FILE_LIST_BATCH_SIZE,
         // Initial load always starts from cursor-less; Load More uses
         // a dedicated function that does not go through here.
         name_prefix: namePrefix || undefined,
@@ -1644,7 +1605,7 @@ async function loadMoreFileTree() {
       props.currentPath ? `/${props.currentPath}` : "",
       {
         recursive: false,
-        limit: fileListPageSize.value,
+        limit: FILE_LIST_BATCH_SIZE,
         cursor,
         name_prefix: namePrefix || undefined,
       },
@@ -1742,17 +1703,6 @@ async function probeMissingIndexedTarSiblings(entries, requestId) {
       }
     }),
   );
-}
-
-function changeFileListBatchSize(nextSize) {
-  const n = Number(nextSize);
-  if (!FILE_LIST_PAGE_SIZE_OPTIONS.includes(n)) return;
-  if (n === fileListPageSize.value) return;
-  fileListPageSize.value = n;
-  writeFileListPageSize(n);
-  // Per the issue's acceptance criteria, the new batch size applies
-  // only to the next Load More click — already-loaded entries are
-  // not refetched, so no `loadFileTree` here.
 }
 
 async function loadReadme() {
@@ -2103,7 +2053,6 @@ watch(
 
 // Lifecycle
 onMounted(async () => {
-  fileListPageSize.value = readFileListPageSize();
   await loadRepoInfo();
 
   if (activeTab.value === "files") {

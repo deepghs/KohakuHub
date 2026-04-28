@@ -631,12 +631,9 @@ describe("RepoViewer path handling", () => {
     expect(observed).toHaveLength(1);
     expect(observed[0]).toEqual({ limit: "50", cursor: null });
     expect(wrapper.text()).toContain("a-first.txt");
-    // Load More button + per-batch selector both surface because the
-    // response carried a `Link: rel="next"` cursor.
+    // Load More button surfaces because the response carried a
+    // `Link: rel="next"` cursor.
     expect(wrapper.find('[data-testid="file-list-load-more"]').exists()).toBe(
-      true,
-    );
-    expect(wrapper.find('[data-testid="file-list-page-size"]').exists()).toBe(
       true,
     );
     // Count copy carries the "loaded" suffix while more is available.
@@ -715,23 +712,21 @@ describe("RepoViewer path handling", () => {
     // Both entries are rendered — Load More appended, did not replace.
     expect(wrapper.text()).toContain("a-first.txt");
     expect(wrapper.text()).toContain("z-last.txt");
-    // Tail batch arrived → Load More button + per-batch selector
-    // both removed (nothing left to fetch, nothing to configure).
+    // Tail batch arrived → Load More button removed (nothing to fetch).
     expect(wrapper.find('[data-testid="file-list-load-more"]').exists()).toBe(
-      false,
-    );
-    expect(wrapper.find('[data-testid="file-list-page-size"]').exists()).toBe(
       false,
     );
 
     wrapper.unmount();
   });
 
-  it("changing the batch-size selector persists the choice and applies to the next Load More click — already-loaded entries stay in place", async () => {
-    // Acceptance criterion from issue #56: changing the batch-size
-    // selector does NOT re-fetch the listing. The existing rows stay
-    // rendered; the new value only shows up as `limit=` on the next
-    // Load More click.
+  it("every Load More click sends limit=50 — the per-batch selector was removed in favor of a single fixed batch", async () => {
+    // The earlier numbered-pager UI had a 50/100/200 selector. With
+    // Load More the affordance "click to extend" carries the entire
+    // knob, so the selector was dropped (it visually collided with
+    // the surrounding header chrome). Pin the constant batch size on
+    // the wire so a future regression doesn't silently re-introduce
+    // a configurable size without the UI to drive it.
     const observed = [];
     server.use(
       http.get(
@@ -747,7 +742,7 @@ describe("RepoViewer path handling", () => {
               [
                 {
                   type: "file",
-                  path: "catalog/a-first.txt",
+                  path: "catalog/a.txt",
                   size: 1,
                   lastModified: "2026-04-21T13:53:39.000000Z",
                 },
@@ -762,7 +757,7 @@ describe("RepoViewer path handling", () => {
           return jsonResponse([
             {
               type: "file",
-              path: "catalog/z-last.txt",
+              path: "catalog/m.txt",
               size: 1,
               lastModified: "2026-04-21T13:53:39.000000Z",
             },
@@ -779,36 +774,18 @@ describe("RepoViewer path handling", () => {
     await flushPromises();
     await flushPromises();
 
-    expect(observed).toEqual([{ limit: "50", cursor: null }]);
-    expect(wrapper.text()).toContain("a-first.txt");
-
-    // Change the batch size. The selector renders as a stub here —
-    // drive the change handler directly the same way the existing
-    // page-size widget tests do (the el-select stub doesn't render
-    // real <option>s in jsdom).
-    wrapper.vm.changeFileListBatchSize(100);
-    await flushPromises();
-    await flushPromises();
-
-    // Crucially: NO new request fired — the change is queued for
-    // the next Load More click.
-    expect(observed).toEqual([{ limit: "50", cursor: null }]);
-    // Already-loaded row is still rendered — change did not blank
-    // the listing or trigger a reset.
-    expect(wrapper.text()).toContain("a-first.txt");
-    expect(localStorage.getItem("kohaku-repo-file-list-page-size")).toBe(
-      "100",
-    );
-
-    // Now the Load More click goes out with the new limit.
     await wrapper.find('[data-testid="file-list-load-more"]').trigger("click");
     await flushPromises();
     await flushPromises();
+
     expect(observed).toEqual([
       { limit: "50", cursor: null },
-      { limit: "100", cursor: "cursor-2" },
+      { limit: "50", cursor: "cursor-2" },
     ]);
-    expect(wrapper.text()).toContain("z-last.txt");
+    // No batch-size widget renders in either state.
+    expect(wrapper.find('[data-testid="file-list-page-size"]').exists()).toBe(
+      false,
+    );
 
     wrapper.unmount();
   });
