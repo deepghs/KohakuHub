@@ -631,11 +631,12 @@ describe("RepoViewer path handling", () => {
     expect(observed).toHaveLength(1);
     expect(observed[0]).toEqual({ limit: "50", cursor: null });
     expect(wrapper.text()).toContain("a-first.txt");
-    // Footer becomes visible because nextCursor was parsed off Link.
-    expect(wrapper.find('[data-testid="file-list-footer"]').exists()).toBe(
+    // Load More button + per-batch selector both surface because the
+    // response carried a `Link: rel="next"` cursor.
+    expect(wrapper.find('[data-testid="file-list-load-more"]').exists()).toBe(
       true,
     );
-    expect(wrapper.find('[data-testid="file-list-load-more"]').exists()).toBe(
+    expect(wrapper.find('[data-testid="file-list-page-size"]').exists()).toBe(
       true,
     );
     // Count copy carries the "loaded" suffix while more is available.
@@ -714,11 +715,12 @@ describe("RepoViewer path handling", () => {
     // Both entries are rendered — Load More appended, did not replace.
     expect(wrapper.text()).toContain("a-first.txt");
     expect(wrapper.text()).toContain("z-last.txt");
-    // Tail batch arrived → footer + Load More button gone.
-    expect(wrapper.find('[data-testid="file-list-footer"]').exists()).toBe(
+    // Tail batch arrived → Load More button + per-batch selector
+    // both removed (nothing left to fetch, nothing to configure).
+    expect(wrapper.find('[data-testid="file-list-load-more"]').exists()).toBe(
       false,
     );
-    expect(wrapper.find('[data-testid="file-list-load-more"]').exists()).toBe(
+    expect(wrapper.find('[data-testid="file-list-page-size"]').exists()).toBe(
       false,
     );
 

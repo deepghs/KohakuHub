@@ -387,6 +387,41 @@
                   loaded
                 </template>
               </span>
+              <!--
+                Per-batch selector lives in the header next to the
+                count rather than down by the Load More button — that
+                way it's discoverable without scrolling past a long
+                listing, and the visual relationship "this controls
+                the next fetch" is established up front. Visible only
+                while more is fetchable; changing the value persists
+                to localStorage but does not refetch (issue #56).
+              -->
+              <template v-if="fileListHasMore">
+                <span
+                  class="text-sm text-gray-400 dark:text-gray-500 whitespace-nowrap"
+                >
+                  ·
+                </span>
+                <span
+                  class="text-sm text-gray-600 dark:text-gray-400 whitespace-nowrap"
+                >
+                  Per batch:
+                </span>
+                <el-select
+                  :model-value="fileListPageSize"
+                  size="small"
+                  class="w-20"
+                  data-testid="file-list-page-size"
+                  @change="changeFileListBatchSize"
+                >
+                  <el-option
+                    v-for="size in FILE_LIST_PAGE_SIZE_OPTIONS"
+                    :key="size"
+                    :label="String(size)"
+                    :value="size"
+                  />
+                </el-select>
+              </template>
             </div>
 
             <div
@@ -603,56 +638,30 @@
           </div>
 
           <!--
-            File-list "Load more" footer. Cursor-based listings (LakeFS
-            exposes only opaque `next_offset`) don't carry a total page
-            count, so a numbered pager forced the SPA to walk every
-            page forward just to know how many buttons to render —
-            visible as buttons popping in one by one (issue #56). Load
-            More mirrors HuggingFace's pattern: append on click, no
-            background walk, no reveal animation.
+            "Load more" button — centered, plain, mirroring the
+            commit-history "Load More Commits" affordance below. We
+            switched away from a numbered pager because the cursor-
+            only LakeFS list API gives no total page count and the
+            old pager had to walk every page forward just to render
+            its buttons (issue #56). The per-batch selector that
+            controls the next click's `limit` lives up in the header
+            next to the count, not here.
 
-            Hidden when the listing is fully loaded — at that point
-            the batch-size selector has nothing to act on, since
-            changing it does not retroactively re-fetch already-loaded
-            entries (per the issue's acceptance criteria).
+            Hidden when the listing is exhausted — at that point
+            there is nothing to load.
           -->
           <div
             v-if="!filesLoading && fileListHasMore"
-            class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-            data-testid="file-list-footer"
+            class="text-center pt-4"
           >
-            <div class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
-              <span>Per batch:</span>
-              <el-select
-                :model-value="fileListPageSize"
-                size="small"
-                class="w-24"
-                data-testid="file-list-page-size"
-                @change="changeFileListBatchSize"
-              >
-                <el-option
-                  v-for="size in FILE_LIST_PAGE_SIZE_OPTIONS"
-                  :key="size"
-                  :label="String(size)"
-                  :value="size"
-                />
-              </el-select>
-              <span class="text-xs text-gray-400 dark:text-gray-500">
-                · applies to the next click
-              </span>
-            </div>
             <el-button
-              size="small"
-              type="primary"
-              plain
               :loading="fileListLoadingMore"
               :disabled="fileListLoadingMore"
+              plain
               data-testid="file-list-load-more"
               @click="loadMoreFileTree"
-              title="Fetch and append the next batch"
             >
-              <div class="i-carbon-add inline-block mr-1" />
-              Load more ({{ fileListPageSize }})
+              Load More Files
             </el-button>
           </div>
         </div>
