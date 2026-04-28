@@ -405,10 +405,11 @@
               </el-button>
               <el-input
                 v-model="fileSearchQuery"
-                placeholder="Search files..."
+                placeholder="Filter by name prefix..."
                 size="small"
                 class="w-full sm:w-50"
                 clearable
+                data-testid="file-list-name-prefix"
               >
                 <template #prefix>
                   <div class="i-carbon-search" />
@@ -505,7 +506,7 @@
                 they don't trigger the row navigation.
               -->
               <div
-                v-for="file in filteredFiles"
+                v-for="file in fileTree"
                 :key="file.path"
                 class="relative py-3 grid grid-cols-[auto_1fr] md:grid-cols-[auto_minmax(0,1.4fr)_minmax(0,2fr)_120px_110px] gap-3 items-center hover:bg-gray-50 dark:hover:bg-gray-700 px-2 cursor-pointer transition-colors"
               >
@@ -587,14 +588,15 @@
               </div>
 
               <div
-                v-if="filteredFiles.length === 0"
+                v-if="fileTree.length === 0"
                 class="py-12 text-center text-gray-500 dark:text-gray-400"
               >
                 <div
                   class="i-carbon-document-blank text-6xl mb-4 inline-block"
                 />
                 <p v-if="fileSearchQuery">
-                  No files match "{{ fileSearchQuery }}" on this page
+                  No files in this directory start with
+                  "{{ fileSearchQuery }}" (case-sensitive prefix)
                 </p>
                 <p v-else>No files found</p>
               </div>
@@ -1254,14 +1256,10 @@ const pathSegments = computed(() => {
   return props.currentPath ? props.currentPath.split("/").filter(Boolean) : [];
 });
 
-const filteredFiles = computed(() => {
-  if (!fileSearchQuery.value) return fileTree.value;
-
-  const query = fileSearchQuery.value.toLowerCase();
-  return fileTree.value.filter((file) =>
-    getFileName(file.path).toLowerCase().includes(query),
-  );
-});
+// `fileSearchQuery` is wired to the backend's same-level
+// `name_prefix` filter (issue #54). Filtering happens server-side
+// against LakeFS' native `prefix`, so the listing rendered by the
+// table is exactly `fileTree` — no client-side post-filter pass.
 
 // Parse tags from repo info
 const parsedTags = computed(() => {
@@ -1537,6 +1535,17 @@ async function toggleLike() {
   }
 }
 
+function activeNamePrefix() {
+  // Trim like the backend's `_normalize_name_prefix` so a whitespace-
+  // only entry never reaches the wire (response would be byte-
+  // identical to the unfiltered listing, but it would muddle the
+  // cursor-stack-reset watcher below).
+  const value = fileSearchQuery.value;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
 async function loadFileTree({ resetPagination = true } = {}) {
   if (resetPagination) {
     fileListDiscoveredCursors.value = [null];
@@ -1554,6 +1563,7 @@ async function loadFileTree({ resetPagination = true } = {}) {
   let sortedEntries = [];
   const targetPage = fileListCurrentPage.value;
   const cursor = fileListDiscoveredCursors.value[targetPage - 1] ?? null;
+  const namePrefix = activeNamePrefix();
 
   try {
     const page = await repoAPI.listTreePage(
@@ -1566,6 +1576,7 @@ async function loadFileTree({ resetPagination = true } = {}) {
         recursive: false,
         limit: fileListPageSize.value,
         cursor: cursor || undefined,
+        name_prefix: namePrefix || undefined,
       },
     );
 
@@ -1805,6 +1816,7 @@ async function extendFileListDiscoveryTo(targetPageCount) {
     const lastIdx = fileListDiscoveredCursors.value.length - 1;
     const cursor = fileListDiscoveredCursors.value[lastIdx];
     if (lastIdx > 0 && cursor === null) break; // safety: should never happen
+    const namePrefix = activeNamePrefix();
     try {
       const page = await repoAPI.listTreePage(
         props.repoType,
@@ -1816,6 +1828,7 @@ async function extendFileListDiscoveryTo(targetPageCount) {
           recursive: false,
           limit: fileListPageSize.value,
           cursor: cursor || undefined,
+          name_prefix: namePrefix || undefined,
         },
       );
       if (fileListDiscoveryRunId !== myRunId) return;
@@ -2115,6 +2128,28 @@ async function deleteFolder() {
 }
 
 // Watchers
+
+// `fileSearchQuery` drives the backend's `name_prefix` filter on the
+// /tree endpoint (issue #54). Debounce keystrokes so we don't hammer
+// LakeFS while the user is typing — and always force a full reset on
+// the cursor stack, since cursors discovered with one prefix do not
+// address the same slice under another. This watcher owns the reset;
+// the loadFileTree() call below picks up the new value via
+// `activeNamePrefix()`.
+const FILE_SEARCH_DEBOUNCE_MS = 300;
+let fileSearchDebounceHandle = null;
+watch(fileSearchQuery, () => {
+  if (fileSearchDebounceHandle) {
+    clearTimeout(fileSearchDebounceHandle);
+  }
+  fileSearchDebounceHandle = setTimeout(() => {
+    fileSearchDebounceHandle = null;
+    if (activeTab.value === "files" || activeTab.value === "card") {
+      loadFileTree({ resetPagination: true });
+    }
+  }, FILE_SEARCH_DEBOUNCE_MS);
+});
+
 watch(
   () => props.currentPath,
   () => {

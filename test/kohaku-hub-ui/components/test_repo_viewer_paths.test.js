@@ -1159,12 +1159,24 @@ describe("RepoViewer path handling", () => {
     wrapper.unmount();
   });
 
-  it("paginated empty-search placeholder reads 'No files match \"…\" on this page', not the bare 'No files found'", async () => {
+  it("name_prefix filter is server-side: the search box drives a new /tree request and renders the prefix-not-found copy when LakeFS returns []", async () => {
+    // Issue #54 — the in-memory `filteredFiles` post-filter was
+    // replaced by a server-side `name_prefix` query param so paginated
+    // listings can actually be searched. The empty-state copy must
+    // reflect the prefix semantics ("starts with", case-sensitive)
+    // rather than the previous in-memory contains-match wording.
+    const treeRequests = [];
     server.use(
       http.get(
         "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main",
-        () =>
-          jsonResponse([
+        ({ request }) => {
+          const url = new URL(request.url);
+          const params = Object.fromEntries(url.searchParams.entries());
+          treeRequests.push(params);
+          if (params.name_prefix === "zeta") {
+            return jsonResponse([]);
+          }
+          return jsonResponse([
             {
               type: "file",
               path: "alpha.txt",
@@ -1177,7 +1189,8 @@ describe("RepoViewer path handling", () => {
               size: 1,
               lastModified: "2026-04-21T13:53:39.000000Z",
             },
-          ]),
+          ]);
+        },
       ),
       http.post(
         "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
@@ -1185,17 +1198,110 @@ describe("RepoViewer path handling", () => {
       ),
     );
 
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const wrapper = mountViewer();
     await flushPromises();
     await flushPromises();
 
-    // Search for something not on this page (since paginated search
-    // only filters the current slice). The empty-state copy must
-    // distinguish "current page" from "whole repo" so the user is
-    // not misled into thinking the file does not exist at all.
     wrapper.vm.fileSearchQuery = "zeta";
+    // The watcher debounces 300ms before firing the reload. Advance
+    // the timer so the new request goes out, then drain pending
+    // microtasks (paths-info chains off the same request id).
+    await vi.advanceTimersByTimeAsync(350);
     await flushPromises();
-    expect(wrapper.text()).toContain('No files match "zeta" on this page');
+    await flushPromises();
+    vi.useRealTimers();
+
+    // The new request must carry the prefix verbatim — case-sensitive
+    // wire form, no client-side lowercasing.
+    const prefixedReq = treeRequests.find((r) => r.name_prefix === "zeta");
+    expect(prefixedReq).toBeTruthy();
+    // Cursor must be absent — typing a new prefix resets the cursor
+    // stack so previously-discovered cursors (which addressed the
+    // unfiltered slice) cannot leak into the filtered listing.
+    expect(prefixedReq.cursor).toBeUndefined();
+    expect(wrapper.text()).toContain(
+      'No files in this directory start with "zeta"',
+    );
+
+    wrapper.unmount();
+  });
+
+  it("typing into the search box resets the cursor stack so previously-discovered cursors do not leak into the filtered listing", async () => {
+    // Cursors are minted by LakeFS for the unfiltered slice. If the
+    // SPA reused them after a `name_prefix` change, a Prev / direct-N
+    // page click would land on the wrong window of entries — which
+    // is exactly the regression the cursor-stack reset prevents.
+    const treeRequests = [];
+    server.use(
+      http.get(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main",
+        ({ request }) => {
+          const url = new URL(request.url);
+          const params = Object.fromEntries(url.searchParams.entries());
+          treeRequests.push(params);
+          // Filtered request: empty result, simulating "no match".
+          if (params.name_prefix) {
+            return jsonResponse([]);
+          }
+          // Unfiltered: hand back a page with a next cursor so the
+          // SPA records `cursor-page-2` in its discovered-cursors
+          // stack. Subsequent filtered requests must NOT reuse it.
+          return jsonResponse(
+            [
+              {
+                type: "file",
+                path: "alpha.txt",
+                size: 1,
+                lastModified: "2026-04-21T13:53:39.000000Z",
+              },
+            ],
+            {
+              headers: {
+                Link: '<https://hub.local/api/datasets/open-media-lab/hierarchy-crawl-fixtures/tree/main?cursor=cursor-page-2&limit=50>; rel="next"',
+              },
+            },
+          );
+        },
+      ),
+      http.post(
+        "/api/datasets/open-media-lab/hierarchy-crawl-fixtures/paths-info/main",
+        () => jsonResponse([]),
+      ),
+    );
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const wrapper = mountViewer();
+    await flushPromises();
+    await flushPromises();
+
+    // Pager should have walked forward and discovered `cursor-page-2`
+    // (and possibly more). Pin that the SPA actually saw the cursor —
+    // otherwise the assertion below is trivially true.
+    expect(
+      treeRequests.some((r) => r.cursor === "cursor-page-2"),
+    ).toBe(true);
+
+    wrapper.vm.fileSearchQuery = "alp";
+    await vi.advanceTimersByTimeAsync(350);
+    await flushPromises();
+    await flushPromises();
+    vi.useRealTimers();
+
+    // Inspect every request issued AFTER the prefix was set: not one
+    // of them should carry the previously-discovered cursor.
+    const filteredRequests = treeRequests.filter(
+      (r) => r.name_prefix === "alp",
+    );
+    expect(filteredRequests.length).toBeGreaterThan(0);
+    for (const req of filteredRequests) {
+      expect(req.cursor).toBeUndefined();
+    }
+    // And after the watcher fires, the visible page indicator goes
+    // back to 1 — direct evidence the discovered-cursors stack was
+    // reset and the SPA did not stay on a stale page index.
+    expect(wrapper.vm.fileListCurrentPage).toBe(1);
+    expect(wrapper.vm.fileListDiscoveredCursors).toEqual([null]);
 
     wrapper.unmount();
   });

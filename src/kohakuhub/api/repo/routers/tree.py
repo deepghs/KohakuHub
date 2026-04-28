@@ -43,11 +43,26 @@ TREE_DIFF_PAGE_SIZE = 1000
 TREE_COMMIT_SCAN_PAGE_SIZE = 100
 PATHS_INFO_MAX_PATHS = 1000
 PATHS_INFO_CONCURRENCY = 16
+NAME_PREFIX_MAX_LENGTH = 256
 
 
 def _normalize_repo_path(path: str) -> str:
     """Normalize a repository-relative path."""
     return path.lstrip("/").rstrip("/")
+
+
+def _normalize_name_prefix(value: str | None) -> str | None:
+    """Normalize the optional same-level name-prefix filter.
+
+    Returns the trimmed prefix, or ``None`` when the caller did not
+    supply one. Empty strings (or whitespace-only) are treated as
+    omitted so the response stays byte-identical to the unfiltered
+    listing — that matters for the HF-compat invariant in §5.1.
+    """
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
 
 
 def _format_last_modified(mtime: float | int | None) -> str | None:
@@ -484,6 +499,7 @@ async def list_repo_tree(
     expand: bool = False,
     limit: int | None = Query(default=None, ge=1),
     cursor: str | None = None,
+    name_prefix: str | None = None,
     fallback: bool = True,
     user: User | None = Depends(get_optional_user),
 ):
@@ -498,7 +514,23 @@ async def list_repo_tree(
 
     lakefs_repo = lakefs_repo_name(repo_type, repo_id)
     clean_path = _normalize_repo_path(path)
-    prefix = f"{clean_path}/" if clean_path else ""
+    base_prefix = f"{clean_path}/" if clean_path else ""
+
+    # Same-level basename-prefix filter pushed straight to LakeFS via its
+    # `prefix` arg; `delimiter='/'` is preserved when not recursive so
+    # directory rows still surface as `common_prefix` entries (see #54).
+    normalized_prefix = _normalize_name_prefix(name_prefix)
+    if normalized_prefix is not None:
+        if "/" in normalized_prefix:
+            return hf_bad_request("name_prefix must not contain '/'")
+        if len(normalized_prefix) > NAME_PREFIX_MAX_LENGTH:
+            return hf_bad_request(
+                f"name_prefix is too long (max {NAME_PREFIX_MAX_LENGTH} chars)"
+            )
+        lakefs_prefix = f"{base_prefix}{normalized_prefix}"
+    else:
+        lakefs_prefix = base_prefix
+
     default_limit = TREE_EXPAND_PAGE_SIZE if expand else TREE_PAGE_SIZE
     page_size = min(limit or default_limit, default_limit)
 
@@ -513,7 +545,7 @@ async def list_repo_tree(
         page = await fetch_lakefs_objects_page(
             lakefs_repo=lakefs_repo,
             revision=resolved_revision,
-            prefix=prefix,
+            prefix=lakefs_prefix,
             recursive=recursive,
             amount=page_size,
             after=cursor,
@@ -528,7 +560,15 @@ async def list_repo_tree(
         return hf_server_error(f"Failed to list objects: {str(error)}")
 
     page_results = page.get("results", [])
-    if clean_path and not page_results:
+    # "Directory exists but the prefix matched nothing" must stay 200 +
+    # empty list — only treat empty results as 404 when the caller did
+    # not narrow with name_prefix and is not paging into a known dir.
+    if (
+        clean_path
+        and not page_results
+        and normalized_prefix is None
+        and not cursor
+    ):
         return hf_entry_not_found(repo_id, clean_path, revision)
 
     file_paths = [

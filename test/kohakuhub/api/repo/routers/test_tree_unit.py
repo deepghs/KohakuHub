@@ -1172,3 +1172,355 @@ async def test_get_paths_info_handles_last_commit_lookup_failures(monkeypatch):
             "securityFileStatus": None,
         }
     ]
+
+
+def test_normalize_name_prefix_treats_blank_as_omitted():
+    # Issue #54 / §5.1: a whitespace-only `name_prefix` must be treated
+    # as omitted so the response is byte-identical to the unfiltered
+    # listing — anything else would silently change the LakeFS prefix
+    # and the downstream cursor stack.
+    assert tree_api._normalize_name_prefix(None) is None
+    assert tree_api._normalize_name_prefix("") is None
+    assert tree_api._normalize_name_prefix("   ") is None
+    assert tree_api._normalize_name_prefix("conf") == "conf"
+    assert tree_api._normalize_name_prefix("  conf  ") == "conf"
+
+
+@pytest.mark.asyncio
+async def test_list_repo_tree_name_prefix_pushes_lakefs_prefix(monkeypatch):
+    request = _request("/api/models/owner/demo/tree/main/docs")
+    repo = SimpleNamespace(full_id="owner/demo", private=False)
+
+    monkeypatch.setattr(tree_api, "get_repository", lambda *args: repo)
+    monkeypatch.setattr(tree_api, "check_repo_read_permission", lambda repo_arg, user: True)
+    monkeypatch.setattr(tree_api, "lakefs_repo_name", lambda repo_type, repo_id: "lake-repo")
+
+    async def _resolve_revision(client, lakefs_repo, revision):
+        return ("resolved-main", "branch")
+
+    monkeypatch.setattr(tree_api, "resolve_revision", _resolve_revision)
+
+    fetch_calls = []
+
+    async def _fetch(**kwargs):
+        fetch_calls.append(kwargs)
+        return {
+            "results": [
+                {
+                    "path_type": "object",
+                    "path": "docs/config.json",
+                    "size_bytes": 7,
+                    "checksum": "sha-config",
+                }
+            ],
+            "pagination": {"has_more": False},
+        }
+
+    monkeypatch.setattr(tree_api, "fetch_lakefs_objects_page", _fetch)
+    monkeypatch.setattr(tree_api, "_build_file_record_map", lambda repository, paths: {})
+    monkeypatch.setattr(tree_api, "should_use_lfs", lambda repository, path, size: False)
+
+    response = await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        path="/docs/",
+        name_prefix="conf",
+        limit=None,
+    )
+
+    assert isinstance(response, JSONResponse)
+    # The LakeFS-side prefix is `<base>/<typed>` — that's the whole
+    # design (see issue #54 §"Approach"). The handler must not leak the
+    # raw `prefix` arg under any other name.
+    assert fetch_calls == [
+        {
+            "lakefs_repo": "lake-repo",
+            "revision": "resolved-main",
+            "prefix": "docs/conf",
+            "recursive": False,
+            "amount": tree_api.TREE_PAGE_SIZE,
+            "after": None,
+        }
+    ]
+    body = _json_body(response)
+    assert [entry["path"] for entry in body] == ["docs/config.json"]
+
+
+@pytest.mark.asyncio
+async def test_list_repo_tree_name_prefix_root_path(monkeypatch):
+    request = _request("/api/models/owner/demo/tree/main")
+    repo = SimpleNamespace(full_id="owner/demo", private=False)
+
+    monkeypatch.setattr(tree_api, "get_repository", lambda *args: repo)
+    monkeypatch.setattr(tree_api, "check_repo_read_permission", lambda repo_arg, user: True)
+    monkeypatch.setattr(tree_api, "lakefs_repo_name", lambda repo_type, repo_id: "lake-repo")
+
+    async def _resolve_revision(client, lakefs_repo, revision):
+        return ("resolved-main", "branch")
+
+    monkeypatch.setattr(tree_api, "resolve_revision", _resolve_revision)
+    fetch_calls = []
+
+    async def _fetch(**kwargs):
+        fetch_calls.append(kwargs)
+        return {"results": [], "pagination": {"has_more": False}}
+
+    monkeypatch.setattr(tree_api, "fetch_lakefs_objects_page", _fetch)
+    monkeypatch.setattr(tree_api, "_build_file_record_map", lambda repository, paths: {})
+
+    # Root path means base_prefix is "" — the LakeFS prefix is then the
+    # raw user-typed prefix, with no leading "/".
+    response = await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        path="",
+        name_prefix="READ",
+        limit=None,
+    )
+    assert isinstance(response, JSONResponse)
+    assert fetch_calls[0]["prefix"] == "READ"
+    # Empty result at root with a prefix is 200 + [], not 404.
+    assert _json_body(response) == []
+
+
+@pytest.mark.asyncio
+async def test_list_repo_tree_name_prefix_validation(monkeypatch):
+    request = _request("/api/models/owner/demo/tree/main")
+    repo = SimpleNamespace(full_id="owner/demo", private=False)
+
+    monkeypatch.setattr(tree_api, "get_repository", lambda *args: repo)
+    monkeypatch.setattr(tree_api, "check_repo_read_permission", lambda repo_arg, user: True)
+    monkeypatch.setattr(tree_api, "lakefs_repo_name", lambda repo_type, repo_id: "lake-repo")
+
+    async def _resolve_revision(client, lakefs_repo, revision):
+        return ("resolved-main", "branch")
+
+    monkeypatch.setattr(tree_api, "resolve_revision", _resolve_revision)
+
+    # If validation passes the prefix gate, the handler will try to
+    # call fetch — wire a sentinel so an unwanted call is loud.
+    async def _explode(**kwargs):
+        raise AssertionError("LakeFS must not be called when validation fails")
+
+    monkeypatch.setattr(tree_api, "fetch_lakefs_objects_page", _explode)
+    monkeypatch.setattr(
+        tree_api,
+        "hf_bad_request",
+        lambda message: {"bad_request": message},
+    )
+
+    # `/` would silently turn the basename filter into a multi-segment
+    # navigation — that's a UX trap, so the wire form must reject it.
+    slash_result = await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        name_prefix="docs/conf",
+        limit=None,
+    )
+    assert slash_result == {"bad_request": "name_prefix must not contain '/'"}
+
+    too_long = "a" * (tree_api.NAME_PREFIX_MAX_LENGTH + 1)
+    long_result = await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        name_prefix=too_long,
+        limit=None,
+    )
+    assert "too long" in long_result["bad_request"]
+
+
+@pytest.mark.asyncio
+async def test_list_repo_tree_blank_name_prefix_is_byte_identical(monkeypatch):
+    """§5.1 invariant — a whitespace-only `name_prefix` must produce the
+    same LakeFS call as omitting the parameter entirely. Without this,
+    HF clients that round-trip the query string (or proxies that
+    normalize empty strings) could accidentally narrow the listing."""
+    request = _request("/api/models/owner/demo/tree/main/docs")
+    repo = SimpleNamespace(full_id="owner/demo", private=False)
+
+    monkeypatch.setattr(tree_api, "get_repository", lambda *args: repo)
+    monkeypatch.setattr(tree_api, "check_repo_read_permission", lambda repo_arg, user: True)
+    monkeypatch.setattr(tree_api, "lakefs_repo_name", lambda repo_type, repo_id: "lake-repo")
+
+    async def _resolve_revision(client, lakefs_repo, revision):
+        return ("resolved-main", "branch")
+
+    monkeypatch.setattr(tree_api, "resolve_revision", _resolve_revision)
+    fetch_calls = []
+
+    async def _fetch(**kwargs):
+        fetch_calls.append(kwargs)
+        return {
+            "results": [
+                {
+                    "path_type": "object",
+                    "path": "docs/intro.md",
+                    "size_bytes": 4,
+                    "checksum": "sha-intro",
+                }
+            ],
+            "pagination": {"has_more": False},
+        }
+
+    monkeypatch.setattr(tree_api, "fetch_lakefs_objects_page", _fetch)
+    monkeypatch.setattr(tree_api, "_build_file_record_map", lambda repository, paths: {})
+    monkeypatch.setattr(tree_api, "should_use_lfs", lambda repository, path, size: False)
+
+    await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        path="/docs",
+        name_prefix="   ",
+        limit=None,
+    )
+    assert fetch_calls[0]["prefix"] == "docs/"
+
+
+@pytest.mark.asyncio
+async def test_list_repo_tree_empty_with_name_prefix_returns_200(monkeypatch):
+    """A valid directory whose name_prefix matched nothing should
+    return 200 + [] (not 404). Without this, a one-character typo in
+    the search box would render the whole UI as "directory not found"
+    even though the directory clearly exists."""
+    request = _request("/api/models/owner/demo/tree/main/docs")
+    repo = SimpleNamespace(full_id="owner/demo", private=False)
+
+    monkeypatch.setattr(tree_api, "get_repository", lambda *args: repo)
+    monkeypatch.setattr(tree_api, "check_repo_read_permission", lambda repo_arg, user: True)
+    monkeypatch.setattr(tree_api, "lakefs_repo_name", lambda repo_type, repo_id: "lake-repo")
+
+    async def _resolve_revision(client, lakefs_repo, revision):
+        return ("resolved-main", "branch")
+
+    monkeypatch.setattr(tree_api, "resolve_revision", _resolve_revision)
+
+    async def _empty_fetch(**kwargs):
+        return {"results": [], "pagination": {"has_more": False}}
+
+    monkeypatch.setattr(tree_api, "fetch_lakefs_objects_page", _empty_fetch)
+    monkeypatch.setattr(tree_api, "_build_file_record_map", lambda repository, paths: {})
+
+    # Sentinel — if the handler took the 404 path, this would clobber
+    # the JSONResponse with our marker dict. It must NOT be called.
+    monkeypatch.setattr(
+        tree_api,
+        "hf_entry_not_found",
+        lambda repo_id, path, revision: {"unexpected_404": True},
+    )
+
+    response = await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        path="/docs",
+        name_prefix="zzz-no-such-thing",
+        limit=None,
+    )
+    assert isinstance(response, JSONResponse)
+    assert _json_body(response) == []
+    assert "link" not in {key.lower() for key in response.headers.keys()}
+
+
+@pytest.mark.asyncio
+async def test_list_repo_tree_empty_path_with_cursor_no_404(monkeypatch):
+    """Paginating into a non-empty directory and landing on an empty
+    final page must not 404 — the original "entry not found" guard
+    only fires on the *first* request to a path that doesn't exist."""
+    request = _request("/api/models/owner/demo/tree/main/docs")
+    repo = SimpleNamespace(full_id="owner/demo", private=False)
+
+    monkeypatch.setattr(tree_api, "get_repository", lambda *args: repo)
+    monkeypatch.setattr(tree_api, "check_repo_read_permission", lambda repo_arg, user: True)
+    monkeypatch.setattr(tree_api, "lakefs_repo_name", lambda repo_type, repo_id: "lake-repo")
+
+    async def _resolve_revision(client, lakefs_repo, revision):
+        return ("resolved-main", "branch")
+
+    monkeypatch.setattr(tree_api, "resolve_revision", _resolve_revision)
+
+    async def _empty_fetch(**kwargs):
+        return {"results": [], "pagination": {"has_more": False}}
+
+    monkeypatch.setattr(tree_api, "fetch_lakefs_objects_page", _empty_fetch)
+    monkeypatch.setattr(tree_api, "_build_file_record_map", lambda repository, paths: {})
+    monkeypatch.setattr(
+        tree_api,
+        "hf_entry_not_found",
+        lambda repo_id, path, revision: {"unexpected_404": True},
+    )
+
+    response = await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        path="/docs",
+        cursor="cursor-from-previous-page",
+        limit=None,
+    )
+    assert isinstance(response, JSONResponse)
+    assert _json_body(response) == []
+
+
+@pytest.mark.asyncio
+async def test_list_repo_tree_link_header_preserves_name_prefix(monkeypatch):
+    """The Link: rel="next" cursor URL must keep `name_prefix` so
+    follow-up pages see the same filter — `_build_public_link` already
+    forwards `request.query_params`, but pin the behavior so a future
+    refactor doesn't accidentally drop it."""
+    request = _request(
+        "/api/models/owner/demo/tree/main/docs",
+        query={"name_prefix": "conf", "recursive": "false"},
+    )
+    repo = SimpleNamespace(full_id="owner/demo", private=False)
+
+    monkeypatch.setattr(tree_api, "get_repository", lambda *args: repo)
+    monkeypatch.setattr(tree_api, "check_repo_read_permission", lambda repo_arg, user: True)
+    monkeypatch.setattr(tree_api, "lakefs_repo_name", lambda repo_type, repo_id: "lake-repo")
+
+    async def _resolve_revision(client, lakefs_repo, revision):
+        return ("resolved-main", "branch")
+
+    monkeypatch.setattr(tree_api, "resolve_revision", _resolve_revision)
+
+    async def _fetch(**kwargs):
+        return {
+            "results": [
+                {
+                    "path_type": "object",
+                    "path": "docs/config.json",
+                    "size_bytes": 12,
+                    "checksum": "sha-config",
+                }
+            ],
+            "pagination": {"has_more": True, "next_offset": "page-2"},
+        }
+
+    monkeypatch.setattr(tree_api, "fetch_lakefs_objects_page", _fetch)
+    monkeypatch.setattr(tree_api, "_build_file_record_map", lambda repository, paths: {})
+    monkeypatch.setattr(tree_api, "should_use_lfs", lambda repository, path, size: False)
+    monkeypatch.setattr(tree_api.cfg.app, "base_url", "https://hub.local")
+
+    response = await tree_api.list_repo_tree.__wrapped__(
+        "model",
+        "owner",
+        "demo",
+        request,
+        path="/docs",
+        name_prefix="conf",
+        limit=None,
+    )
+    link_header = response.headers["link"]
+    assert "name_prefix=conf" in link_header
+    assert "cursor=page-2" in link_header

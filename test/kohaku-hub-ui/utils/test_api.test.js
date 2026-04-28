@@ -639,6 +639,35 @@ describe("frontend API client", () => {
     );
   });
 
+  it("listTreePage forwards the name_prefix filter to the backend", async () => {
+    // Issue #54 — same-level basename filter is pushed straight to the
+    // /tree endpoint as `name_prefix`. The frontend must hand the
+    // verbatim trimmed value through (case-sensitive prefix on the
+    // wire) so LakeFS-side prefix narrowing kicks in.
+    const { apiClient, repoAPI } = await loadModules();
+    const getSpy = vi.spyOn(apiClient, "get").mockResolvedValueOnce({
+      data: [{ path: "docs/config.json" }],
+      headers: {},
+    });
+
+    const page = await repoAPI.listTreePage(
+      "model",
+      "alice",
+      "demo",
+      "main",
+      "/docs",
+      { recursive: false, limit: 50, name_prefix: "conf" },
+    );
+
+    expect(page.entries).toEqual([{ path: "docs/config.json" }]);
+    expect(getSpy).toHaveBeenCalledWith(
+      "/api/models/alice/demo/tree/main/docs",
+      {
+        params: { recursive: false, limit: 50, name_prefix: "conf" },
+      },
+    );
+  });
+
   it("fileExists resolves true on a 2xx HEAD and false on any non-2xx / error", async () => {
     const { apiClient, repoAPI } = await loadModules();
     const headSpy = vi
