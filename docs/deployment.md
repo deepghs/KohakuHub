@@ -53,10 +53,8 @@ See [scripts/README.md](../scripts/README.md#docker-compose-generator) for detai
 After configuration (either option):
 
 ```bash
-npm install --prefix ./src/kohaku-hub-ui
-npm install --prefix ./src/kohaku-hub-admin
-npm run build --prefix ./src/kohaku-hub-ui
-npm run build --prefix ./src/kohaku-hub-admin
+pnpm install
+pnpm run build
 docker-compose up -d --build
 ```
 
@@ -161,7 +159,7 @@ os.environ["HF_ENDPOINT"] = "http://localhost:48888"  # Don't use backend port d
 
 **Frontend Dev Server** (port 5173):
 ```bash
-npm run dev --prefix ./src/kohaku-hub-ui
+pnpm run dev:ui
 # Proxies /api → http://localhost:48888
 ```
 

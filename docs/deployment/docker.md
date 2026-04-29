@@ -59,10 +59,8 @@ cp docker-compose.example.yml docker-compose.yml
 Before starting the services, you need to build the frontend applications:
 
 ```bash
-npm install --prefix src/kohaku-hub-ui
-npm install --prefix src/kohaku-hub-admin
-npm run build --prefix src/kohaku-hub-ui
-npm run build --prefix src/kohaku-hub-admin
+pnpm install
+pnpm run build
 ```
 
 ### 4. Start the Services
