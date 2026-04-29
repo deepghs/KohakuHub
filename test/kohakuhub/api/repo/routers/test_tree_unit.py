@@ -469,6 +469,141 @@ async def test_resolve_last_commits_for_paths_concurrency_capped(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolve_last_commits_for_paths_directory_filter_uses_trailing_slash(
+    monkeypatch,
+):
+    """Directory targets must be passed to LakeFS as a strict-prefix filter
+    (``prefixes=[path + "/"]``). Without the trailing slash, LakeFS would
+    match siblings that share the directory's basename leading edge — e.g.
+    ``prefixes=["docs"]`` would also match ``docs.txt`` or ``docs-old/``.
+    Pin the exact wire shape so this regression cannot creep back in.
+    """
+    seen_calls: list[dict] = []
+
+    class _CapturingClient:
+        async def log_commits(self, **kwargs):
+            seen_calls.append(dict(kwargs))
+            return {
+                "results": [
+                    {
+                        "id": "stub-commit",
+                        "message": "stub",
+                        "creation_date": 0,
+                        "parents": [],
+                    }
+                ],
+                "pagination": {"has_more": False},
+            }
+
+    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: _CapturingClient())
+
+    await tree_api.resolve_last_commits_for_paths(
+        "lake",
+        "main",
+        [
+            {"path": "docs", "type": "directory"},
+            {"path": "nested/sub-tree", "type": "directory"},
+            {"path": "model.bin", "type": "file"},
+        ],
+    )
+
+    by_target: dict[str, dict] = {}
+    for call in seen_calls:
+        if call.get("objects"):
+            by_target[call["objects"][0]] = call
+        else:
+            by_target[call["prefixes"][0]] = call
+
+    # Directory entries are passed with the trailing slash exactly.
+    assert "docs/" in by_target
+    assert by_target["docs/"]["prefixes"] == ["docs/"]
+    assert "objects" not in by_target["docs/"]
+    assert "nested/sub-tree/" in by_target
+    assert by_target["nested/sub-tree/"]["prefixes"] == ["nested/sub-tree/"]
+    # File entries are passed verbatim, NO trailing slash, NO prefix mode.
+    assert "model.bin" in by_target
+    assert by_target["model.bin"]["objects"] == ["model.bin"]
+    assert "prefixes" not in by_target["model.bin"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_last_commits_for_paths_uses_only_first_returned_commit(
+    monkeypatch,
+):
+    """Defensive: even though we ask LakeFS for ``amount=1``, a future server
+    or proxy could return more than one row. The decoder must take results[0]
+    and ignore the rest — taking last() or merging would silently change the
+    visible ``lastCommit`` for the page.
+    """
+
+    class _OverProvisioningClient:
+        async def log_commits(self, **kwargs):
+            return {
+                "results": [
+                    {
+                        "id": "newest",
+                        "message": "newest",
+                        "creation_date": 1700000200,
+                        "parents": ["a"],
+                    },
+                    {
+                        "id": "older",
+                        "message": "older",
+                        "creation_date": 1700000100,
+                        "parents": ["b"],
+                    },
+                ],
+                "pagination": {"has_more": True, "next_offset": "page-2"},
+            }
+
+    monkeypatch.setattr(
+        tree_api, "get_lakefs_rest_client", lambda: _OverProvisioningClient()
+    )
+
+    resolved = await tree_api.resolve_last_commits_for_paths(
+        "lake", "main", [{"path": "weights/model.bin", "type": "file"}]
+    )
+    assert resolved["weights/model.bin"]["id"] == "newest"
+
+
+@pytest.mark.asyncio
+async def test_resolve_last_commits_for_paths_skips_blank_path_entries(monkeypatch):
+    """Targets with empty ``path`` (which can show up as residue from
+    ``_normalize_repo_path('/')``) must be skipped *before* hitting LakeFS,
+    not silently sent through. Sending ``objects=['']`` would 400 on LakeFS.
+    """
+    captured: list[dict] = []
+
+    class _NoBlankClient:
+        async def log_commits(self, **kwargs):
+            captured.append(dict(kwargs))
+            objs = kwargs.get("objects") or []
+            prefs = kwargs.get("prefixes") or []
+            for v in objs + prefs:
+                assert v, "empty path must never reach LakeFS"
+            return {"results": [], "pagination": {"has_more": False}}
+
+    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: _NoBlankClient())
+
+    resolved = await tree_api.resolve_last_commits_for_paths(
+        "lake",
+        "main",
+        [
+            {"path": "", "type": "file"},
+            {"path": "real.txt", "type": "file"},
+            {"path": "", "type": "directory"},
+        ],
+    )
+
+    # Only the real path issued a LakeFS call.
+    assert len(captured) == 1
+    assert captured[0]["objects"] == ["real.txt"]
+    # And the output dict is keyed only on non-empty paths.
+    assert "" not in resolved
+    assert "real.txt" in resolved
+
+
+@pytest.mark.asyncio
 async def test_process_single_path_covers_file_directory_missing_and_errors(monkeypatch):
     class _NotFoundError(Exception):
         pass

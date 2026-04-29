@@ -302,6 +302,57 @@ async def test_log_commits_path_filter_params(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_log_commits_omits_unset_path_filter_params(monkeypatch):
+    """When ``objects`` / ``prefixes`` / ``limit`` / ``first_parent`` are not
+    passed, the wire request must NOT carry any of those keys. LakeFS's
+    handler skips path filtering only when those params are absent — sending
+    e.g. ``objects=[]`` or ``limit=false`` could change behaviour on some
+    server versions.
+    """
+    client = lakefs_rest.LakeFSRestClient("https://lakefs.example.com", "ak", "sk")
+    factory = _AsyncClientFactory(
+        [
+            _response(
+                "GET",
+                "https://lakefs.example.com/api/v1/repositories/repo/refs/main/commits",
+                json_data={"results": []},
+            ),
+        ]
+    )
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+
+    await client.log_commits("repo", "main")
+    params = factory.calls[0][2]["params"]
+    keys = {k for k, _ in params}
+    # No path-filter params, no limit, no first_parent — completely bare
+    # cursor-less log query.
+    assert keys == set(), f"expected no params, got {params!r}"
+
+
+@pytest.mark.asyncio
+async def test_log_commits_first_parent_true(monkeypatch):
+    """The ``first_parent`` parameter must serialise as the literal string
+    ``"true"`` (not Python ``True``); LakeFS's query-param parser only
+    recognises the lowercase string forms.
+    """
+    client = lakefs_rest.LakeFSRestClient("https://lakefs.example.com", "ak", "sk")
+    factory = _AsyncClientFactory(
+        [
+            _response(
+                "GET",
+                "https://lakefs.example.com/api/v1/repositories/repo/refs/main/commits",
+                json_data={"results": []},
+            ),
+        ]
+    )
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+
+    await client.log_commits("repo", "main", first_parent=True)
+    params = factory.calls[0][2]["params"]
+    assert params == [("first_parent", "true")]
+
+
+@pytest.mark.asyncio
 async def test_tag_revert_merge_reset_and_factory_cover_optional_payloads(monkeypatch):
     client = lakefs_rest.LakeFSRestClient("https://lakefs.example.com", "ak", "sk")
     factory = _AsyncClientFactory(
