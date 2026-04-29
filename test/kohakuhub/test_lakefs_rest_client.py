@@ -255,6 +255,41 @@ async def test_log_diff_list_repository_and_branch_methods(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_repositories_and_repository_exists_happy_paths(monkeypatch):
+    """Cover the two LakeFS methods the broader test_log_diff suite skips:
+    ``list_repositories`` (paginated repo enumeration) and the 200-OK branch
+    of ``repository_exists`` (existing repo). These are touched by the pool
+    refactor — every method now goes through ``self._httpx()`` — so the
+    patch line gets hit only when each method is actually exercised.
+    """
+    client = lakefs_rest.LakeFSRestClient("https://lakefs.example.com", "ak", "sk")
+    factory = _AsyncClientFactory(
+        [
+            _response(
+                "GET",
+                "https://lakefs.example.com/api/v1/repositories",
+                json_data={"results": [{"id": "repo-a"}, {"id": "repo-b"}]},
+            ),
+            _response(
+                "GET",
+                "https://lakefs.example.com/api/v1/repositories/repo-a",
+                json_data={"id": "repo-a"},
+            ),
+        ]
+    )
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+
+    # list_repositories — pagination params surface as a dict.
+    listed = await client.list_repositories(amount=50, after="cursor-x")
+    assert listed == {"results": [{"id": "repo-a"}, {"id": "repo-b"}]}
+    assert factory.calls[0][2]["params"] == {"amount": 50, "after": "cursor-x"}
+
+    # repository_exists — 200 path returns True (the 404 path is already
+    # covered in test_log_diff_list_repository_and_branch_methods).
+    assert await client.repository_exists("repo-a") is True
+
+
+@pytest.mark.asyncio
 async def test_log_commits_path_filter_params(monkeypatch):
     """``log_commits`` must serialise ``objects`` / ``prefixes`` as repeated
     query params (LakeFS v0.54.0+ logCommits filter), encode ``limit`` and
@@ -604,6 +639,46 @@ async def test_get_lakefs_rest_client_returns_singleton_across_calls(monkeypatch
     b = lakefs_rest.get_lakefs_rest_client()
     c = lakefs_rest.get_lakefs_rest_client()
     assert a is b is c
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_closes_pooled_client(monkeypatch):
+    """The FastAPI lifespan in ``main.py`` calls
+    ``close_lakefs_rest_client()`` in its ``finally`` clause so the pooled
+    httpx connections are released cleanly on worker shutdown. Drive the
+    lifespan context manager by hand and verify the singleton is None
+    afterwards.
+    """
+    factory = _CountingFactory()
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "endpoint", "https://lakefs")
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "access_key", "ak")
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "secret_key", "sk")
+
+    # Force the singleton into existence so the lifespan finally has
+    # something to clean up.
+    a = lakefs_rest.get_lakefs_rest_client()
+    await a.get_branch("repo", "main")
+    assert lakefs_rest._singleton_client is a
+
+    # Import here to avoid pulling main.py at module-import time (which
+    # would also pull in route registration). Drive the lifespan
+    # context manager directly. ``init_storage`` is mocked because the
+    # lifespan calls it eagerly and it'd otherwise try to talk to S3.
+    import kohakuhub.main as main_mod
+    monkeypatch.setattr(main_mod, "init_storage", lambda: None)
+
+    class _StubApp:
+        # The lifespan only consumes ``app`` as its parameter; nothing
+        # else on the app is touched.
+        ...
+
+    async with main_mod.lifespan(_StubApp()):
+        # Inside the lifespan, the singleton is still alive.
+        assert lakefs_rest._singleton_client is a
+
+    # The finally block must have torn it down.
+    assert lakefs_rest._singleton_client is None
 
 
 @pytest.mark.asyncio
