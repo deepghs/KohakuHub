@@ -39,22 +39,6 @@ class _FakeLakeFSClient:
         return result
 
 
-class _FakeLakeFSRestClient:
-    def __init__(self, *, log_responses=None, diff_responses=None):
-        self.log_responses = list(log_responses or [])
-        self.diff_responses = list(diff_responses or [])
-        self.log_calls = []
-        self.diff_calls = []
-
-    async def log_commits(self, **kwargs):
-        self.log_calls.append(kwargs)
-        return self.log_responses.pop(0)
-
-    async def diff_refs(self, **kwargs):
-        self.diff_calls.append(kwargs)
-        return self.diff_responses.pop(0)
-
-
 class _Expression:
     def __init__(self, label: str):
         self.label = label
@@ -232,7 +216,7 @@ async def test_fetch_page_and_directory_stats_cover_pagination(monkeypatch):
     assert directory_client.list_calls[1]["after"] == "page-2"
 
 
-def test_make_tree_item_and_apply_changed_path_cover_file_directory_and_ancestors(monkeypatch):
+def test_make_tree_item_covers_file_directory_and_lfs_payload(monkeypatch):
     monkeypatch.setattr(tree_api, "should_use_lfs", lambda repository, path, size: False)
 
     file_record = SimpleNamespace(sha256="sha256-lfs", lfs=True)
@@ -285,75 +269,67 @@ def test_make_tree_item_and_apply_changed_path_cover_file_directory_and_ancestor
         "lastCommit": {"id": "commit-2", "title": "Docs refresh"},
     }
 
-    unresolved_files = {"docs/guide.md"}
-    unresolved_directories = {"docs", "weights"}
-    resolved = {}
-    commit_info = {"id": "commit-3", "title": "Update nested paths"}
-
-    tree_api._apply_changed_path(
-        "docs/guide.md",
-        unresolved_files,
-        unresolved_directories,
-        resolved,
-        commit_info,
-    )
-
-    assert unresolved_files == set()
-    assert unresolved_directories == {"weights"}
-    assert resolved == {
-        "docs/guide.md": commit_info,
-        "docs": commit_info,
+@pytest.mark.asyncio
+async def test_resolve_last_commits_for_paths_uses_lakefs_path_filter(monkeypatch):
+    """The new implementation issues one ``log_commits`` call per target with
+    the matching ``objects=`` (file) or ``prefixes=`` (directory) filter,
+    relying on LakeFS's metarange-tree short-circuit instead of walking
+    diffs client-side. Verify the call shape and that the response is
+    decoded into the HF-compatible ``{id, title, date}`` payload.
+    """
+    # Targets are fanned out in parallel via asyncio.gather, so we route the
+    # mocked LakeFS responses by the ``objects``/``prefixes`` kwarg each call
+    # carries — asserting the *set* of calls keeps the test robust to
+    # scheduler order.
+    canned: dict[tuple[str, str], dict] = {
+        ("objects", "weights/model.bin"): {
+            "results": [
+                {
+                    "id": "commit-7",
+                    "message": "Refresh model weights",
+                    "creation_date": 1713657600,
+                    "parents": ["commit-6"],
+                }
+            ],
+            "pagination": {"has_more": False},
+        },
+        ("prefixes", "docs/"): {
+            "results": [
+                {
+                    "id": "commit-5",
+                    "message": "Edit docs",
+                    "creation_date": 1713657500,
+                    "parents": ["commit-4"],
+                }
+            ],
+            "pagination": {"has_more": False},
+        },
+        # Path with no qualifying commit anywhere in history → empty results.
+        ("objects", "ghost.txt"): {
+            "results": [],
+            "pagination": {"has_more": False},
+        },
     }
 
-    direct_directory_targets = {"weights"}
-    tree_api._apply_changed_path(
-        "/",
-        set(),
-        direct_directory_targets,
-        resolved,
-        commit_info,
-    )
-    assert direct_directory_targets == {"weights"}
+    seen_calls: list[dict] = []
 
-    tree_api._apply_changed_path(
-        "weights",
-        set(),
-        direct_directory_targets,
-        resolved,
-        commit_info,
-    )
-    assert direct_directory_targets == set()
-    assert resolved["weights"] == commit_info
+    class _RoutingClient:
+        async def log_commits(self, **kwargs):
+            seen_calls.append(dict(kwargs))
+            objs = kwargs.get("objects")
+            prefs = kwargs.get("prefixes")
+            if objs:
+                key = ("objects", objs[0])
+            elif prefs:
+                key = ("prefixes", prefs[0])
+            else:
+                raise AssertionError(
+                    "resolve_last_commits_for_paths must always pass either "
+                    "objects= or prefixes="
+                )
+            return canned[key]
 
-
-@pytest.mark.asyncio
-async def test_resolve_last_commits_for_paths_covers_diff_pagination_and_root_commit(monkeypatch):
-    rest_client = _FakeLakeFSRestClient(
-        log_responses=[
-            {
-                "results": [
-                    {
-                        "id": "commit-2",
-                        "message": "Refresh tree rows",
-                        "creation_date": 1713657600,
-                        "parents": ["commit-1"],
-                    }
-                ],
-                "pagination": {"has_more": False},
-            }
-        ],
-        diff_responses=[
-            {
-                "results": [{"path": "docs/guide.md"}],
-                "pagination": {"has_more": True, "next_offset": "diff-2"},
-            },
-            {
-                "results": [{"path": "weights/model.bin"}],
-                "pagination": {"has_more": False},
-            },
-        ],
-    )
-    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: rest_client)
+    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: _RoutingClient())
 
     resolved = await tree_api.resolve_last_commits_for_paths(
         "lake",
@@ -361,126 +337,135 @@ async def test_resolve_last_commits_for_paths_covers_diff_pagination_and_root_co
         [
             {"path": "docs", "type": "directory"},
             {"path": "weights/model.bin", "type": "file"},
+            {"path": "ghost.txt", "type": "file"},
         ],
     )
 
-    assert resolved["docs"]["id"] == "commit-2"
-    assert resolved["weights/model.bin"]["title"] == "Refresh tree rows"
-    assert rest_client.log_calls == [
-        {
-            "repository": "lake",
-            "ref": "main",
-            "after": None,
-            "amount": tree_api.TREE_COMMIT_SCAN_PAGE_SIZE,
-        }
-    ]
-    assert rest_client.diff_calls == [
-        {
-            "repository": "lake",
-            "left_ref": "commit-1",
-            "right_ref": "commit-2",
-            "after": None,
-            "amount": tree_api.TREE_DIFF_PAGE_SIZE,
+    # Output map: file/dir resolved to their commits, ghost path → None.
+    assert resolved == {
+        "docs": {
+            "id": "commit-5",
+            "title": "Edit docs",
+            "date": tree_api._format_commit_date(1713657500),
         },
-        {
-            "repository": "lake",
-            "left_ref": "commit-1",
-            "right_ref": "commit-2",
-            "after": "diff-2",
-            "amount": tree_api.TREE_DIFF_PAGE_SIZE,
+        "weights/model.bin": {
+            "id": "commit-7",
+            "title": "Refresh model weights",
+            "date": tree_api._format_commit_date(1713657600),
         },
-    ]
+        "ghost.txt": None,
+    }
 
-    root_client = _FakeLakeFSRestClient(
-        log_responses=[
-            {
+    # Every call asks LakeFS for at most one commit and pins ``limit=true``
+    # so the server stops walking after the first qualifying commit. There
+    # are exactly N calls (one per target), no other primitives used.
+    assert len(seen_calls) == 3
+    for call in seen_calls:
+        assert call["repository"] == "lake"
+        assert call["ref"] == "main"
+        assert call["amount"] == 1
+        assert call["limit"] is True
+        # Every call carries either objects= or prefixes= but not both.
+        has_objects = bool(call.get("objects"))
+        has_prefixes = bool(call.get("prefixes"))
+        assert has_objects ^ has_prefixes, (
+            f"each call must use exactly one of objects/prefixes, got {call!r}"
+        )
+
+    # Targets list shape sanity-checks.
+    assert await tree_api.resolve_last_commits_for_paths("lake", "main", []) == {}
+
+
+@pytest.mark.asyncio
+async def test_resolve_last_commits_for_paths_handles_errors_and_missing_paths(monkeypatch):
+    """Per-target ``log_commits`` failures must not bubble; affected paths
+    just resolve to ``None`` and the rest of the page still surfaces. This
+    matches the previous diff-walk behaviour, which logged-and-continued on
+    LakeFS errors.
+    """
+    failures = {"alpha.txt"}
+
+    class _PartiallyFailingClient:
+        async def log_commits(self, **kwargs):
+            objs = kwargs.get("objects") or []
+            prefs = kwargs.get("prefixes") or []
+            target = objs[0] if objs else prefs[0]
+            if target in failures:
+                raise RuntimeError("simulated LakeFS hiccup")
+            return {
                 "results": [
                     {
-                        "id": "root-commit",
-                        "message": "Initial import",
-                        "creation_date": "2026-04-21T00:00:00.000000Z",
-                        "parents": [],
+                        "id": "commit-99",
+                        "message": "stable commit",
+                        "creation_date": 1713600000,
+                        "parents": ["commit-98"],
                     }
                 ],
                 "pagination": {"has_more": False},
             }
-        ]
-    )
-    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: root_client)
 
-    root_resolved = await tree_api.resolve_last_commits_for_paths(
+    monkeypatch.setattr(
+        tree_api, "get_lakefs_rest_client", lambda: _PartiallyFailingClient()
+    )
+
+    resolved = await tree_api.resolve_last_commits_for_paths(
         "lake",
         "main",
         [
-            {"path": "README.md", "type": "file"},
-            {"path": "docs", "type": "directory"},
+            {"path": "alpha.txt", "type": "file"},  # raises → None
+            {"path": "beta.txt", "type": "file"},   # resolves → commit-99
+            {"path": "", "type": "file"},          # empty path → skipped
         ],
     )
-    assert root_resolved == {
-        "README.md": {
-            "id": "root-commit",
-            "title": "Initial import",
-            "date": "2026-04-21T00:00:00.000000Z",
-        },
-        "docs": {
-            "id": "root-commit",
-            "title": "Initial import",
-            "date": "2026-04-21T00:00:00.000000Z",
-        },
-    }
-    assert await tree_api.resolve_last_commits_for_paths("lake", "main", []) == {}
+    assert resolved["alpha.txt"] is None
+    assert resolved["beta.txt"]["id"] == "commit-99"
+    assert "" not in resolved
 
-    empty_client = _FakeLakeFSRestClient(
-        log_responses=[{"results": [], "pagination": {"has_more": False}}]
-    )
-    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: empty_client)
-    assert await tree_api.resolve_last_commits_for_paths(
-        "lake",
-        "main",
-        [{"path": "missing.txt", "type": "file"}],
-    ) == {}
 
-    paginated_client = _FakeLakeFSRestClient(
-        log_responses=[
-            {
+@pytest.mark.asyncio
+async def test_resolve_last_commits_for_paths_concurrency_capped(monkeypatch):
+    """The fan-out must respect ``LAST_COMMIT_LOOKUP_CONCURRENCY`` so that a
+    50-entry page does not detonate a remote LakeFS connection pool. We
+    assert that no more than the configured cap of in-flight calls happens
+    at once.
+    """
+    in_flight = 0
+    peak = 0
+    lock = asyncio.Lock()
+
+    class _CountingClient:
+        async def log_commits(self, **kwargs):
+            nonlocal in_flight, peak
+            async with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            # Yield to let other tasks accumulate before responding.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            async with lock:
+                in_flight -= 1
+            return {
                 "results": [
                     {
-                        "id": "commit-2",
-                        "message": "Unrelated change",
-                        "creation_date": 1713657600,
-                        "parents": ["commit-1"],
-                    }
-                ],
-                "pagination": {"has_more": True, "next_offset": "page-2"},
-            },
-            {
-                "results": [
-                    {
-                        "id": "root-commit",
-                        "message": "Initial import",
-                        "creation_date": 1713657610,
+                        "id": "c",
+                        "message": "m",
+                        "creation_date": 0,
                         "parents": [],
                     }
                 ],
                 "pagination": {"has_more": False},
-            },
-        ],
-        diff_responses=[
-            {
-                "results": [{"path": "docs/other.md"}],
-                "pagination": {"has_more": False},
             }
-        ],
-    )
-    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: paginated_client)
 
-    paginated_result = await tree_api.resolve_last_commits_for_paths(
-        "lake",
-        "main",
-        [{"path": "README.md", "type": "file"}],
+    monkeypatch.setattr(tree_api, "get_lakefs_rest_client", lambda: _CountingClient())
+
+    targets = [{"path": f"file_{i:03d}.txt", "type": "file"} for i in range(50)]
+    resolved = await tree_api.resolve_last_commits_for_paths("lake", "main", targets)
+
+    assert len(resolved) == 50
+    assert peak <= tree_api.LAST_COMMIT_LOOKUP_CONCURRENCY, (
+        f"peak in-flight {peak} exceeded the configured concurrency cap "
+        f"{tree_api.LAST_COMMIT_LOOKUP_CONCURRENCY}"
     )
-    assert paginated_result["README.md"]["id"] == "root-commit"
-    assert paginated_client.log_calls[1]["after"] == "page-2"
 
 
 @pytest.mark.asyncio

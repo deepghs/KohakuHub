@@ -90,6 +90,44 @@ class FileSeed:
 
 
 @dataclass(frozen=True)
+class DeletedFileSeed:
+    """Mark a path for deletion in a commit.
+
+    Emits a `deletedFile` NDJSON op against the commit endpoint. Used by
+    fixtures that want to exercise repos with churn (add/delete/restore
+    cycles) instead of monotonically-growing histories.
+    """
+
+    path: str
+
+
+@dataclass(frozen=True)
+class DeletedFolderSeed:
+    """Mark a folder (recursive) for deletion in a commit.
+
+    Emits a `deletedFolder` NDJSON op. Path is the folder prefix without
+    a trailing slash; the commit endpoint normalises it. Used to stress
+    repos with prefix-level changes that touch many descendants at once.
+    """
+
+    path: str
+
+
+@dataclass(frozen=True)
+class CopyFileSeed:
+    """Copy a file from one path to another within the repo.
+
+    Emits a `copyFile` NDJSON op with `srcPath` / `srcRevision`. The
+    source path must exist on `srcRevision` (defaulting to `main`) at
+    commit time, otherwise LakeFS rejects the link.
+    """
+
+    dest_path: str
+    src_path: str
+    src_revision: str = "main"
+
+
+@dataclass(frozen=True)
 class RepoSeed:
     actor: str
     repo_type: str
@@ -103,7 +141,9 @@ class RepoSeed:
     download_sessions: int = 0
 
 
-SeedFile = tuple[str, bytes] | FileSeed
+SeedFile = (
+    tuple[str, bytes] | FileSeed | DeletedFileSeed | DeletedFolderSeed | CopyFileSeed
+)
 
 
 @dataclass(frozen=True)
@@ -3448,12 +3488,239 @@ def build_big_indexed_tar_pagination_seeds() -> tuple[RepoSeed, ...]:
     )
 
 
+def build_tree_expand_stress_seeds() -> tuple[RepoSeed, ...]:
+    """Synthetic repo with **highly chaotic** commit history for `/tree?expand=true`.
+
+    The mix is add / modify / delete / restore / folder-delete, deterministic from
+    a hash-based byte stream so the output is byte-identical across runs (no
+    `random` module — see AGENTS §2 "no random seed fixtures").
+
+    Note: `copyFile` is intentionally not exercised here. KohakuHub's current
+    `process_copy_file` re-links the source's internal LakeFS physical address,
+    which LakeFS 1.80 rejects with "address is not signed: link address invalid"
+    for non-LFS sources (verified live). That's a pre-existing backend limitation
+    orthogonal to this fixture's purpose; once the copy path is fixed, copy ops
+    can be added back to this churn loop.
+
+    Path-selection bias: the pool is split into a small "hot" tier (most ops
+    keep hammering the same handful of paths so they get modified, deleted,
+    restored, modified again, ...), a "warm" tier with regular activity, and
+    a "cold" tier of one-shot files. This produces individual paths with
+    ~30–50 lifecycle transitions each — exactly the pattern that the old
+    `resolve_last_commits_for_paths` walker has to chase commit-by-commit.
+
+    Acceptance target: ~40-80 surviving files at HEAD, 150-350 commits,
+    where every surviving path's last-touching commit sits at a different
+    depth and a meaningful subset has been deleted-and-restored multiple
+    times. This is the benchmark fixture for the `resolve_last_commits_for_paths`
+    rewrite (issue #59 Plan E).
+    """
+    pool_size = 80
+    num_commits = 280
+    paths = [f"shard/group_{i // 10:02d}/file_{i:03d}.json" for i in range(pool_size)]
+    folder_prefixes = sorted({p.rsplit("/", 1)[0] for p in paths})  # shard/group_NN
+
+    # Path-selection tiers — biased so a small hot set absorbs the bulk of
+    # the churn. Indices live inside the same single pool so all surviving
+    # files share the same path schema; only the per-tier weight differs.
+    hot_indices = list(range(0, 12))         # 12 paths take ~50% of ops
+    warm_indices = list(range(12, 40))       # 28 paths take ~35%
+    cold_indices = list(range(40, pool_size))  # 40 paths take ~15%
+
+    def churn_digest(scope: str, ordinal: int) -> bytes:
+        """Hash-based deterministic byte source. Slicing it gives op counts,
+        path indices, and op-kind rolls without invoking the `random` module.
+        """
+        return hashlib.sha256(f"{scope}:{ordinal}".encode("utf-8")).digest()
+
+    def pick_index(digest: bytes, byte_offset: int) -> int:
+        """Pick a path index biased toward the hot tier."""
+        tier_roll = digest[byte_offset] / 256.0
+        slot = int.from_bytes(digest[byte_offset + 1 : byte_offset + 5], "big")
+        if tier_roll < 0.50:
+            return hot_indices[slot % len(hot_indices)]
+        if tier_roll < 0.85:
+            return warm_indices[slot % len(warm_indices)]
+        return cold_indices[slot % len(cold_indices)]
+
+    def file_payload(path: str, version: int) -> bytes:
+        digest = hashlib.sha256(f"{path}:{version}".encode("utf-8")).digest()
+        body = {
+            "path": path,
+            "version": version,
+            "fingerprint": digest.hex()[:16],
+            "tags": ["tree-expand-stress", "dev-fixture"],
+        }
+        return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    # Per-path lifecycle state. `alive[path]` holds the current write counter
+    # so each modify gets a fresh sha256; once deleted the path moves to
+    # `deleted` (preserving the highest seen version so restores keep climbing).
+    alive: dict[str, int] = {}
+    deleted: dict[str, int] = {}
+    commits: list[CommitSeed] = []
+
+    # Initial commit: plant README + a starter slice spanning all three tiers,
+    # so the very first churn round has something to modify/delete/copy from.
+    initial_files: list[SeedFile] = [
+        FileSeed(
+            "README.md",
+            (
+                "# tree-expand stress fixture\n\n"
+                "Synthetic dataset planted by `seed_demo_data.py` to acceptance-test\n"
+                "`/tree?expand=true` performance under a chaotic commit history.\n"
+                "\n"
+                "Hot/warm/cold path tiers, biased churn (modify / delete / restore /\n"
+                "copy / folder-delete) — see `build_tree_expand_stress_seeds()`.\n"
+            ).encode("utf-8"),
+        ),
+    ]
+    starter_indices = list(hot_indices[:6]) + list(warm_indices[:6]) + list(cold_indices[:3])
+    for idx in starter_indices:
+        path = paths[idx]
+        initial_files.append(FileSeed(path, file_payload(path, 0)))
+        alive[path] = 0
+    commits.append(
+        CommitSeed(
+            summary="Initial import of tree-expand stress fixture",
+            description="Plant README and a tier-spanning starter slice before the churn loop.",
+            files=tuple(initial_files),
+        )
+    )
+
+    # Churn loop. Heavier per-commit op counts (1-7) drive harder per-path
+    # cycling.  Op-kind probabilities (when the path is alive):
+    #   modify: 0.55, delete: 0.30, folder-delete: 0.05 (rare, capped one
+    #   per commit), default modify: 0.10.
+    # When the picked path is currently deleted → restore-via-write (1.0).
+    # New paths get added when the tier roll picks an index that has never
+    # been touched yet.
+    for ordinal in range(1, num_commits):
+        head = churn_digest("ops", ordinal)
+        ops_count = (head[0] % 7) + 1  # 1..7 ops per commit
+        ops: list[SeedFile] = []
+        # Track which paths/folders we've already touched in this commit so
+        # one round doesn't both modify-and-delete the same file (LakeFS
+        # tolerates it but it muddies the lifecycle bookkeeping).
+        round_paths: set[str] = set()
+        round_folders: set[str] = set()
+        # Folder-delete is a heavy op; cap it to at most one per commit.
+        folder_delete_done = False
+        # Snapshot of `alive` at the start of this commit. Copy ops must use
+        # this set as the source, because srcRevision='main' resolves to the
+        # PRIOR commit — paths added by earlier ops in this same commit are
+        # not yet visible on main and would 404 on the LakeFS link step.
+        alive_at_commit_start = frozenset(alive)
+
+        for op_idx in range(ops_count):
+            picker = churn_digest(f"ops:{ordinal}:pick", op_idx)
+            idx = pick_index(picker, 0)
+            path = paths[idx]
+            if path in round_paths:
+                # Re-pick once with shifted bytes to avoid touching the same
+                # path twice in one commit; if still colliding, just skip.
+                idx = pick_index(picker, 16)
+                path = paths[idx]
+                if path in round_paths:
+                    continue
+            folder = path.rsplit("/", 1)[0]
+            if folder in round_folders:
+                continue
+
+            roll = picker[6] / 256.0
+            copy_roll = picker[7] / 256.0
+
+            if path not in alive and path not in deleted:
+                # Never seen → add.
+                ops.append(FileSeed(path, file_payload(path, 0)))
+                alive[path] = 0
+                round_paths.add(path)
+                continue
+
+            if path in alive:
+                if roll < 0.55:
+                    # Modify in place.
+                    alive[path] += 1
+                    ops.append(FileSeed(path, file_payload(path, alive[path])))
+                    round_paths.add(path)
+                elif roll < 0.85:
+                    # Delete (soft).
+                    deleted[path] = alive[path]
+                    del alive[path]
+                    ops.append(DeletedFileSeed(path))
+                    round_paths.add(path)
+                elif (
+                    roll < 0.90
+                    and not folder_delete_done
+                    and ordinal > 20  # let some history accrue first
+                ):
+                    # Folder-delete: drop one entire group_NN/. Pick the
+                    # folder deterministically from the digest. Only fires
+                    # when at least 3 alive paths live in that folder, so
+                    # the op actually erases something meaningful.
+                    folder_idx = picker[12] % len(folder_prefixes)
+                    folder = folder_prefixes[folder_idx]
+                    affected = [p for p in list(alive.keys()) if p.startswith(folder + "/")]
+                    if len(affected) >= 3:
+                        for p in affected:
+                            deleted[p] = alive[p]
+                            del alive[p]
+                            round_paths.add(p)
+                        round_folders.add(folder)
+                        ops.append(DeletedFolderSeed(folder))
+                        folder_delete_done = True
+                    else:
+                        # Fallback to plain modify if folder is too sparse.
+                        alive[path] += 1
+                        ops.append(FileSeed(path, file_payload(path, alive[path])))
+                        round_paths.add(path)
+                else:
+                    # Default: modify.
+                    alive[path] += 1
+                    ops.append(FileSeed(path, file_payload(path, alive[path])))
+                    round_paths.add(path)
+            else:
+                # Currently deleted → restore with a bumped version.
+                next_version = deleted[path] + 1
+                ops.append(FileSeed(path, file_payload(path, next_version)))
+                del deleted[path]
+                alive[path] = next_version
+                round_paths.add(path)
+
+        if not ops:
+            continue
+        commits.append(
+            CommitSeed(
+                summary=f"Churn round {ordinal:03d}",
+                description=(
+                    f"Deterministic add/modify/delete/restore/copy/folder-delete "
+                    f"round (ordinal={ordinal})."
+                ),
+                files=tuple(ops),
+            )
+        )
+
+    return (
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="dataset",
+            namespace="mai_lin",
+            name="tree-expand-stress-bench",
+            private=False,
+            commits=tuple(commits),
+            download_path="README.md",
+            download_sessions=0,
+        ),
+    )
+
+
 REPO_SEEDS = (
     build_repo_seeds()
     + build_open_media_core_repo_seeds()
     + build_indexed_tar_showcase_repo_seeds()
     + build_open_media_showcase_repo_seeds()
     + build_big_indexed_tar_pagination_seeds()
+    + build_tree_expand_stress_seeds()
 )
 
 LIKES: tuple[tuple[str, str, str, str], ...] = (
@@ -4078,30 +4345,46 @@ async def commit_files(
     repo: RepoSeed,
     commit: CommitSeed,
 ) -> None:
-    materialized_files = [materialize_seed_file(file_entry) for file_entry in commit.files]
-    metadata = []
+    # Split the commit's entries by op kind. Only content-bearing entries
+    # (FileSeed / tuple) need preupload; delete / folder-delete / copy ops
+    # carry no payload.
+    delete_paths: list[str] = []
+    delete_folder_paths: list[str] = []
+    copy_ops: list[CopyFileSeed] = []
+    file_entries: list[FileSeed | tuple[str, bytes]] = []
+    for entry in commit.files:
+        if isinstance(entry, DeletedFileSeed):
+            delete_paths.append(entry.path)
+        elif isinstance(entry, DeletedFolderSeed):
+            delete_folder_paths.append(entry.path)
+        elif isinstance(entry, CopyFileSeed):
+            copy_ops.append(entry)
+        else:
+            file_entries.append(entry)
 
-    for path, content in materialized_files:
-        sha256 = hashlib.sha256(content).hexdigest()
-        metadata.append(
-            {
-                "path": path,
-                "size": len(content),
-                "sha256": sha256,
-            }
+    materialized_files = [materialize_seed_file(entry) for entry in file_entries]
+    metadata = [
+        {
+            "path": path,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        for path, content in materialized_files
+    ]
+
+    preupload_results: dict[str, dict] = {}
+    if metadata:
+        preupload_response = await client.post(
+            f"/api/{repo.repo_type}s/{repo.namespace}/{repo.name}/preupload/main",
+            json={"files": metadata},
         )
-
-    preupload_response = await client.post(
-        f"/api/{repo.repo_type}s/{repo.namespace}/{repo.name}/preupload/main",
-        json={"files": metadata},
-    )
-    await ensure_response(
-        preupload_response,
-        f"preupload {repo.namespace}/{repo.name}",
-    )
-    preupload_results = {
-        item["path"]: item for item in preupload_response.json().get("files", [])
-    }
+        await ensure_response(
+            preupload_response,
+            f"preupload {repo.namespace}/{repo.name}",
+        )
+        preupload_results = {
+            item["path"]: item for item in preupload_response.json().get("files", [])
+        }
 
     ndjson_lines = [
         {
@@ -4141,6 +4424,34 @@ async def commit_files(
                     "path": path,
                     "content": base64.b64encode(content).decode("ascii"),
                     "encoding": "base64",
+                },
+            }
+        )
+
+    for path in delete_paths:
+        ndjson_lines.append(
+            {
+                "key": "deletedFile",
+                "value": {"path": path},
+            }
+        )
+
+    for path in delete_folder_paths:
+        ndjson_lines.append(
+            {
+                "key": "deletedFolder",
+                "value": {"path": path},
+            }
+        )
+
+    for op in copy_ops:
+        ndjson_lines.append(
+            {
+                "key": "copyFile",
+                "value": {
+                    "path": op.dest_path,
+                    "srcPath": op.src_path,
+                    "srcRevision": op.src_revision,
                 },
             }
         )

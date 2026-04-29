@@ -220,7 +220,11 @@ async def test_log_diff_list_repository_and_branch_methods(monkeypatch):
     await client.create_branch("repo", "dev", "main")
     await client.delete_branch("repo", "dev", force=True)
 
-    assert factory.calls[0][2]["params"] == {"after": "cursor-1", "amount": 5}
+    # log_commits emits params as a list-of-tuples so list-valued query
+    # params (objects, prefixes — see ``log_commits`` docstring) can be
+    # serialised as repeats. The ``after``/``amount`` pair still appears in
+    # order at the head of the list.
+    assert factory.calls[0][2]["params"] == [("after", "cursor-1"), ("amount", 5)]
     assert factory.calls[1][2]["params"] == {"after": "cursor-2", "amount": 10}
     assert factory.calls[2][2]["params"] == {
         "amount": 1000,
@@ -234,6 +238,67 @@ async def test_log_diff_list_repository_and_branch_methods(monkeypatch):
     assert factory.calls[9][2]["params"] == {"after": "cursor-4", "amount": 20}
     assert factory.calls[10][2]["json"] == {"name": "dev", "source": "main"}
     assert factory.calls[11][2]["params"] == {"force": True}
+
+
+@pytest.mark.asyncio
+async def test_log_commits_path_filter_params(monkeypatch):
+    """``log_commits`` must serialise ``objects`` / ``prefixes`` as repeated
+    query params (LakeFS v0.54.0+ logCommits filter), encode ``limit`` and
+    ``first_parent`` as ``"true"``/``"false"`` strings, and combine them with
+    ``after`` / ``amount`` in the order they were passed.
+    """
+    client = lakefs_rest.LakeFSRestClient("https://lakefs.example.com", "ak", "sk")
+    factory = _AsyncClientFactory(
+        [
+            _response(
+                "GET",
+                "https://lakefs.example.com/api/v1/repositories/repo/refs/main/commits",
+                json_data={"results": []},
+            ),
+            _response(
+                "GET",
+                "https://lakefs.example.com/api/v1/repositories/repo/refs/main/commits",
+                json_data={"results": []},
+            ),
+        ]
+    )
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+
+    # 1) Single-object filter — the canonical "last commit that touched X"
+    # call shape used by resolve_last_commits_for_paths.
+    await client.log_commits(
+        "repo", "main",
+        objects=["docs/guide.md"],
+        amount=1,
+        limit=True,
+    )
+    assert factory.calls[0][2]["params"] == [
+        ("amount", 1),
+        ("objects", "docs/guide.md"),
+        ("limit", "true"),
+    ]
+
+    # 2) Multi-object + prefix + first_parent — exercises the repeated-param
+    # serialisation that distinguishes our new code from the pre-rewrite
+    # behaviour. ``after`` and ``amount`` retain their leading position when
+    # present.
+    await client.log_commits(
+        "repo", "main",
+        after="cursor-7",
+        amount=50,
+        objects=["a.txt", "b.txt"],
+        prefixes=["docs/", "weights/"],
+        first_parent=False,
+    )
+    assert factory.calls[1][2]["params"] == [
+        ("after", "cursor-7"),
+        ("amount", 50),
+        ("objects", "a.txt"),
+        ("objects", "b.txt"),
+        ("prefixes", "docs/"),
+        ("prefixes", "weights/"),
+        ("first_parent", "false"),
+    ]
 
 
 @pytest.mark.asyncio
