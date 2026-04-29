@@ -10,6 +10,20 @@ import pytest
 import kohakuhub.lakefs_rest_client as lakefs_rest
 
 
+@pytest.fixture(autouse=True)
+def _reset_singleton_between_tests():
+    """Drop the module-level pooled singleton before/after every test.
+
+    Without this, a test that monkey-patches ``cfg.lakefs`` would build a
+    singleton wired to those values; the next test would inherit it even
+    after its own ``monkeypatch.setattr`` reverted the cfg. Resetting both
+    ways keeps each test isolated.
+    """
+    lakefs_rest._singleton_client = None
+    yield
+    lakefs_rest._singleton_client = None
+
+
 def _response(method: str, url: str, *, status: int = 200, json_data=None, text: str | None = None, content: bytes | None = None):
     request = httpx.Request(method, url)
     kwargs = {}
@@ -443,3 +457,177 @@ async def test_tag_revert_merge_reset_and_factory_cover_optional_payloads(monkey
     configured_client = lakefs_rest.get_lakefs_rest_client()
     assert configured_client.endpoint == "https://cfg-lakefs"
     assert configured_client.auth == ("cfg-ak", "cfg-sk")
+
+
+# ---------------------------------------------------------------------------
+# Connection-pool semantics (issue #59 follow-up).
+#
+# These tests pin the invariants the new pooled implementation must hold.
+# Mock-only — the real-backend integration coverage lives next to the
+# tree route tests.
+# ---------------------------------------------------------------------------
+
+
+class _CountingFactory:
+    """Track how many ``httpx.AsyncClient(...)`` constructor calls happen.
+
+    The pooled implementation should construct exactly one underlying
+    httpx client per ``LakeFSRestClient`` instance, regardless of how many
+    requests are issued through it.
+    """
+
+    def __init__(self):
+        self.constructor_calls = 0
+        self.constructor_kwargs: list[dict] = []
+        self.method_calls: list[str] = []
+
+    def __call__(self, *args, **kwargs):
+        self.constructor_calls += 1
+        self.constructor_kwargs.append(dict(kwargs))
+        outer = self
+
+        class _Client:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *args):
+                return False
+
+            async def aclose(self_inner):
+                return None
+
+            async def get(self_inner, url, **kwargs):
+                outer.method_calls.append(f"GET {url}")
+                return _response("GET", url, json_data={})
+
+            async def post(self_inner, url, **kwargs):
+                outer.method_calls.append(f"POST {url}")
+                return _response("POST", url, json_data={})
+
+            async def put(self_inner, url, **kwargs):
+                outer.method_calls.append(f"PUT {url}")
+                return _response("PUT", url, json_data={})
+
+            async def delete(self_inner, url, **kwargs):
+                outer.method_calls.append(f"DELETE {url}")
+                return _response("DELETE", url)
+
+        return _Client()
+
+
+@pytest.mark.asyncio
+async def test_pooled_httpx_client_constructed_once_per_instance(monkeypatch):
+    """One ``LakeFSRestClient`` should yield ONE underlying httpx client,
+    no matter how many requests pass through it. This is the whole point
+    of the pool — without it, every method call would pay a fresh
+    TCP+TLS handshake.
+    """
+    factory = _CountingFactory()
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+
+    client = lakefs_rest.LakeFSRestClient("https://x.example", "ak", "sk")
+    # Five different methods on the same client instance.
+    await client.get_branch("repo", "main")
+    await client.list_branches("repo")
+    await client.log_commits("repo", "main")
+    await client.diff_refs("repo", "left", "right")
+    await client.get_repository("repo")
+
+    assert factory.constructor_calls == 1, (
+        f"expected 1 httpx.AsyncClient constructor call, got "
+        f"{factory.constructor_calls}"
+    )
+    # All five method calls landed on the SAME underlying client.
+    assert len(factory.method_calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_pooled_httpx_client_uses_keepalive_limits(monkeypatch):
+    """The pooled client must be constructed with ``httpx.Limits``
+    matching ``_HTTPX_LIMITS`` (max_connections=64, max_keepalive=32,
+    keepalive_expiry=30s). Drift here defeats the connection pooling.
+    """
+    factory = _CountingFactory()
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+
+    client = lakefs_rest.LakeFSRestClient("https://x.example", "ak", "sk")
+    await client.get_branch("repo", "main")
+
+    assert factory.constructor_calls == 1
+    kw = factory.constructor_kwargs[0]
+    limits = kw["limits"]
+    assert limits is lakefs_rest._HTTPX_LIMITS
+    assert limits.max_connections == 64
+    assert limits.max_keepalive_connections == 32
+    assert limits.keepalive_expiry == 30.0
+    # ``timeout=None`` matches the previous unpooled per-call default —
+    # we don't want to silently introduce a tighter budget at this layer.
+    assert kw["timeout"] is None
+
+
+@pytest.mark.asyncio
+async def test_aclose_drops_pooled_client_and_relazy_init_on_next_use(monkeypatch):
+    """``aclose()`` must close the current pooled client and clear the
+    cache so the next call lazily rebuilds. This is the same lifecycle
+    the FastAPI lifespan hook relies on at shutdown.
+    """
+    factory = _CountingFactory()
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+
+    client = lakefs_rest.LakeFSRestClient("https://x.example", "ak", "sk")
+    await client.get_branch("repo", "main")
+    assert factory.constructor_calls == 1
+    assert client._httpx_client is not None
+
+    await client.aclose()
+    assert client._httpx_client is None
+
+    # aclose must be idempotent — second call is a no-op, not an error.
+    await client.aclose()
+
+    # Next request lazily rebuilds the pooled client.
+    await client.get_branch("repo", "main")
+    assert factory.constructor_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_get_lakefs_rest_client_returns_singleton_across_calls(monkeypatch):
+    """``get_lakefs_rest_client()`` must return the same instance across
+    calls — the whole point is that all FastAPI handlers share one pooled
+    httpx connection bag, not that each handler gets a fresh one.
+    """
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "endpoint", "https://lakefs")
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "access_key", "ak")
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "secret_key", "sk")
+
+    a = lakefs_rest.get_lakefs_rest_client()
+    b = lakefs_rest.get_lakefs_rest_client()
+    c = lakefs_rest.get_lakefs_rest_client()
+    assert a is b is c
+
+
+@pytest.mark.asyncio
+async def test_close_lakefs_rest_client_resets_singleton(monkeypatch):
+    """``close_lakefs_rest_client()`` must close the underlying client and
+    drop the module-level cache so subsequent ``get_lakefs_rest_client()``
+    rebuilds. Idempotent — calling close on an already-closed module is OK.
+    """
+    factory = _CountingFactory()
+    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "endpoint", "https://lakefs")
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "access_key", "ak")
+    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "secret_key", "sk")
+
+    a = lakefs_rest.get_lakefs_rest_client()
+    await a.get_branch("repo", "main")
+    assert lakefs_rest._singleton_client is a
+
+    await lakefs_rest.close_lakefs_rest_client()
+    assert lakefs_rest._singleton_client is None
+
+    # Idempotent.
+    await lakefs_rest.close_lakefs_rest_client()
+
+    b = lakefs_rest.get_lakefs_rest_client()
+    assert b is not a
+    assert lakefs_rest._singleton_client is b

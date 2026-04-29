@@ -67,7 +67,14 @@ async def lifespan(app: FastAPI):
         logger.warning("=" * 80)
 
     init_storage()
-    yield
+    try:
+        yield
+    finally:
+        # Drop the LakeFS REST client's pooled httpx connections so the
+        # worker exits cleanly. Without this the keepalive sockets leak
+        # at shutdown and can hold the process from terminating.
+        from kohakuhub.lakefs_rest_client import close_lakefs_rest_client
+        await close_lakefs_rest_client()
 
 
 app = FastAPI(
