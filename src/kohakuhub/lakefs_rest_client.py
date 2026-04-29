@@ -2,6 +2,14 @@
 
 This module provides a pure async HTTP client for LakeFS API,
 replacing the deprecated lakefs-client library which has threading issues.
+
+Connection pooling: ``LakeFSRestClient`` keeps a single underlying
+``httpx.AsyncClient`` for its lifetime (lazily created on first use,
+disposed via ``aclose()`` / module-level ``close_lakefs_rest_client()``
+/ FastAPI lifespan). This way the per-call TCP+TLS handshake is paid
+once per connection, not per request — important for the path-filtered
+``logCommits`` calls in the file-list ``expand=true`` flow (issue #59),
+which fan out N parallel requests per page.
 """
 
 from typing import Any, Optional
@@ -13,6 +21,17 @@ from kohakuhub.config import cfg
 from kohakuhub.logger import get_logger
 
 logger = get_logger("LAKEFS_REST")
+
+
+# httpx.Limits values picked so a single FastAPI worker can sustain
+# ~16-way concurrent LakeFS calls (see LAST_COMMIT_LOOKUP_CONCURRENCY in
+# tree.py) with headroom for the rest of the request volume. Conservative
+# — bumping them is safe if a deployment fans out heavier.
+_HTTPX_LIMITS = httpx.Limits(
+    max_connections=64,
+    max_keepalive_connections=32,
+    keepalive_expiry=30.0,
+)
 
 
 class StagingLocation(BaseModel):
@@ -62,6 +81,42 @@ class LakeFSRestClient:
         self.endpoint = endpoint.rstrip("/")
         self.base_url = f"{self.endpoint}/api/v1"
         self.auth = (access_key, secret_key)
+        # Lazily-constructed pooled httpx client. We DO NOT build it eagerly
+        # because httpx.AsyncClient binds connections to the calling event
+        # loop on first use; deferring construction lets the same
+        # LakeFSRestClient instance survive pytest fixture re-binds in
+        # tests, where the loop changes between modules.
+        self._httpx_client: httpx.AsyncClient | None = None
+
+    def _httpx(self) -> httpx.AsyncClient:
+        """Return the pooled ``httpx.AsyncClient``, creating it on first call.
+
+        Single client per ``LakeFSRestClient`` instance, configured with
+        keepalive limits so consecutive calls reuse TCP+TLS connections.
+        Auth is still passed per-request for the same reason the un-pooled
+        version did (avoids serialising one client per identity).
+        """
+        if self._httpx_client is None:
+            self._httpx_client = httpx.AsyncClient(
+                limits=_HTTPX_LIMITS,
+                # ``timeout=None`` matches the previous per-call default. Per-
+                # call sites can still override via ``timeout=`` kwarg if
+                # they want a tighter budget.
+                timeout=None,
+            )
+        return self._httpx_client
+
+    async def aclose(self) -> None:
+        """Close the underlying ``httpx.AsyncClient`` and drop the reference.
+
+        Safe to call multiple times. Subsequent calls to any client method
+        will lazily re-create a fresh client (rare, but useful for tests
+        that restart the event loop).
+        """
+        if self._httpx_client is not None:
+            client = self._httpx_client
+            self._httpx_client = None
+            await client.aclose()
 
     def _check_response(self, response: httpx.Response) -> None:
         """Check response status and raise detailed error if not OK.
@@ -117,16 +172,16 @@ class LakeFSRestClient:
         if range_header:
             headers["Range"] = range_header
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                params={"path": path},
-                headers=headers,
-                auth=self.auth,
-                timeout=None,
-            )
-            self._check_response(response)
-            return response.content
+        client = self._httpx()
+        response = await client.get(
+            url,
+            params={"path": path},
+            headers=headers,
+            auth=self.auth,
+            timeout=None,
+        )
+        self._check_response(response)
+        return response.content
 
     async def stat_object(
         self, repository: str, ref: str, path: str, user_metadata: bool = True
@@ -144,15 +199,15 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}/refs/{ref}/objects/stat"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                params={"path": path, "user_metadata": user_metadata},
-                auth=self.auth,
-                timeout=None,
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(
+            url,
+            params={"path": path, "user_metadata": user_metadata},
+            auth=self.auth,
+            timeout=None,
+        )
+        self._check_response(response)
+        return response.json()
 
     async def upload_object(
         self,
@@ -176,17 +231,17 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}/branches/{branch}/objects"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url,
-                params={"path": path, "force": force},
-                content=content,
-                headers={"Content-Type": "application/octet-stream"},
-                auth=self.auth,
-                timeout=None,
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.post(
+            url,
+            params={"path": path, "force": force},
+            content=content,
+            headers={"Content-Type": "application/octet-stream"},
+            auth=self.auth,
+            timeout=None,
+        )
+        self._check_response(response)
+        return response.json()
 
     async def list_repositories(
         self, amount: int = 1000, after: str | None = None
@@ -205,15 +260,15 @@ class LakeFSRestClient:
         if after:
             params["after"] = after
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                params=params,
-                auth=self.auth,
-                timeout=None,
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(
+            url,
+            params=params,
+            auth=self.auth,
+            timeout=None,
+        )
+        self._check_response(response)
+        return response.json()
 
     async def link_physical_address(
         self,
@@ -241,16 +296,16 @@ class LakeFSRestClient:
         else:
             metadata_dict = staging_metadata
 
-        async with httpx.AsyncClient() as client:
-            response = await client.put(
-                url,
-                params={"path": path},
-                json=metadata_dict,
-                auth=self.auth,
-                timeout=None,
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.put(
+            url,
+            params={"path": path},
+            json=metadata_dict,
+            auth=self.auth,
+            timeout=None,
+        )
+        self._check_response(response)
+        return response.json()
 
     async def commit(
         self,
@@ -276,15 +331,15 @@ class LakeFSRestClient:
         if metadata:
             commit_data["metadata"] = metadata
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url,
-                json=commit_data,
-                auth=self.auth,
-                timeout=None,  # No timeout for internal service
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.post(
+            url,
+            json=commit_data,
+            auth=self.auth,
+            timeout=None,  # No timeout for internal service
+        )
+        self._check_response(response)
+        return response.json()
 
     async def get_commit(self, repository: str, commit_id: str) -> dict[str, Any]:
         """Get commit details.
@@ -298,10 +353,10 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}/commits/{commit_id}"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, auth=self.auth, timeout=None)
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(url, auth=self.auth, timeout=None)
+        self._check_response(response)
+        return response.json()
 
     async def log_commits(
         self,
@@ -362,12 +417,12 @@ class LakeFSRestClient:
         if first_parent is not None:
             params.append(("first_parent", "true" if first_parent else "false"))
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url, params=params, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(
+            url, params=params, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+        return response.json()
 
     async def diff_refs(
         self,
@@ -396,12 +451,12 @@ class LakeFSRestClient:
         if amount:
             params["amount"] = amount
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url, params=params, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(
+            url, params=params, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+        return response.json()
 
     async def list_objects(
         self,
@@ -438,12 +493,12 @@ class LakeFSRestClient:
         if delimiter:
             params["delimiter"] = delimiter
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url, params=params, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(
+            url, params=params, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+        return response.json()
 
     async def delete_object(
         self, repository: str, branch: str, path: str, force: bool = False
@@ -458,11 +513,11 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}/branches/{branch}/objects"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.delete(
-                url, params={"path": path, "force": force}, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
+        client = self._httpx()
+        response = await client.delete(
+            url, params={"path": path, "force": force}, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
 
     async def create_repository(
         self, name: str, storage_namespace: str, default_branch: str = "main"
@@ -485,12 +540,12 @@ class LakeFSRestClient:
             "default_branch": default_branch,
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url, json=repo_data, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.post(
+            url, json=repo_data, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+        return response.json()
 
     async def delete_repository(self, repository: str, force: bool = False) -> None:
         """Delete repository.
@@ -501,11 +556,11 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.delete(
-                url, params={"force": force}, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
+        client = self._httpx()
+        response = await client.delete(
+            url, params={"force": force}, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
 
     async def get_repository(self, repository: str) -> dict[str, Any]:
         """Get repository details.
@@ -521,10 +576,10 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, auth=self.auth, timeout=None)
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(url, auth=self.auth, timeout=None)
+        self._check_response(response)
+        return response.json()
 
     async def repository_exists(self, repository: str) -> bool:
         """Check if repository exists.
@@ -537,12 +592,12 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, auth=self.auth, timeout=None)
-            if response.status_code == 404:
-                return False
-            self._check_response(response)
-            return True
+        client = self._httpx()
+        response = await client.get(url, auth=self.auth, timeout=None)
+        if response.status_code == 404:
+            return False
+        self._check_response(response)
+        return True
 
     async def get_branch(self, repository: str, branch: str) -> dict[str, Any]:
         """Get branch details.
@@ -556,10 +611,10 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}/branches/{branch}"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, auth=self.auth, timeout=None)
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(url, auth=self.auth, timeout=None)
+        self._check_response(response)
+        return response.json()
 
     async def list_branches(
         self,
@@ -584,15 +639,15 @@ class LakeFSRestClient:
         if amount:
             params["amount"] = amount
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                params=params,
-                auth=self.auth,
-                timeout=None,
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(
+            url,
+            params=params,
+            auth=self.auth,
+            timeout=None,
+        )
+        self._check_response(response)
+        return response.json()
 
     async def create_branch(self, repository: str, name: str, source: str) -> None:
         """Create branch.
@@ -609,13 +664,13 @@ class LakeFSRestClient:
 
         branch_data = {"name": name, "source": source}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url, json=branch_data, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
-            # LakeFS returns 201 with text/html (plain string ref), not JSON
-            # We don't need to return it since we already know the branch name
+        client = self._httpx()
+        response = await client.post(
+            url, json=branch_data, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+        # LakeFS returns 201 with text/html (plain string ref), not JSON
+        # We don't need to return it since we already know the branch name
 
     async def delete_branch(
         self, repository: str, branch: str, force: bool = False
@@ -629,11 +684,11 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}/branches/{branch}"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.delete(
-                url, params={"force": force}, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
+        client = self._httpx()
+        response = await client.delete(
+            url, params={"force": force}, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
 
     async def create_tag(
         self, repository: str, id: str, ref: str, force: bool = False
@@ -653,12 +708,12 @@ class LakeFSRestClient:
 
         tag_data = {"id": id, "ref": ref, "force": force}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url, json=tag_data, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.post(
+            url, json=tag_data, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+        return response.json()
 
     async def list_tags(
         self,
@@ -683,15 +738,15 @@ class LakeFSRestClient:
         if amount:
             params["amount"] = amount
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                params=params,
-                auth=self.auth,
-                timeout=None,
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.get(
+            url,
+            params=params,
+            auth=self.auth,
+            timeout=None,
+        )
+        self._check_response(response)
+        return response.json()
 
     async def delete_tag(self, repository: str, tag: str, force: bool = False) -> None:
         """Delete tag.
@@ -703,11 +758,11 @@ class LakeFSRestClient:
         """
         url = f"{self.base_url}/repositories/{repository}/tags/{tag}"
 
-        async with httpx.AsyncClient() as client:
-            response = await client.delete(
-                url, params={"force": force}, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
+        client = self._httpx()
+        response = await client.delete(
+            url, params={"force": force}, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
 
     async def revert_branch(
         self,
@@ -749,11 +804,11 @@ class LakeFSRestClient:
                 commit_overrides["metadata"] = metadata
             revert_data["commit_overrides"] = commit_overrides
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url, json=revert_data, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
+        client = self._httpx()
+        response = await client.post(
+            url, json=revert_data, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
 
     async def merge_into_branch(
         self,
@@ -798,12 +853,12 @@ class LakeFSRestClient:
         if strategy:
             merge_data["strategy"] = strategy
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url, json=merge_data, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
-            return response.json()
+        client = self._httpx()
+        response = await client.post(
+            url, json=merge_data, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+        return response.json()
 
     async def hard_reset_branch(
         self,
@@ -834,21 +889,43 @@ class LakeFSRestClient:
             "force": force,
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.put(
-                url, params=params, auth=self.auth, timeout=None
-            )
-            self._check_response(response)
+        client = self._httpx()
+        response = await client.put(
+            url, params=params, auth=self.auth, timeout=None
+        )
+        self._check_response(response)
+
+
+_singleton_client: LakeFSRestClient | None = None
 
 
 def get_lakefs_rest_client() -> LakeFSRestClient:
-    """Get LakeFS REST client instance.
+    """Return the process-wide ``LakeFSRestClient`` singleton.
 
-    Returns:
-        LakeFSRestClient configured from app config
+    A single instance is reused for the lifetime of the process so its
+    pooled ``httpx.AsyncClient`` can keep connections alive across calls.
+    Lazily constructed on first call (and on first call after each
+    ``close_lakefs_rest_client()``).
     """
-    return LakeFSRestClient(
-        endpoint=cfg.lakefs.endpoint,
-        access_key=cfg.lakefs.access_key,
-        secret_key=cfg.lakefs.secret_key,
-    )
+    global _singleton_client
+    if _singleton_client is None:
+        _singleton_client = LakeFSRestClient(
+            endpoint=cfg.lakefs.endpoint,
+            access_key=cfg.lakefs.access_key,
+            secret_key=cfg.lakefs.secret_key,
+        )
+    return _singleton_client
+
+
+async def close_lakefs_rest_client() -> None:
+    """Tear down the singleton client and its pooled httpx connections.
+
+    Wired into FastAPI's lifespan shutdown hook so workers exit cleanly
+    instead of dangling open sockets to LakeFS. Safe to call multiple
+    times — subsequent ``get_lakefs_rest_client()`` calls lazily rebuild.
+    """
+    global _singleton_client
+    if _singleton_client is not None:
+        client = _singleton_client
+        _singleton_client = None
+        await client.aclose()
