@@ -2,6 +2,17 @@
 
 *Last Updated: January 2025*
 
+## Prerequisites
+
+- Docker and Docker Compose
+- LakeFS **v0.54.0 or newer** (released 2021-11-08). The provided
+  `docker-compose.example.yml` pulls `treeverse/lakefs:latest`, which is
+  always compatible. Self-deployments that pin an older LakeFS image must
+  upgrade — the file-list `expand=true` path relies on `logCommits`'s
+  `objects=` / `prefixes=` / `limit=` filters that pre-v0.54 servers
+  silently ignore.
+- Node.js (only for building the frontend bundles)
+
 ## Quick Start
 
 ### 1. Clone Repository

@@ -1,5 +1,17 @@
 # KohakuHub Deployment Architecture
 
+## Component Version Requirements
+
+- **LakeFS ≥ v0.54.0** (released 2021-11-08). The file-list `expand=true`
+  endpoint uses path-filtered `logCommits` queries (`objects=` / `prefixes=`
+  / `limit=` parameters) introduced in that release; pre-v0.54 servers
+  silently ignore those parameters and would return incorrect `lastCommit`
+  metadata. The shipped docker bundle pins `treeverse/lakefs:latest` so the
+  default deployment is always compatible — only manual self-deployments
+  that pin an older LakeFS image need to upgrade.
+- PostgreSQL ≥ 13 or SQLite (latest).
+- MinIO (latest) or any S3-compatible blob store.
+
 ## Setup Instructions
 
 ### First Time Setup

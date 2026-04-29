@@ -8,6 +8,16 @@ icon: i-carbon-cloud-upload
 
 Deploy KohakuHub for production use.
 
+## Component Versions
+
+- **LakeFS ≥ v0.54.0** (released 2021-11-08). The bundled docker compose
+  uses `treeverse/lakefs:latest` and is always compatible. If your
+  production stack pins an older LakeFS image, upgrade before rolling out
+  KohakuHub — the file-list `expand=true` endpoint depends on
+  path-filtered `logCommits` (`objects=` / `prefixes=` / `limit=`)
+  introduced in v0.54.0; pre-v0.54 servers silently drop those
+  parameters and would surface wrong `lastCommit` metadata.
+
 ## SSL & Domain
 
 **nginx config:**
