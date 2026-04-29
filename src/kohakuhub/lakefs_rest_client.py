@@ -309,6 +309,10 @@ class LakeFSRestClient:
         ref: str,
         after: str | None = None,
         amount: int | None = None,
+        objects: list[str] | None = None,
+        prefixes: list[str] | None = None,
+        limit: bool | None = None,
+        first_parent: bool | None = None,
     ) -> dict[str, Any]:
         """List commits (commit log).
 
@@ -317,16 +321,46 @@ class LakeFSRestClient:
             ref: Branch or commit ID
             after: Pagination cursor
             amount: Number of commits to return
+            objects: Restrict the log to commits that touched any of these
+                exact paths. Server-side filter via LakeFS metarange tree —
+                much cheaper than walking diffs client-side. **Requires
+                LakeFS v0.54.0 (2021-11-08) or newer.** Pre-v0.54 servers
+                ignore this parameter and return the unfiltered log; the
+                caller must check the response for the expected commit.
+            prefixes: Same as ``objects`` but the entries are path prefixes;
+                a commit qualifies if it touched any descendant. Same
+                version requirement as ``objects``.
+            limit: When True, cap the result set at ``amount`` and stop the
+                walk early. Useful with ``amount=1`` to ask "the most recent
+                commit that touched X" in a single round-trip. Same version
+                requirement as ``objects``.
+            first_parent: When True, follow only the first parent at merge
+                commits (LakeFS equivalent of ``git log --first-parent``).
+                Available since LakeFS v0.96.0.
 
         Returns:
-            Dict with results (list of Commit) and pagination
+            Dict with results (list of Commit) and pagination.
         """
         url = f"{self.base_url}/repositories/{repository}/refs/{ref}/commits"
-        params = {}
+        params: list[tuple[str, Any]] = []
         if after:
-            params["after"] = after
+            params.append(("after", after))
         if amount:
-            params["amount"] = amount
+            params.append(("amount", amount))
+        # ``objects`` and ``prefixes`` are repeated query params per LakeFS
+        # OpenAPI; use a list-of-tuples so httpx serialises them as repeats
+        # instead of joining with commas.
+        if objects:
+            for obj in objects:
+                params.append(("objects", obj))
+        if prefixes:
+            for prefix in prefixes:
+                params.append(("prefixes", prefix))
+        if limit is not None:
+            # LakeFS expects the literal "true"/"false" strings here.
+            params.append(("limit", "true" if limit else "false"))
+        if first_parent is not None:
+            params.append(("first_parent", "true" if first_parent else "false"))
 
         async with httpx.AsyncClient() as client:
             response = await client.get(
