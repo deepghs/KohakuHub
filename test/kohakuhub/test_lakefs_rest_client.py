@@ -648,24 +648,40 @@ async def test_lifespan_shutdown_closes_pooled_client(monkeypatch):
     httpx connections are released cleanly on worker shutdown. Drive the
     lifespan context manager by hand and verify the singleton is None
     afterwards.
+
+    Test-state plumbing reloads backend modules under
+    ``force_reload=True`` (see ``support/bootstrap.py``); the
+    module-level ``import kohakuhub.lakefs_rest_client as lakefs_rest``
+    at the top of this file therefore freezes a *pre-reload* module
+    reference, while the lifespan's inline ``from
+    kohakuhub.lakefs_rest_client import close_lakefs_rest_client``
+    resolves through ``sys.modules`` and gets the *post-reload* one. We
+    have to look up the live module the same way to actually observe
+    the singleton state the lifespan touches.
     """
+    import sys
+    live_lakefs = sys.modules["kohakuhub.lakefs_rest_client"]
+
     factory = _CountingFactory()
-    monkeypatch.setattr(lakefs_rest.httpx, "AsyncClient", factory)
-    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "endpoint", "https://lakefs")
-    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "access_key", "ak")
-    monkeypatch.setattr(lakefs_rest.cfg.lakefs, "secret_key", "sk")
+    monkeypatch.setattr(live_lakefs.httpx, "AsyncClient", factory)
+    monkeypatch.setattr(live_lakefs.cfg.lakefs, "endpoint", "https://lakefs")
+    monkeypatch.setattr(live_lakefs.cfg.lakefs, "access_key", "ak")
+    monkeypatch.setattr(live_lakefs.cfg.lakefs, "secret_key", "sk")
 
     # Force the singleton into existence so the lifespan finally has
     # something to clean up.
-    a = lakefs_rest.get_lakefs_rest_client()
+    a = live_lakefs.get_lakefs_rest_client()
     await a.get_branch("repo", "main")
-    assert lakefs_rest._singleton_client is a
+    assert live_lakefs._singleton_client is a
 
-    # Import here to avoid pulling main.py at module-import time (which
-    # would also pull in route registration). Drive the lifespan
-    # context manager directly. ``init_storage`` is mocked because the
-    # lifespan calls it eagerly and it'd otherwise try to talk to S3.
-    import kohakuhub.main as main_mod
+    # Drive the lifespan context manager by hand. ``init_storage`` is
+    # mocked because the lifespan calls it eagerly and it'd otherwise
+    # try to talk to S3. Use ``importlib`` so we get whichever
+    # ``kohakuhub.main`` is currently registered in ``sys.modules``
+    # (the test bootstrap may have force-reloaded it; if no test in
+    # the session has imported it yet, this triggers a fresh import).
+    import importlib
+    main_mod = importlib.import_module("kohakuhub.main")
     monkeypatch.setattr(main_mod, "init_storage", lambda: None)
 
     class _StubApp:
@@ -675,10 +691,10 @@ async def test_lifespan_shutdown_closes_pooled_client(monkeypatch):
 
     async with main_mod.lifespan(_StubApp()):
         # Inside the lifespan, the singleton is still alive.
-        assert lakefs_rest._singleton_client is a
+        assert live_lakefs._singleton_client is a
 
     # The finally block must have torn it down.
-    assert lakefs_rest._singleton_client is None
+    assert live_lakefs._singleton_client is None
 
 
 @pytest.mark.asyncio
