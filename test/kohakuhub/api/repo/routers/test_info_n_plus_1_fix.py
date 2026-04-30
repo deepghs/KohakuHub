@@ -19,6 +19,24 @@ The tests in this module verify:
 4. The LakeFS fallback engages when the ``Commit`` rows are deleted, so the
    API contract (``sha`` / ``lastModified`` populated) is preserved for
    git-push / rename / fresh-repo cases.
+5. ``huggingface_hub.HfApi.list_models`` / ``list_datasets`` / ``list_spaces``
+   parse the response cleanly into ``ModelInfo`` / ``DatasetInfo`` /
+   ``SpaceInfo`` with ``sha`` and ``last_modified`` populated — i.e. the
+   wire-level shape stays compatible with the upstream client.
+
+Behavior alignment with huggingface_hub:
+
+- HF's ``list_models`` (and the dataset/space variants) has **no
+  ``revision`` parameter**: ``/api/models?author=...&sort=...&limit=...``.
+  The endpoint is implicitly "default branch only" by HF protocol design.
+  Both the original LakeFS-based code (``get_branch(branch="main")``) and
+  the new SQL aggregate (``WHERE branch == "main"``) honor that.
+- ``last_modified`` is wire-formatted as ``"%Y-%m-%dT%H:%M:%S.%fZ"`` so
+  ``huggingface_hub.utils._datetime.parse_datetime`` round-trips it cleanly.
+- ``/api/users/{name}/repos`` is **NOT** a huggingface_hub API surface (HF
+  uses ``/api/users/{name}/overview``). It's a KohakuHub-only endpoint
+  used by the org/user profile pages, so there's no upstream contract to
+  match — only KohakuHub's own front-end consumers, exercised separately.
 
 Reference: issue #62 (perf umbrella #69).
 """
@@ -369,3 +387,195 @@ async def test_list_models_falls_back_to_lakefs_when_commit_rows_missing(
         f"expected exactly one get_commit fallback for the single missing repo, "
         f"got {counter.get_commit_calls}"
     )
+
+
+# --- huggingface_hub upstream compatibility --------------------------------
+#
+# These tests drive the live test server through ``huggingface_hub.HfApi``,
+# the actual upstream client. They verify that the wire-level response from
+# the SQL-aggregate path (issue #62) parses cleanly into the upstream
+# ``ModelInfo`` / ``DatasetInfo`` / ``SpaceInfo`` dataclasses with ``sha``
+# and ``last_modified`` populated. If we ever break the format string, the
+# field names, or the camelCase/snake_case casing, these tests catch it.
+#
+# We use the live_server_url fixture (HfApi needs a real HTTP server, not
+# an ASGITransport, because it follows redirects, builds Link-paginated
+# iterators, etc.).
+
+
+import asyncio
+from datetime import datetime as _dt
+
+
+async def test_huggingface_hub_list_models_parses_modelinfo_with_sha_and_last_modified(
+    live_server_url, hf_api_token
+):
+    """``huggingface_hub.HfApi.list_models`` against the post-fix backend
+    must yield ``ModelInfo`` objects whose ``sha`` and ``last_modified``
+    are populated — proving the wire-level shape is unchanged from the
+    upstream client's perspective.
+
+    Specifically validates:
+    - ``ModelInfo.sha`` is a non-empty SHA-like string (the LakeFS commit ID)
+    - ``ModelInfo.last_modified`` is a real ``datetime`` (HF runs
+      ``parse_datetime`` on the ``lastModified`` field, which raises on
+      malformed strings)
+    - ``ModelInfo.created_at``, ``downloads``, ``likes``, ``private`` round
+      trip as expected
+    """
+    from huggingface_hub import HfApi, ModelInfo
+
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+
+    models = await asyncio.to_thread(
+        lambda: list(api.list_models(author="owner", limit=10))
+    )
+
+    assert models, "seed plants owner/demo-model — list_models must return it"
+    by_id = {m.id: m for m in models}
+    demo = by_id.get("owner/demo-model")
+    assert demo is not None, f"expected owner/demo-model in {list(by_id)}"
+    assert isinstance(demo, ModelInfo)
+
+    # The two fields the SQL aggregate populates.
+    assert isinstance(demo.sha, str) and len(demo.sha) >= 40, (
+        f"ModelInfo.sha must be a SHA-like string, got {demo.sha!r}"
+    )
+    assert isinstance(demo.last_modified, _dt), (
+        f"ModelInfo.last_modified must be a datetime; got {type(demo.last_modified)}"
+        f" / {demo.last_modified!r}"
+    )
+
+    # Other fields the list payload populates — these have always come from
+    # the DB row, not LakeFS — but it's worth a regression net.
+    assert demo.private is False
+    assert isinstance(demo.created_at, _dt)
+    assert demo.downloads is not None
+    assert demo.likes is not None
+
+
+async def test_huggingface_hub_list_datasets_parses_datasetinfo_with_sha_and_last_modified(
+    live_server_url, hf_api_token
+):
+    """Same compat contract for ``list_datasets`` — exercises the dataset
+    code branch (separate decorator, separate request path).
+
+    Uses owner's token because owner created the seed's
+    ``acme-labs/private-dataset`` (and is the org's admin), so the privacy
+    filter still surfaces it."""
+    from huggingface_hub import HfApi, DatasetInfo
+
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+    datasets = await asyncio.to_thread(
+        lambda: list(api.list_datasets(author="acme-labs", limit=10))
+    )
+    assert datasets, "seed plants acme-labs/private-dataset"
+
+    by_id = {d.id: d for d in datasets}
+    private_ds = by_id.get("acme-labs/private-dataset")
+    assert private_ds is not None
+    assert isinstance(private_ds, DatasetInfo)
+    assert isinstance(private_ds.sha, str) and len(private_ds.sha) >= 40
+    assert isinstance(private_ds.last_modified, _dt)
+    assert private_ds.private is True
+
+
+async def test_huggingface_hub_list_spaces_parses_spaceinfo(
+    live_server_url, hf_api_token
+):
+    """``list_spaces`` parity — even if no space has a populated
+    ``lastModified`` (the seed doesn't always plant a commit), the
+    response must still parse without raising. The contract is ``sha``
+    and ``last_modified`` may be ``None``, never malformed."""
+    from huggingface_hub import HfApi, SpaceInfo
+
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+
+    # Plant a space so we have at least one row to round-trip.
+    await asyncio.to_thread(
+        lambda: api.create_repo(
+            "owner/hf-list-space", repo_type="space", space_sdk="static"
+        )
+    )
+
+    spaces = await asyncio.to_thread(
+        lambda: list(api.list_spaces(author="owner", limit=10))
+    )
+    assert spaces, "the just-created space must show up"
+
+    by_id = {s.id: s for s in spaces}
+    space = by_id.get("owner/hf-list-space")
+    assert space is not None
+    assert isinstance(space, SpaceInfo)
+    # Newly-created space may have no DB Commit yet → fallback to LakeFS,
+    # which returns the initial dangling commit's sha. Either way, sha is
+    # populated; last_modified may be None depending on LakeFS' handling
+    # of the empty-tree initial commit.
+    assert space.sha is None or isinstance(space.sha, str)
+    assert space.last_modified is None or isinstance(space.last_modified, _dt)
+
+
+async def test_huggingface_hub_list_models_supported_sort_modes(
+    live_server_url, hf_api_token
+):
+    """HfApi maps ``sort`` parameter values; some pass through to the
+    server unchanged (``"likes"``, ``"downloads"``), others get translated
+    (``"last_modified"`` → ``"lastModified"``, etc.).
+
+    KohakuHub's list endpoint only accepts ``recent | updated | likes |
+    downloads | trending``. So:
+
+    - ``sort=None`` (default) → no sort param → server defaults to ``recent``
+    - ``sort="downloads"`` → passes through → server accepts ``downloads``
+    - ``sort="likes"`` → passes through → server accepts ``likes``
+
+    The other HF sort modes (``last_modified``, ``trending_score``,
+    ``created_at``) translate to camelCase param values that KohakuHub's
+    endpoint does NOT yet accept — that's a pre-existing alignment gap
+    tracked separately, not introduced by this fix.
+
+    This test pins the **supported** sort modes so the fix can't regress
+    them, and documents the gap inline for future readers."""
+    from huggingface_hub import HfApi
+
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+
+    for sort in (None, "downloads", "likes"):
+        models = await asyncio.to_thread(
+            lambda s=sort: list(api.list_models(author="owner", limit=10, sort=s))
+        )
+        assert any(m.id == "owner/demo-model" for m in models), (
+            f"sort={sort!r}: list_models must surface the seed model; got "
+            f"{[m.id for m in models]}"
+        )
+        # Format compat: every populated last_modified must be a real datetime
+        for m in models:
+            if m.last_modified is not None:
+                assert isinstance(m.last_modified, _dt)
+            if m.sha is not None:
+                assert isinstance(m.sha, str)
+
+
+async def test_huggingface_hub_list_models_does_not_pass_revision_param(
+    live_server_url, hf_api_token
+):
+    """Sanity / regression net: HfApi's ``list_models`` does not have a
+    ``revision`` parameter. If a future huggingface_hub release adds one
+    with new semantics, our code may need to grow a handler. This test
+    pins the assumption that today's HF client never sends ``revision``
+    on the list endpoint, so our "main-only" SQL aggregate is correct.
+    """
+    import inspect
+    from huggingface_hub import HfApi
+
+    sig = inspect.signature(HfApi.list_models)
+    assert "revision" not in sig.parameters, (
+        "huggingface_hub.HfApi.list_models gained a `revision` parameter — "
+        "the SQL aggregate in `_latest_main_commits` filters on `branch == "
+        "'main'` only. If list endpoints now need to honor a revision, "
+        "extend the helper to take a revision arg and update this test."
+    )
+
+    # Same check for the other two list APIs.
+    assert "revision" not in inspect.signature(HfApi.list_datasets).parameters
+    assert "revision" not in inspect.signature(HfApi.list_spaces).parameters
