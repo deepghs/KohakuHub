@@ -251,6 +251,145 @@ export async function verifyAdminToken(token) {
   }
 }
 
+// ===== Credentials (sessions / tokens / SSH keys) =====
+
+/**
+ * List active and expired user sessions across the deployment.
+ * @param {string} token - Admin token
+ * @param {Object} [options]
+ * @param {string} [options.user] - Restrict to a specific username
+ * @param {boolean} [options.activeOnly] - Drop expired sessions
+ * @param {string} [options.createdAfter] - ISO timestamp lower bound
+ * @param {number} [options.limit] - Page size
+ * @param {number} [options.offset] - Page offset
+ * @returns {Promise<Object>} Paginated session list
+ */
+export async function listAdminSessions(
+  token,
+  { user, activeOnly, createdAfter, limit = 100, offset = 0 } = {},
+) {
+  const client = createAdminClient(token);
+  const params = { limit, offset };
+  if (user !== undefined) params.user = user;
+  if (activeOnly !== undefined) params.active_only = activeOnly;
+  if (createdAfter !== undefined) params.created_after = createdAfter;
+  const response = await client.get("/sessions", { params });
+  return response.data;
+}
+
+/**
+ * Revoke a single session by id.
+ * @param {string} token - Admin token
+ * @param {number} sessionId - Session row id
+ * @returns {Promise<Object>} `{ revoked: 1 }`
+ */
+export async function revokeAdminSession(token, sessionId) {
+  const client = createAdminClient(token);
+  const response = await client.delete(`/sessions/${sessionId}`);
+  return response.data;
+}
+
+/**
+ * Bulk revoke sessions by user and/or before-timestamp filter.
+ * At least one of the two must be provided; the backend rejects empty bodies.
+ * @param {string} token - Admin token
+ * @param {Object} body - `{ user?: string, before_ts?: string }`
+ * @returns {Promise<Object>} `{ revoked: N }`
+ */
+export async function revokeAdminSessionsBulk(token, body) {
+  const client = createAdminClient(token);
+  const response = await client.post("/sessions/revoke-bulk", body);
+  return response.data;
+}
+
+/**
+ * List API tokens across the deployment.
+ * @param {string} token - Admin token
+ * @param {Object} [options]
+ * @param {string} [options.user] - Restrict to a specific username
+ * @param {number} [options.unusedForDays] - Only list tokens unused for N+ days (or never used)
+ * @param {number} [options.limit] - Page size
+ * @param {number} [options.offset] - Page offset
+ * @returns {Promise<Object>} Paginated token list
+ */
+export async function listAdminTokens(
+  token,
+  { user, unusedForDays, limit = 100, offset = 0 } = {},
+) {
+  const client = createAdminClient(token);
+  const params = { limit, offset };
+  if (user !== undefined) params.user = user;
+  if (unusedForDays !== undefined) params.unused_for_days = unusedForDays;
+  const response = await client.get("/tokens", { params });
+  return response.data;
+}
+
+/**
+ * Revoke a single API token by id.
+ * @param {string} token - Admin token
+ * @param {number} tokenId - Token row id
+ * @returns {Promise<Object>} `{ revoked: 1 }`
+ */
+export async function revokeAdminToken(token, tokenId) {
+  const client = createAdminClient(token);
+  const response = await client.delete(`/tokens/${tokenId}`);
+  return response.data;
+}
+
+/**
+ * List SSH public keys across the deployment.
+ * @param {string} token - Admin token
+ * @param {Object} [options]
+ * @param {string} [options.user] - Restrict to a specific username
+ * @param {number} [options.unusedForDays] - Only list keys unused for N+ days (or never used)
+ * @param {number} [options.limit] - Page size
+ * @param {number} [options.offset] - Page offset
+ * @returns {Promise<Object>} Paginated SSH key list
+ */
+export async function listAdminSshKeys(
+  token,
+  { user, unusedForDays, limit = 100, offset = 0 } = {},
+) {
+  const client = createAdminClient(token);
+  const params = { limit, offset };
+  if (user !== undefined) params.user = user;
+  if (unusedForDays !== undefined) params.unused_for_days = unusedForDays;
+  const response = await client.get("/ssh-keys", { params });
+  return response.data;
+}
+
+/**
+ * Revoke (delete) a single SSH key by id.
+ * @param {string} token - Admin token
+ * @param {number} keyId - SSH key row id
+ * @returns {Promise<Object>} `{ revoked: 1 }`
+ */
+export async function revokeAdminSshKey(token, keyId) {
+  const client = createAdminClient(token);
+  const response = await client.delete(`/ssh-keys/${keyId}`);
+  return response.data;
+}
+
+// ===== Dependency Health =====
+
+/**
+ * Probe Postgres / MinIO / LakeFS / SMTP and return their status.
+ *
+ * @param {string} token - Admin token
+ * @param {Object} [options]
+ * @param {number} [options.timeoutSeconds] - Per-probe timeout in seconds
+ * @returns {Promise<Object>} Aggregated probe report
+ */
+export async function getDependencyHealth(token, { timeoutSeconds } = {}) {
+  const client = createAdminClient(token);
+  const params = {};
+  if (timeoutSeconds !== undefined && timeoutSeconds !== null) {
+    params.timeout_seconds = timeoutSeconds;
+  }
+  const response = await client.get("/health/dependencies", { params });
+  return response.data;
+}
+
 // ===== Repository Management =====
 
 /**
