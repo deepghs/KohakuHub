@@ -410,6 +410,15 @@ def load_config(path: str = None) -> Config:
         )
     if "KOHAKU_HUB_CACHE_URL" in os.environ:
         cache_env["url"] = os.environ["KOHAKU_HUB_CACHE_URL"]
+        # Implicit-enable: if the operator set a CACHE_URL but did not
+        # set CACHE_ENABLED, treat the URL as opt-in. This matters for
+        # dev environments whose .env.dev predates the cache feature —
+        # they get a fresh KOHAKU_HUB_CACHE_URL line (e.g. via
+        # ``cp .env.dev.example .env.dev``) without remembering to also
+        # set ENABLED. Explicit ``KOHAKU_HUB_CACHE_ENABLED=false`` still
+        # wins over this default.
+        if "KOHAKU_HUB_CACHE_ENABLED" not in os.environ:
+            cache_env["enabled"] = True
     if "KOHAKU_HUB_CACHE_NAMESPACE" in os.environ:
         cache_env["namespace"] = os.environ["KOHAKU_HUB_CACHE_NAMESPACE"]
     if "KOHAKU_HUB_CACHE_DEFAULT_TTL" in os.environ:

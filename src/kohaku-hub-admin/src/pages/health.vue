@@ -45,6 +45,7 @@ const DEPENDENCY_LABEL = {
   postgres: "PostgreSQL",
   minio: "MinIO / S3",
   lakefs: "LakeFS",
+  redis: "Redis",
   smtp: "SMTP",
 };
 

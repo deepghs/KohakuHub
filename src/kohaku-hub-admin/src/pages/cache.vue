@@ -230,10 +230,10 @@ onBeforeUnmount(() => {
       <div class="flex justify-between items-center mb-6 gap-4 flex-wrap">
         <div>
           <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100">
-            L2 Cache (Valkey)
+            L2 Cache (Redis)
           </h1>
           <p class="text-gray-500 dark:text-gray-400 text-sm mt-1">
-            Hit / miss counters, Valkey memory state, and the bootstrap-flush
+            Hit / miss counters, Redis memory state, and the bootstrap-flush
             metadata. The cache is never on the correctness critical path —
             see <code>docs/development/cache.md</code> for the design.
           </p>

@@ -81,6 +81,19 @@ const SAMPLE_PAYLOAD = {
       detail: null,
     },
     {
+      // Backend reports the probe as ``redis`` regardless of which
+      // protocol-compatible server is on the other end (Valkey, KeyDB,
+      // Redis itself); the version field is the only place the actual
+      // implementation is surfaced — see probe_redis in
+      // src/kohakuhub/api/admin/utils/health.py.
+      name: "redis",
+      status: "ok",
+      latency_ms: 4,
+      version: "Valkey 8.0.1",
+      endpoint: "redis://127.0.0.1:6379/0",
+      detail: null,
+    },
+    {
       name: "smtp",
       status: "disabled",
       latency_ms: null,
