@@ -769,6 +769,410 @@ async def test_get_memory_info_returns_valkey_state():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Error / silent-degradation paths (deterministic, mock-driven)
+#
+# Every helper in cache.py wraps Redis calls in ``try/except`` so the API
+# never propagates a cache-layer failure into a 5xx. The integration-style
+# tests above validate the happy paths against a real Valkey; this block
+# uses ``AsyncMock`` to drive each ``except`` branch explicitly so a
+# regression that turns one of them back into an unhandled exception
+# lights up CI.
+# ---------------------------------------------------------------------------
+
+
+from unittest.mock import AsyncMock, MagicMock
+
+
+@pytest.fixture
+def mock_client(monkeypatch):
+    """Replace cache_mod._client with an ``AsyncMock`` configured per test.
+
+    Keeps the rest of the suite (which uses a real Valkey) untouched —
+    this fixture is opt-in.
+    """
+    fake = AsyncMock()
+    monkeypatch.setattr(cache_mod, "_client", fake)
+    return fake
+
+
+async def test_init_cache_swallows_bootstrap_flush_failure(monkeypatch, valkey_url):
+    """If _bootstrap_flush raises, init_cache must log and return — not
+    propagate. The cache layer is allowed to be late, never wrong, never
+    a 500.
+    """
+    await close_cache()
+
+    async def _boom():
+        raise RuntimeError("simulated bootstrap failure")
+
+    monkeypatch.setattr(cache_mod, "_bootstrap_flush", _boom)
+    monkeypatch.setattr(cfg.cache, "url", valkey_url)
+    monkeypatch.setattr(cfg.cache, "enabled", True)
+
+    # Should not raise.
+    await init_cache()
+    # ...and the helper API should still be usable (PING succeeded).
+    assert is_enabled() is True
+
+
+async def test_init_cache_swallows_ping_failure(monkeypatch):
+    """If PING fails, init_cache stays enabled but the client is left
+    in 'will fail every op' state — every helper falls back through its
+    own except branch.
+    """
+    await close_cache()
+
+    monkeypatch.setattr(cfg.cache, "enabled", True)
+    monkeypatch.setattr(cfg.cache, "url", "redis://127.0.0.1:1/0")
+
+    # Should not raise even though the port is closed.
+    await init_cache()
+
+
+async def test_close_cache_swallows_aclose_errors(monkeypatch):
+    """``close_cache`` must be safe to call even if both client.aclose()
+    and pool.aclose() raise — otherwise FastAPI shutdown gets noisy.
+    """
+    raising_client = AsyncMock()
+    raising_client.aclose.side_effect = RuntimeError("client aclose boom")
+    raising_pool = AsyncMock()
+    raising_pool.aclose.side_effect = RuntimeError("pool aclose boom")
+
+    monkeypatch.setattr(cache_mod, "_client", raising_client)
+    monkeypatch.setattr(cache_mod, "_pool", raising_pool)
+
+    # Should not raise.
+    await close_cache()
+    assert cache_mod._client is None
+    assert cache_mod._pool is None
+
+
+async def test_bootstrap_flush_no_op_when_client_is_none(monkeypatch):
+    """When the client isn't initialized at all, _bootstrap_flush must
+    return immediately rather than try to touch a None attribute.
+    """
+    monkeypatch.setattr(cache_mod, "_client", None)
+    await cache_mod._bootstrap_flush()  # should be a no-op, no error
+
+
+async def test_bootstrap_flush_no_run_id_returns_early(mock_client):
+    """A Valkey that doesn't expose ``run_id`` (custom forks, mocks,
+    very old Redis 2.x) must produce a logged warning + return — not
+    a stack trace.
+    """
+    mock_client.info.return_value = {}  # no run_id
+    await cache_mod._bootstrap_flush()
+    mock_client.set.assert_not_called()
+
+
+async def test_bootstrap_flush_handles_non_dict_info(mock_client):
+    """Defensive: if INFO returns a non-dict (broken decoder, custom
+    server), treat it as 'no run_id' rather than crashing.
+    """
+    mock_client.info.return_value = "not-a-dict"
+    await cache_mod._bootstrap_flush()
+    mock_client.set.assert_not_called()
+
+
+async def test_bootstrap_flush_loser_path_marker_then_return(monkeypatch, mock_client):
+    """When another worker holds the bootstrap lock, the loser must wait
+    for the marker to update and return — not run the flush itself.
+    """
+    mock_client.info.return_value = {"run_id": "rid-new"}
+    # Sequence of GET responses for run_id_key:
+    #   1st (entry check): "stale" → triggers flush attempt
+    #   2nd (poll loop): "stale" again → keeps waiting
+    #   3rd (poll loop): "rid-new" → peer finished, return
+    mock_client.get.side_effect = ["stale", "stale", "rid-new"]
+    # NX lock fails → loser path
+    mock_client.set.return_value = False
+
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda *_a, **_kw: real_sleep(0))
+
+    await cache_mod._bootstrap_flush()
+    # Loser path: no scan / no run_id update / lock not deleted by loser.
+    assert mock_client.scan.await_count == 0
+    # The set call recorded was the NX lock attempt; loser never writes
+    # the run_id marker.
+    set_calls = [
+        c
+        for c in mock_client.set.call_args_list
+        if c.kwargs.get("nx") is True
+    ]
+    assert len(set_calls) == 1
+
+
+async def test_bootstrap_flush_loser_path_times_out(monkeypatch, mock_client):
+    """Loser whose peer never finishes within the deadline: log warning
+    + return without flushing. Bounds blocked-startup time.
+    """
+    mock_client.info.return_value = {"run_id": "rid-new"}
+    # GET always returns the stale marker — peer never finishes.
+    mock_client.get.return_value = "stale"
+    mock_client.set.return_value = False  # NX lock contended
+
+    # Compress real time to keep the test fast.
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda *_a, **_kw: real_sleep(0))
+    # Make ``time.monotonic`` jump past the deadline after the first few
+    # ticks. Use a generator that returns a "way past deadline" value
+    # forever after iteration 4 — using ``iter([...])`` would StopIteration
+    # if the helper polls a fifth time.
+    def _ticking():
+        yield 0  # entry: 'now'
+        yield 0  # deadline computation reads it again
+        yield 1  # first while-check
+        while True:
+            yield 99999  # deadline exceeded forever after
+
+    ticks = _ticking()
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+
+    await cache_mod._bootstrap_flush()
+    # Confirm we did not run the flush (no SCAN, no marker write).
+    assert mock_client.scan.await_count == 0
+
+
+async def test_bootstrap_flush_winner_lock_release_swallows_errors(
+    monkeypatch, mock_client
+):
+    """If the winner's ``DELETE lock`` step raises (Valkey hiccup right
+    at the end), the flush still completes successfully — the lock TTL
+    is the safety net.
+    """
+    mock_client.info.return_value = {"run_id": "rid-new"}
+    mock_client.get.return_value = "stale"
+    mock_client.set.return_value = True  # winner gets the NX lock
+    # Make the SCAN-deletion path no-op deterministically.
+    mock_client.scan.return_value = (0, [])
+    mock_client.delete.side_effect = RuntimeError("delete failed")
+
+    # Should not raise.
+    await cache_mod._bootstrap_flush()
+
+
+def test_short_handles_none_and_short_strings():
+    """``_short`` is the run_id formatter used in log lines. Must handle
+    None / empty without raising — log emission is on the failure path."""
+    assert cache_mod._short(None) == "<none>"
+    assert cache_mod._short("") == "<none>"
+    assert cache_mod._short("abc") == "abc"
+    assert cache_mod._short("0123456789012") == "012345678901..."
+
+
+async def test_scan_delete_no_op_when_client_none(monkeypatch):
+    monkeypatch.setattr(cache_mod, "_client", None)
+    assert await cache_mod._scan_delete("anything:*") == 0
+
+
+async def test_cache_set_negative_returns_false_when_disabled(monkeypatch):
+    monkeypatch.setattr(cache_mod, "_client", None)
+    assert (await cache_set_negative("repo:absent")) is False
+
+
+async def test_cache_set_negative_swallows_redis_error(mock_client):
+    mock_client.set.side_effect = RuntimeError("redis went away")
+    reset_metrics()
+    ok = await cache_set_negative("repo:err")
+    assert ok is False
+    metrics = get_metrics_snapshot()
+    assert metrics["errors"].get("repo", 0) >= 1
+
+
+async def test_cache_invalidate_swallows_redis_error(mock_client):
+    mock_client.delete.side_effect = RuntimeError("redis went away")
+    reset_metrics()
+    n = await cache_invalidate("repo:err1", "repo:err2")
+    assert n == 0
+    metrics = get_metrics_snapshot()
+    assert metrics["errors"].get("repo", 0) >= 1
+
+
+async def test_cache_invalidate_prefix_swallows_redis_error(mock_client):
+    mock_client.scan.side_effect = RuntimeError("redis went away")
+    reset_metrics()
+    n = await cache_invalidate_prefix("list:")
+    assert n == 0
+    metrics = get_metrics_snapshot()
+    assert metrics["errors"].get("list", 0) >= 1
+
+
+async def test_cache_set_json_swallows_redis_error(mock_client):
+    mock_client.set.side_effect = RuntimeError("redis went away")
+    reset_metrics()
+    ok = await cache_set_json("repo:fail", {"x": 1})
+    assert ok is False
+
+
+async def test_cache_get_json_swallows_redis_error(mock_client):
+    mock_client.get.side_effect = RuntimeError("redis went away")
+    reset_metrics()
+    hit, value = await cache_get_json("repo:fail")
+    assert hit is False
+    assert value is None
+
+
+async def test_cache_get_json_swallows_decode_error(mock_client):
+    """A non-JSON, non-sentinel value lying in Valkey must be reported
+    as a miss. ``json.loads`` failures are absorbed into ``errors``.
+    """
+    mock_client.get.return_value = "not-json-{["
+    reset_metrics()
+    hit, _ = await cache_get_json("repo:corrupt-cached")
+    assert hit is False
+    metrics = get_metrics_snapshot()
+    assert metrics["errors"].get("repo", 0) >= 1
+
+
+async def test_bump_gen_returns_zero_on_redis_error(mock_client):
+    mock_client.incr.side_effect = RuntimeError("redis went away")
+    assert await bump_gen("repo:gen:99") == 0
+
+
+async def test_read_gen_returns_zero_on_redis_error(mock_client):
+    mock_client.get.side_effect = RuntimeError("redis went away")
+    assert await read_gen("repo:gen:99") == 0
+
+
+async def test_get_memory_info_when_client_none(monkeypatch):
+    monkeypatch.setattr(cache_mod, "_client", None)
+    info = await get_memory_info()
+    assert info["available"] is False
+    assert info["reason"]
+
+
+async def test_get_memory_info_swallows_info_error(mock_client):
+    mock_client.info.side_effect = RuntimeError("INFO failed")
+    info = await get_memory_info()
+    assert info["available"] is False
+    assert "INFO failed" in info["reason"]
+
+
+async def test_get_memory_info_handles_non_dict_response(mock_client):
+    mock_client.info.return_value = "not-a-dict"
+    info = await get_memory_info()
+    assert info["available"] is False
+    assert info["reason"]
+
+
+async def test_get_or_fetch_polls_when_cross_worker_holds_lock(
+    raw_client, cache_setup
+):
+    """Cover the cross-worker polling branch.
+
+    Simulates "another worker is fetching this key" by manually planting
+    the singleflight cross-lock in Valkey before the call. The helper
+    enters the polling loop; once we plant the cache fill from outside,
+    the next poll iteration returns it without re-invoking ``fetch()``.
+    """
+    namespace = cache_setup
+    key = "lakefs:commit:cross-worker-test"
+    cross_lock_key = cache_mod._prefixed(f"sf:lock:{key}")
+    full_value_key = cache_mod._prefixed(key)
+
+    # Plant the cross-worker singleflight lock — NX from the helper will fail.
+    await raw_client.set(cross_lock_key, "1", ex=5)
+
+    fetch_calls = []
+
+    async def fetch():
+        fetch_calls.append(1)
+        return {"v": "should-not-be-called"}
+
+    async def planter():
+        # Give the helper a moment to enter the polling loop, then write
+        # the cache entry as if the "real" worker had finished.
+        await asyncio.sleep(SINGLEFLIGHT_POLL_INTERVAL_FOR_TEST)
+        await raw_client.set(full_value_key, json.dumps({"v": "from-peer"}), ex=60)
+
+    # Run the planter and the helper concurrently. The helper sees the
+    # NX failure, enters polling, picks up the planted value on a
+    # subsequent iteration.
+    helper_task = asyncio.create_task(
+        cache_get_or_fetch(key, fetch, ttl=60)
+    )
+    planter_task = asyncio.create_task(planter())
+
+    value = await asyncio.wait_for(helper_task, timeout=3)
+    await planter_task
+
+    assert value == {"v": "from-peer"}
+    assert fetch_calls == [], "fetch must not run when polling finds the value"
+
+    metrics = get_metrics_snapshot()
+    assert metrics["singleflight_contention"] >= 1
+
+
+# Keep the polling loop interval and test wait constants in sync; the
+# helper uses 0.05s, so we plant after ~70ms to ensure the helper has
+# entered its polling loop at least once.
+SINGLEFLIGHT_POLL_INTERVAL_FOR_TEST = 0.07
+
+
+async def test_get_or_fetch_cross_lock_release_swallows_error(monkeypatch):
+    """When the singleflight cross-lock release ``DELETE`` fails
+    (network blip), the helper still returns the freshly fetched value
+    instead of propagating.
+    """
+    # Use a partially-real client: real for everything except DELETE
+    # of the singleflight lock key.
+    real_client = cache_mod._get_client()
+    if real_client is None:
+        pytest.skip("requires live cache for this scenario")
+
+    original_delete = real_client.delete
+
+    async def _delete_with_failure(*keys):
+        # Fail only when the call targets a sf:lock key — leave normal
+        # invalidations alone so the surrounding test infrastructure
+        # works.
+        if any("sf:lock" in str(k) for k in keys):
+            raise RuntimeError("simulated delete failure on lock release")
+        return await original_delete(*keys)
+
+    monkeypatch.setattr(real_client, "delete", _delete_with_failure)
+
+    async def fetch():
+        return {"v": "ok"}
+
+    # Should not raise even though the cross-lock release will fail.
+    v = await cache_get_or_fetch(
+        "lakefs:commit:lock-release-test", fetch, ttl=60
+    )
+    assert v == {"v": "ok"}
+
+
+async def test_get_or_fetch_cross_lock_release_swallows_error_on_fetch_failure(
+    monkeypatch,
+):
+    """Same as above, but the fetch itself raises — the lock release
+    should still be best-effort and the helper should re-raise the
+    original fetch exception, not the lock-release failure.
+    """
+    real_client = cache_mod._get_client()
+    if real_client is None:
+        pytest.skip("requires live cache for this scenario")
+
+    original_delete = real_client.delete
+
+    async def _delete_with_failure(*keys):
+        if any("sf:lock" in str(k) for k in keys):
+            raise RuntimeError("simulated delete failure on lock release")
+        return await original_delete(*keys)
+
+    monkeypatch.setattr(real_client, "delete", _delete_with_failure)
+
+    async def fetch_boom():
+        raise RuntimeError("source unavailable")
+
+    with pytest.raises(RuntimeError, match="source unavailable"):
+        await cache_get_or_fetch(
+            "lakefs:commit:lock-release-test-2", fetch_boom, ttl=60
+        )
+
+
 def test_mode_b_prefixes_sane_shape():
     """Guard against accidental edits that would cause the bootstrap flush
     to silently miss a namespace.
