@@ -2111,3 +2111,317 @@ async def test_paths_info_404_entry_not_found_propagates_no_cross_source(monkeyp
     assert response.headers["x-error-code"] == "EntryNotFound"
     assert response.headers["X-Source"] == "A"
     assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_cache_points_to_source_no_longer_in_config(monkeypatch):
+    """Cache entry references a source URL that is no longer in the
+    active config (admin removed it). The cache must be invalidated
+    and the chain probed without trying to call into the dropped
+    source."""
+    cached_entry = {
+        "source_url": "https://gone.local",
+        "source_name": "Gone",
+        "source_type": "huggingface",
+        "exists": True,
+    }
+    cache = DummyCache(cached=cached_entry)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    path = "/models/owner/demo/resolve/main/config.json"
+    FakeFallbackClient.queue("https://a.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://a.local", "GET", path, _content_response(200, b"a-payload")
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json"
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Source"] == "A"
+    # Stale (now-orphan) cache entry was invalidated and we never
+    # tried to talk to the removed source.
+    assert len(cache.invalidate_calls) == 1
+    assert all(c[0] != "https://gone.local" for c in FakeFallbackClient.calls)
+
+
+@pytest.mark.asyncio
+async def test_resolve_cached_orphan_with_zero_other_sources_returns_none(monkeypatch):
+    """Pathological: cached source orphaned, and the active sources
+    list is empty (config was wiped). The early `if not sources`
+    short-circuit returns None *before* the cache logic runs, so we
+    never enter the loop."""
+    cached_entry = {
+        "source_url": "https://gone.local",
+        "source_name": "Gone",
+        "source_type": "huggingface",
+        "exists": True,
+    }
+    cache = DummyCache(cached=cached_entry)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [],
+    )
+
+    result = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json"
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_info_cached_orphan_with_only_other_source_invalidates_and_runs_chain(monkeypatch):
+    """info: cached source no longer in config (orphaned). The cache
+    is invalidated; the chain runs against the (single) other source
+    which 404s with RepoNotFound, and the aggregate carries
+    X-Error-Code: RepoNotFound. Specifically drives the
+    ``cache.invalidate(...) + cached_url=None`` orphan path in the
+    helper."""
+    cached_entry = {
+        "source_url": "https://gone.local",
+        "source_name": "Gone",
+        "source_type": "huggingface",
+        "exists": True,
+    }
+    cache = DummyCache(cached=cached_entry)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://only.local", "name": "Only", "source_type": "huggingface"},
+        ],
+    )
+    info_path = "/api/models/owner/demo"
+    FakeFallbackClient.queue(
+        "https://only.local", "GET", info_path,
+        _content_response(404, b"", headers={"x-error-code": "RepoNotFound"}),
+    )
+
+    result = await fallback_ops.try_fallback_info("model", "owner", "demo")
+    assert result is not None
+    assert result.status_code == 404
+    assert result.headers["x-error-code"] == "RepoNotFound"
+    assert len(cache.invalidate_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_get_timeout_after_head_bind_synthesizes_502_no_cross_source(monkeypatch):
+    """HEAD binds source A; GET against A times out before we get a
+    response. Per #75 we are bound — must NOT walk over to source B.
+    The single-attempt aggregate is a 502."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/demo/resolve/main/big.bin"
+    FakeFallbackClient.queue("https://a.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://a.local", "GET", path,
+        httpx.TimeoutException("read timed out"),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "big.bin"
+    )
+    assert response is not None
+    assert response.status_code == 502
+    # No HEAD/GET against B — bound to A on HEAD, stayed bound through
+    # GET timeout.
+    assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_get_generic_exception_after_head_bind_synthesizes_502(monkeypatch):
+    """Same as the timeout case but with a non-timeout transport
+    exception. Both branches must hold the binding rule."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/demo/resolve/main/big.bin"
+    FakeFallbackClient.queue("https://a.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://a.local", "GET", path,
+        RuntimeError("unexpected upstream parser bug"),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "big.bin"
+    )
+    assert response is not None
+    assert response.status_code == 502
+    assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_redirect_with_token_attaches_authorization_on_extra_head(monkeypatch):
+    """When the source has an admin-configured token AND the upstream
+    HEAD returns a 3xx without X-Linked-Size, the extra HEAD that
+    backfills Content-Length must carry the same Bearer token —
+    otherwise the HF resolve-cache origin returns 401 and the
+    follow-up silently fails."""
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {
+                "url": "https://a.local",
+                "name": "A",
+                "source_type": "huggingface",
+                "token": "hf_test_token_xxxx",
+            },
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/cfg.json"
+    # 307 with NO X-Linked-Size triggers the extra-HEAD-for-content-length path.
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            307,
+            b"",
+            headers={
+                "location": "/api/resolve-cache/owner/demo/abc/cfg.json",
+                "content-length": "278",
+                "etag": '"redirect-etag"',
+            },
+            url="https://a.local/models/owner/demo/resolve/main/cfg.json",
+        ),
+    )
+
+    follow_stub = AbsoluteHeadStub()
+    follow_stub.queue(
+        httpx.Response(
+            200,
+            headers={
+                "content-length": "12345",
+                "etag": '"real-etag"',
+            },
+            request=httpx.Request("HEAD", "https://a.local/api/resolve-cache/owner/demo/abc/cfg.json"),
+        )
+    )
+    monkeypatch.setattr(httpx.AsyncClient, "head", follow_stub)
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "cfg.json", method="HEAD",
+    )
+    assert response.status_code == 307
+    # Extra HEAD was made with the token attached.
+    assert len(follow_stub.calls) == 1
+    _url, kwargs = follow_stub.calls[0]
+    headers_used = kwargs.get("headers") or {}
+    assert headers_used.get("Authorization") == "Bearer hf_test_token_xxxx"
+
+
+@pytest.mark.asyncio
+async def test_info_timeout_aggregates_to_502(monkeypatch):
+    """info: timeout at every source → aggregate 502 (no
+    X-Error-Code, hf_hub raises generic HfHubHTTPError). Drives the
+    httpx.TimeoutException branch in try_fallback_info."""
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    info_path = "/api/models/owner/demo"
+    FakeFallbackClient.queue(
+        "https://a.local", "GET", info_path,
+        httpx.TimeoutException("a timed out"),
+    )
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", info_path,
+        httpx.TimeoutException("b timed out"),
+    )
+
+    result = await fallback_ops.try_fallback_info("model", "owner", "demo")
+    assert result is not None
+    assert result.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_info_404_entry_not_found_propagates_through_bind_and_propagate(monkeypatch):
+    """Info responding with EntryNotFound is unusual (info is a
+    repo-level endpoint) but the classifier still routes through
+    BIND_AND_PROPAGATE. Forward upstream verbatim instead of trying
+    the next source — keeps the contract uniform across ops."""
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    info_path = "/api/models/owner/demo"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "GET",
+        info_path,
+        _content_response(
+            404,
+            b"",
+            headers={"x-error-code": "EntryNotFound"},
+        ),
+    )
+
+    result = await fallback_ops.try_fallback_info("model", "owner", "demo")
+    assert hasattr(result, "status_code") and result.status_code == 404
+    assert result.headers["x-error-code"] == "EntryNotFound"
+    assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tree_timeout_aggregates_to_502(monkeypatch):
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    tree_path = "/api/models/owner/demo/tree/main/"
+    FakeFallbackClient.queue(
+        "https://a.local", "GET", tree_path,
+        httpx.TimeoutException("a tree timeout"),
+    )
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", tree_path,
+        httpx.TimeoutException("b tree timeout"),
+    )
+
+    result = await fallback_ops.try_fallback_tree(
+        "model", "owner", "demo", "main"
+    )
+    assert result is not None
+    assert result.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_paths_info_timeout_aggregates_to_502(monkeypatch):
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    pi_path = "/api/models/owner/demo/paths-info/main"
+    FakeFallbackClient.queue(
+        "https://a.local", "POST", pi_path,
+        httpx.TimeoutException("a paths-info timeout"),
+    )
+    FakeFallbackClient.queue(
+        "https://b.local", "POST", pi_path,
+        httpx.TimeoutException("b paths-info timeout"),
+    )
+
+    result = await fallback_ops.try_fallback_paths_info(
+        "model", "owner", "demo", "main", ["foo.bin"]
+    )
+    assert result is not None
+    assert result.status_code == 502

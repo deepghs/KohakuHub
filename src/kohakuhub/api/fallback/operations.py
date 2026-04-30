@@ -124,10 +124,18 @@ async def _run_cached_then_chain(
         if result is not None:
             return result
 
-    if not attempts:
-        # Defensive: caller had at least one source but every one was
-        # the cached-and-now-removed entry. (`if not sources` in the
-        # caller already handles the literal zero-source case.)
+    if not attempts:  # pragma: no cover
+        # Defensive: practically unreachable. Every attempt_fn call
+        # appends to ``attempts`` on TRY_NEXT_SOURCE, and the only
+        # way to skip every source in the loop is for ``cached_url``
+        # to equal every source.url — which can only happen when the
+        # cached source was already tried in the cached pass and that
+        # call also appended. Caller-side ``if not sources: return
+        # None`` covers the literal zero-source case. Kept as belt-
+        # and-braces against future refactors that move the order of
+        # the cache check vs. the attempt-append; cheaper than a bug
+        # that aggregates an empty list and produces a misleading
+        # 502.
         return None
     logger.debug(
         f"Fallback MISS: aggregating {len(attempts)} source failure(s) "
