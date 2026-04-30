@@ -79,6 +79,37 @@ class FallbackConfig(BaseModel):
     sources: list[dict] = []
 
 
+class CacheConfig(BaseModel):
+    """L2 cache (Valkey/Redis) configuration.
+
+    Pure cache, no business state. When ``enabled`` is False the cache layer
+    silently degrades and every call falls back to its source. See
+    ``docs/development/cache.md`` for the full design.
+    """
+
+    # Disabled by default so existing deployments don't acquire a hard
+    # dependency on Valkey unintentionally. Local-dev .env.dev.example flips
+    # this to True so contributors surface cache bugs early.
+    enabled: bool = False
+    url: str = "redis://localhost:6379/0"
+    # Namespace prefix isolates cache keys when multiple deployments share a
+    # single Valkey instance (rare in production, common in CI runners that
+    # reuse a managed Redis between jobs).
+    namespace: str = "kh"
+    # Default TTL applied by ``cache_set_json`` when callers don't pass one.
+    default_ttl_seconds: int = 300
+    # ±jitter fraction applied to every TTL inside the helper. Set to 0 to
+    # disable jitter (only useful for deterministic tests).
+    jitter_fraction: float = 0.15
+    # Connection pool size; tuned for ~4 uvicorn workers each running a
+    # handful of concurrent requests. Bump if a deployment scales beyond.
+    max_connections: int = 50
+    # Socket timeouts. Cache must never become a latency cliff — short
+    # timeouts so a flaky Valkey degrades to "cache miss" within ms, not s.
+    socket_timeout_seconds: float = 0.5
+    socket_connect_timeout_seconds: float = 0.5
+
+
 class AppConfig(BaseModel):
     base_url: str = "http://localhost:48888"
     # Allows local dev to expose frontend-facing URLs while backend self-calls stay direct.
@@ -171,6 +202,7 @@ class Config(BaseModel):
     admin: AdminConfig = AdminConfig()
     quota: QuotaConfig = QuotaConfig()
     fallback: FallbackConfig = FallbackConfig()
+    cache: CacheConfig = CacheConfig()
     app: AppConfig
 
     def validate_production_safety(self) -> list[str]:
@@ -370,6 +402,39 @@ def load_config(path: str = None) -> Config:
     if quota_env:
         config_from_env["quota"] = quota_env
 
+    # Cache (L2 / Valkey)
+    cache_env = {}
+    if "KOHAKU_HUB_CACHE_ENABLED" in os.environ:
+        cache_env["enabled"] = (
+            os.environ["KOHAKU_HUB_CACHE_ENABLED"].lower() == "true"
+        )
+    if "KOHAKU_HUB_CACHE_URL" in os.environ:
+        cache_env["url"] = os.environ["KOHAKU_HUB_CACHE_URL"]
+    if "KOHAKU_HUB_CACHE_NAMESPACE" in os.environ:
+        cache_env["namespace"] = os.environ["KOHAKU_HUB_CACHE_NAMESPACE"]
+    if "KOHAKU_HUB_CACHE_DEFAULT_TTL" in os.environ:
+        cache_env["default_ttl_seconds"] = int(
+            os.environ["KOHAKU_HUB_CACHE_DEFAULT_TTL"]
+        )
+    if "KOHAKU_HUB_CACHE_JITTER_FRACTION" in os.environ:
+        cache_env["jitter_fraction"] = float(
+            os.environ["KOHAKU_HUB_CACHE_JITTER_FRACTION"]
+        )
+    if "KOHAKU_HUB_CACHE_MAX_CONNECTIONS" in os.environ:
+        cache_env["max_connections"] = int(
+            os.environ["KOHAKU_HUB_CACHE_MAX_CONNECTIONS"]
+        )
+    if "KOHAKU_HUB_CACHE_SOCKET_TIMEOUT" in os.environ:
+        cache_env["socket_timeout_seconds"] = float(
+            os.environ["KOHAKU_HUB_CACHE_SOCKET_TIMEOUT"]
+        )
+    if "KOHAKU_HUB_CACHE_SOCKET_CONNECT_TIMEOUT" in os.environ:
+        cache_env["socket_connect_timeout_seconds"] = float(
+            os.environ["KOHAKU_HUB_CACHE_SOCKET_CONNECT_TIMEOUT"]
+        )
+    if cache_env:
+        config_from_env["cache"] = cache_env
+
     # Fallback
     fallback_env = {}
     if "KOHAKU_HUB_FALLBACK_ENABLED" in os.environ:
@@ -457,6 +522,7 @@ def load_config(path: str = None) -> Config:
     admin_config = AdminConfig(**merged_config.get("admin", {}))
     quota_config = QuotaConfig(**merged_config.get("quota", {}))
     fallback_config = FallbackConfig(**merged_config.get("fallback", {}))
+    cache_config = CacheConfig(**merged_config.get("cache", {}))
     app_config = AppConfig(**merged_config.get("app", {}))
 
     return Config(
@@ -467,6 +533,7 @@ def load_config(path: str = None) -> Config:
         admin=admin_config,
         quota=quota_config,
         fallback=fallback_config,
+        cache=cache_config,
         app=app_config,
     )
 

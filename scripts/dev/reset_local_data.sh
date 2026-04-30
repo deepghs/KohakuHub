@@ -66,3 +66,12 @@ source "${LAKEFS_CREDENTIALS_FILE}"
 set +a
 
 "${PYTHON_BIN}" "${ROOT_DIR}/scripts/dev/reset_local_data_direct.py"
+
+# Wipe the L2 cache after the reset. The cache references repos / commits
+# that no longer exist; leaving stale Mode-A entries (commit_id-keyed) in
+# place is correctness-safe but wastes memory. FLUSHALL is targeted at the
+# dev container only, never at production.
+if docker ps --format '{{.Names}}' | grep -Fxq "kohakuhub-dev-valkey"; then
+  docker exec kohakuhub-dev-valkey valkey-cli FLUSHALL >/dev/null 2>&1 || true
+  echo "Flushed kohakuhub-dev-valkey contents"
+fi
