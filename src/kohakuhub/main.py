@@ -67,6 +67,14 @@ async def lifespan(app: FastAPI):
         logger.warning("=" * 80)
 
     init_storage()
+
+    # Initialize L2 cache (Valkey) — silent if disabled or unreachable.
+    # Runs the boot-time flush coordinator so Mode-B namespaces are wiped
+    # whenever Valkey's run_id has changed since the last seen value
+    # (i.e., Valkey was restarted, even if the API was not).
+    from kohakuhub.cache import init_cache, close_cache as _close_cache
+    await init_cache()
+
     try:
         yield
     finally:
@@ -75,6 +83,7 @@ async def lifespan(app: FastAPI):
         # at shutdown and can hold the process from terminating.
         from kohakuhub.lakefs_rest_client import close_lakefs_rest_client
         await close_lakefs_rest_client()
+        await _close_cache()
 
 
 app = FastAPI(

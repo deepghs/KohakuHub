@@ -874,6 +874,42 @@ export async function squashRepositoryAdmin(token, repoType, namespace, name) {
   return response.data;
 }
 
+// ===== L2 Cache Monitoring =====
+
+/**
+ * Fetch the L2 (Valkey) cache snapshot: per-namespace hit/miss/error
+ * counters, Valkey memory usage + eviction count, and the bootstrap-flush
+ * metadata (last seen run_id and timestamp).
+ *
+ * Backed by GET /admin/api/cache/stats. The endpoint is cheap (~one
+ * INFO memory call) and safe to poll on a refresh interval.
+ *
+ * @param {string} token - Admin token
+ * @returns {Promise<Object>} { metrics: {...}, memory: {...} }
+ */
+export async function getCacheStats(token) {
+  const client = createAdminClient(token);
+  const response = await client.get("/cache/stats");
+  return response.data;
+}
+
+/**
+ * Zero out the in-process cache metric counters without touching cache
+ * contents. Useful when measuring the effect of a config change without
+ * a full process restart.
+ *
+ * Returns 409 if the cache is not enabled / not initialized; the caller
+ * should surface that as a friendly message.
+ *
+ * @param {string} token - Admin token
+ * @returns {Promise<Object>} { reset: true }
+ */
+export async function resetCacheMetrics(token) {
+  const client = createAdminClient(token);
+  const response = await client.post("/cache/metrics/reset");
+  return response.data;
+}
+
 // ===== S3 Storage Management =====
 
 /**

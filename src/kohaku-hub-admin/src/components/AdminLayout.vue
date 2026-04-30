@@ -48,6 +48,11 @@ const menuItems = [
     icon: "i-carbon-activity",
   },
   {
+    path: "/cache",
+    label: "Cache",
+    icon: "i-carbon-data-vis-1",
+  },
+  {
     path: "/credentials",
     label: "Credentials",
     icon: "i-carbon-password",
