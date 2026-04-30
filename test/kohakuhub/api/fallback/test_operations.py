@@ -43,12 +43,20 @@ class DummyCache:
     def __init__(self, cached: dict | None = None):
         self.cached = cached
         self.set_calls: list[tuple[tuple, dict]] = []
+        self.invalidate_calls: list[tuple] = []
 
     def get(self, *args):
         return self.cached
 
     def set(self, *args, **kwargs):
         self.set_calls.append((args, kwargs))
+
+    def invalidate(self, *args):
+        # Cache-authoritative semantics (#75): a stale-cache hit
+        # invalidates the entry before falling through to the full
+        # chain. Tests that simulate stale-cache need this hook.
+        self.invalidate_calls.append(args)
+        self.cached = None
 
 
 class FakeFallbackClient:
@@ -192,22 +200,29 @@ async def test_try_fallback_resolve_prefers_cached_source_for_head_requests(monk
 
 
 @pytest.mark.asyncio
-async def test_try_fallback_resolve_proxies_get_content_and_continues_after_get_failure(monkeypatch):
+async def test_try_fallback_resolve_proxies_get_content_with_compression_strip(monkeypatch):
+    """Single-source happy path: HEAD-200 + GET-200 returns content with
+    Content-Encoding/Length/Transfer-Encoding stripped (httpx already
+    decoded the body).
+
+    This was previously bundled with a "continues after GET failure"
+    assertion that documented the cross-source mixing bug; #75 fixes
+    that bug, and the new behavior is covered by
+    ``test_try_fallback_resolve_propagates_get_failure_after_head_bind_does_not_try_next_source``
+    below. The compression-strip invariant survived intact.
+    """
     monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
     monkeypatch.setattr(
         fallback_ops,
         "get_enabled_sources",
         lambda namespace, user_tokens=None: [
             {"url": "https://first.local", "name": "First", "source_type": "huggingface"},
-            {"url": "https://second.local", "name": "Second", "source_type": "huggingface"},
         ],
     )
     path = "/models/owner/demo/resolve/main/model.bin"
     FakeFallbackClient.queue("https://first.local", "HEAD", path, _content_response(200))
-    FakeFallbackClient.queue("https://first.local", "GET", path, _content_response(500))
-    FakeFallbackClient.queue("https://second.local", "HEAD", path, _content_response(200))
     FakeFallbackClient.queue(
-        "https://second.local",
+        "https://first.local",
         "GET",
         path,
         _content_response(
@@ -235,7 +250,59 @@ async def test_try_fallback_resolve_proxies_get_content_and_continues_after_get_
     assert "content-encoding" not in response.headers
     assert response.headers["content-length"] == "7"
     assert "transfer-encoding" not in response.headers
-    assert response.headers["X-Source"] == "Second"
+    assert response.headers["X-Source"] == "First"
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_propagates_get_failure_after_head_bind_does_not_try_next_source(monkeypatch):
+    """#75 binding rule: once HEAD-2xx binds a source for this repo, a
+    subsequent GET non-200 is propagated verbatim (with source
+    attribution) — we do **not** sneak over to a sibling source whose
+    same-named repo would be a different repo.
+
+    The previous behavior (test renamed to
+    ``test_try_fallback_resolve_proxies_get_content_with_compression_strip``)
+    let HEAD-200/GET-500 at source A fall through to source B and serve
+    B's content, which is exactly the cross-source mixing this test
+    now guards against.
+    """
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://first.local", "name": "First", "source_type": "huggingface"},
+            {"url": "https://second.local", "name": "Second", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/model.bin"
+    FakeFallbackClient.queue("https://first.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://first.local",
+        "GET",
+        path,
+        _content_response(500, b"upstream blew up"),
+    )
+    # Second source is a trap — if any code path reaches into it the
+    # FakeFallbackClient will pop from an empty queue and raise
+    # IndexError, surfacing the bug.
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model",
+        "owner",
+        "demo",
+        "main",
+        "model.bin",
+    )
+
+    assert response.status_code == 500
+    assert response.headers["X-Source"] == "First"
+    # The source-attribution header reflects upstream's actual status.
+    assert response.headers["X-Source-Status"] == "500"
+    # Second source was never contacted — the per-source call log only
+    # has the HEAD + GET pair against First.
+    second_calls = [c for c in FakeFallbackClient.calls if c[0] == "https://second.local"]
+    assert second_calls == []
 
 
 @pytest.mark.asyncio
@@ -1604,3 +1671,443 @@ async def test_try_fallback_user_repos_covers_empty_dataset_success_and_failure_
         RuntimeError("repos failed"),
     )
     assert await fallback_ops.try_fallback_user_repos("carol") is None
+
+
+# ===========================================================================
+# Repo-grain binding matrix from #75 — these tests exercise the four
+# try_fallback_* loops against each row of the status-code matrix and
+# assert the new "bind once, never mix sources" semantics.
+# ===========================================================================
+
+
+def _two_sources():
+    """Pair of source configs used by binding tests. Source A is meant
+    to bind; source B is a trap — any code path that reaches into B
+    surfaces a cross-source-mixing regression."""
+    return [
+        {"url": "https://a.local", "name": "A", "source_type": "huggingface"},
+        {"url": "https://b.local", "name": "B", "source_type": "huggingface"},
+    ]
+
+
+def _setup_two_source_resolve(monkeypatch, cache_obj=None):
+    """Common monkeypatch setup for two-source resolve binding tests."""
+    cache = cache_obj or DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    return cache
+
+
+def _b_was_not_called():
+    """Truth value of 'source B was never contacted'."""
+    return all(c[0] != "https://b.local" for c in FakeFallbackClient.calls)
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_404_entry_not_found_at_first_source_propagates_no_cross_source(monkeypatch):
+    """#75 matrix row: HEAD on source A returns 404 + EntryNotFound.
+    The repo lives at A; the file just isn't in this revision. Source
+    B's same-named repo would be a different repo, so we MUST NOT try
+    it — we forward A's 404 + X-Error-Code: EntryNotFound verbatim so
+    a hf_hub client raises EntryNotFoundError."""
+    cache = _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/demo/resolve/main/model.bin"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            404,
+            b"",
+            headers={
+                "x-error-code": "EntryNotFound",
+                "x-error-message": "Entry not found",
+            },
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "model.bin"
+    )
+
+    assert response is not None
+    assert response.status_code == 404
+    assert response.headers["x-error-code"] == "EntryNotFound"
+    assert response.headers["X-Source"] == "A"
+    # No HEAD/GET/POST against source B.
+    assert _b_was_not_called()
+    # Cache binds to A even though the response was an EntryNotFound —
+    # the repo is at A, future requests should go straight there.
+    assert cache.set_calls
+    set_args, _set_kwargs = cache.set_calls[-1]
+    assert "https://a.local" in set_args
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_404_revision_not_found_propagates_no_cross_source(monkeypatch):
+    """Same shape as EntryNotFound but with X-Error-Code: RevisionNotFound."""
+    cache = _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/demo/resolve/refs/no-branch/config.json"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            404,
+            b"",
+            headers={
+                "x-error-code": "RevisionNotFound",
+                "x-error-message": "Invalid rev id: refs",
+            },
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "refs/no-branch", "config.json"
+    )
+
+    assert response.status_code == 404
+    assert response.headers["x-error-code"] == "RevisionNotFound"
+    assert response.headers["X-Source"] == "A"
+    assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_404_repo_not_found_falls_through_to_next_source(monkeypatch):
+    """X-Error-Code: RepoNotFound says 'not at this source' — try the
+    next one. (Authed callers see this; anon callers get the bare-401
+    anti-enum form, covered by a separate test.)"""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/demo/resolve/main/config.json"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            404,
+            b"",
+            headers={
+                "x-error-code": "RepoNotFound",
+                "x-error-message": "Repository not found",
+            },
+        ),
+    )
+    FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", path, _content_response(200, b"data-from-b")
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json"
+    )
+
+    assert response.status_code == 200
+    assert response.body == b"data-from-b"
+    assert response.headers["X-Source"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_401_anti_enum_falls_through(monkeypatch):
+    """HF anonymous anti-enum: 401 + 'Invalid username or password.'
+    (no X-Error-Code) → TRY_NEXT_SOURCE."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/demo/resolve/main/config.json"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            401,
+            b"",
+            headers={"x-error-message": "Invalid username or password."},
+        ),
+    )
+    FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", path, _content_response(200, b"data-from-b")
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json"
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Source"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_401_gated_repo_falls_through_aggregate_preserves_signal(monkeypatch):
+    """401 + GatedRepo at A, 401 + GatedRepo at B → both fall through
+    individually (so the user can possibly access via another source),
+    but the aggregate response still carries X-Error-Code: GatedRepo
+    so a hf_hub client raises GatedRepoError. This is the contract:
+    GatedRepo signal must survive an all-gated chain."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/gated/resolve/main/config.json"
+    gated_headers = {
+        "x-error-code": "GatedRepo",
+        "x-error-message": "Access to model owner/gated is restricted...",
+    }
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(401, b"", headers=gated_headers),
+    )
+    FakeFallbackClient.queue(
+        "https://b.local",
+        "HEAD",
+        path,
+        _content_response(401, b"", headers=gated_headers),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "gated", "main", "config.json"
+    )
+    assert response.status_code == 401
+    assert response.headers["x-error-code"] == "GatedRepo"
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_403_gated_repo_classifies_same_as_401(monkeypatch):
+    """Authed-but-not-in-access-list → HF returns 403 + GatedRepo.
+    Same TRY_NEXT_SOURCE classification as 401 + GatedRepo."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/gated/resolve/main/config.json"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            403,
+            b"",
+            headers={
+                "x-error-code": "GatedRepo",
+                "x-error-message": "Access to model X is restricted and you are not in the authorized list.",
+            },
+        ),
+    )
+    FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", path, _content_response(200, b"data-from-b")
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "gated", "main", "config.json"
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Source"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_disabled_message_propagates(monkeypatch):
+    """X-Error-Message: 'Access to this resource is disabled.' →
+    BIND_AND_PROPAGATE (the repo is here, just disabled). hf_hub
+    raises DisabledRepoError on this exact message."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/disabled/resolve/main/config.json"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            403,
+            b"",
+            headers={"x-error-message": "Access to this resource is disabled."},
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "disabled", "main", "config.json"
+    )
+    assert response.status_code == 403
+    assert response.headers["x-error-message"] == "Access to this resource is disabled."
+    assert response.headers["X-Source"] == "A"
+    assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_5xx_falls_through_to_next_source(monkeypatch):
+    """5xx is transient — TRY_NEXT_SOURCE per matrix."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/demo/resolve/main/config.json"
+    FakeFallbackClient.queue("https://a.local", "HEAD", path, _content_response(503))
+    FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", path, _content_response(200, b"data-from-b")
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json"
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Source"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_resolve_cache_hit_restricts_to_bound_source(monkeypatch):
+    """#75 cache-authoritative rule: a cache hit must restrict the
+    chain to that single source on the first pass. If the cached
+    source binds, no other source is contacted."""
+    cached_entry = {
+        "source_url": "https://b.local",
+        "source_name": "B",
+        "source_type": "huggingface",
+        "exists": True,
+    }
+    cache = DummyCache(cached=cached_entry)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    path = "/models/owner/demo/resolve/main/config.json"
+    FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", path, _content_response(200, b"cached-bound-bytes")
+    )
+    # If the loop falls through into the full chain, the test fixture
+    # has no responses queued for source A and FakeFallbackClient
+    # raises IndexError — that surfaces a regression.
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json"
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Source"] == "B"
+    assert all(c[0] != "https://a.local" for c in FakeFallbackClient.calls)
+    assert not cache.invalidate_calls  # cache stayed authoritative
+
+
+@pytest.mark.asyncio
+async def test_resolve_cache_stale_invalidates_and_falls_through(monkeypatch):
+    """#75: cached source no longer binds → invalidate + full chain
+    skipping the cached one."""
+    cached_entry = {
+        "source_url": "https://a.local",
+        "source_name": "A",
+        "source_type": "huggingface",
+        "exists": True,
+    }
+    cache = DummyCache(cached=cached_entry)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    path = "/models/owner/moved/resolve/main/config.json"
+    # A had it cached but no longer serves (404 + RepoNotFound).
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            404, b"", headers={"x-error-code": "RepoNotFound"}
+        ),
+    )
+    # B picks it up.
+    FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", path, _content_response(200, b"served-by-b")
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "moved", "main", "config.json"
+    )
+    assert response.status_code == 200
+    assert response.headers["X-Source"] == "B"
+    # Stale-cache hook fired exactly once for this repo_id.
+    assert len(cache.invalidate_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_info_404_repo_not_found_falls_through(monkeypatch):
+    """try_fallback_info: 404 + RepoNotFound at A → next source."""
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    info_path = "/api/models/owner/demo"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "GET",
+        info_path,
+        _content_response(404, b"", headers={"x-error-code": "RepoNotFound"}),
+    )
+    FakeFallbackClient.queue(
+        "https://b.local",
+        "GET",
+        info_path,
+        _json_response(200, {"id": "owner/demo"}),
+    )
+
+    result = await fallback_ops.try_fallback_info("model", "owner", "demo")
+    assert isinstance(result, dict)
+    assert result["_source"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_tree_404_entry_not_found_propagates_no_cross_source(monkeypatch):
+    """try_fallback_tree at a sub-path: 404 + EntryNotFound at A
+    means the repo is at A but the path isn't. Don't switch sources."""
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    tree_path = "/api/models/owner/demo/tree/main/no-such-dir"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "GET",
+        tree_path,
+        _content_response(
+            404, b"", headers={"x-error-code": "EntryNotFound"}
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_tree(
+        "model", "owner", "demo", "main", "no-such-dir"
+    )
+    assert response.status_code == 404
+    assert response.headers["x-error-code"] == "EntryNotFound"
+    assert response.headers["X-Source"] == "A"
+    assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_paths_info_404_entry_not_found_propagates_no_cross_source(monkeypatch):
+    """try_fallback_paths_info: 404 + EntryNotFound at A → propagate."""
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+    pi_path = "/api/models/owner/demo/paths-info/main"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "POST",
+        pi_path,
+        _content_response(
+            404, b"", headers={"x-error-code": "EntryNotFound"}
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_paths_info(
+        "model", "owner", "demo", "main", ["foo.bin"]
+    )
+    assert response.status_code == 404
+    assert response.headers["x-error-code"] == "EntryNotFound"
+    assert response.headers["X-Source"] == "A"
+    assert _b_was_not_called()

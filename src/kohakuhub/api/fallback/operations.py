@@ -16,13 +16,124 @@ from kohakuhub.api.fallback.utils import (
     add_source_headers,
     build_fallback_attempt,
     build_aggregate_failure_response,
+    classify_upstream,
     extract_error_message,
+    FallbackDecision,
     is_not_found_error,
     should_retry_source,
     strip_xet_response_headers,
 )
 
+
+def _propagate_upstream_response(
+    response: httpx.Response, source: dict
+) -> Response:
+    """Forward an upstream's BIND_AND_PROPAGATE response verbatim.
+
+    Used when ``classify_upstream`` returns ``BIND_AND_PROPAGATE`` —
+    i.e. EntryNotFound, RevisionNotFound, or "Access to this resource
+    is disabled.". The repo lives at this source; the upstream's 4xx is
+    the right answer for the request, and we forward the body and
+    ``X-Error-Code`` / ``X-Error-Message`` headers so a hf_hub client
+    raises the right exception (``EntryNotFoundError`` /
+    ``RevisionNotFoundError`` / ``DisabledRepoError``).
+
+    Header sanitization mirrors the success path (strip
+    encoding/length/transfer headers httpx already decompressed, drop
+    Xet hints that would push a hf_hub client onto an endpoint we don't
+    serve, attach ``X-Source*`` for telemetry).
+    """
+    headers = dict(response.headers)
+    # httpx already decoded the body, so the original
+    # Content-Length/Encoding/Transfer-Encoding values would mislead
+    # the next hop. Same hygiene as the 200 success path.
+    headers.pop("content-encoding", None)
+    headers.pop("content-length", None)
+    headers.pop("transfer-encoding", None)
+    strip_xet_response_headers(headers)
+    headers.update(add_source_headers(response, source["name"], source["url"]))
+    return Response(
+        status_code=response.status_code,
+        content=response.content,
+        headers=headers,
+    )
+
 logger = get_logger("FALLBACK_OPS")
+
+
+async def _run_cached_then_chain(
+    repo_type: str,
+    namespace: str,
+    name: str,
+    sources: list[dict],
+    cache,
+    attempts: list[dict],
+    attempt_fn,
+    aggregate_scope: str,
+):
+    """Orchestrate the cache-authoritative probe + full-chain fallback.
+
+    Used by ``try_fallback_info`` / ``try_fallback_tree`` /
+    ``try_fallback_paths_info`` (and indirectly by
+    ``try_fallback_resolve``, which inlines the same shape because it
+    has the additional HEAD/GET split). The shared logic is:
+
+    1. If the cache binds this ``repo_id`` to a known source, probe
+       that source *and only that source* on the first pass (within
+       TTL the cache is authoritative — see #75 on why a cache hit
+       previously degenerated to "reorder + still scan the chain").
+    2. On stale cache, invalidate and fall through to the full chain
+       skipping the already-tried cached source.
+    3. If every source falls through (TRY_NEXT_SOURCE), aggregate
+       attempts with the right ``scope`` so the final
+       ``X-Error-Code`` is RepoNotFound (repo-level ops) or
+       EntryNotFound (file-level ops).
+
+    The ``attempt_fn`` is op-specific: it does the request, calls
+    ``classify_upstream``, writes the cache on bind, and returns the
+    final response (Response / dict / list) on bind, ``None`` on
+    TRY_NEXT_SOURCE (the function is responsible for appending to
+    ``attempts`` in that case).
+    """
+    cached_entry = cache.get(repo_type, namespace, name)
+    cached_url: str | None = None
+    if cached_entry and cached_entry.get("exists"):
+        cached_url = cached_entry["source_url"]
+        cached_source = next((s for s in sources if s["url"] == cached_url), None)
+        if cached_source:
+            logger.debug(
+                f"Cache hit: probing {cached_source['name']} only for "
+                f"{repo_type}/{namespace}/{name}"
+            )
+            result = await attempt_fn(cached_source)
+            if result is not None:
+                return result
+            logger.debug(
+                f"Cache stale: {cached_source['name']} no longer binds "
+                f"{repo_type}/{namespace}/{name}; invalidating + falling through"
+            )
+            cache.invalidate(repo_type, namespace, name)
+        else:
+            cache.invalidate(repo_type, namespace, name)
+            cached_url = None
+
+    for source in sources:
+        if cached_url is not None and source["url"] == cached_url:
+            continue
+        result = await attempt_fn(source)
+        if result is not None:
+            return result
+
+    if not attempts:
+        # Defensive: caller had at least one source but every one was
+        # the cached-and-now-removed entry. (`if not sources` in the
+        # caller already handles the literal zero-source case.)
+        return None
+    logger.debug(
+        f"Fallback MISS: aggregating {len(attempts)} source failure(s) "
+        f"for {repo_type}/{namespace}/{name}"
+    )
+    return build_aggregate_failure_response(attempts, scope=aggregate_scope)
 
 
 async def try_fallback_resolve(
@@ -55,228 +166,246 @@ async def try_fallback_resolve(
         logger.debug(f"No fallback sources configured for {namespace}")
         return None
 
-    # Check cache first
-    cached = cache.get(repo_type, namespace, name)
-    if cached and cached.get("exists"):
-        # Cache hit - try this source first
-        source_url = cached["source_url"]
-        source_name = cached["source_name"]
-        source_type = cached["source_type"]
-
-        # Find source config by URL
-        source_config = next((s for s in sources if s["url"] == source_url), None)
-        if source_config:
-            sources = [source_config] + [s for s in sources if s["url"] != source_url]
-            logger.debug(
-                f"Cache hit: trying {source_name} first for {namespace}/{name}"
-            )
-
     # Construct KohakuHub path
     kohaku_path = f"/{repo_type}s/{namespace}/{name}/resolve/{revision}/{path}"
 
     # Per-source attempts accumulated across the loop. If every source
-    # fails, the aggregated JSON body exposes this list under
-    # `body.sources` so the client can tell which sources were asked,
-    # what each one answered, and pick the right remediation (token,
-    # retry, move on). See src/kohakuhub/api/fallback/utils.py for the
-    # status-priority + HF-compatible X-Error-Code contract.
+    # falls through (TRY_NEXT_SOURCE), the aggregated JSON body exposes
+    # this list under `body.sources` so the client can tell which
+    # sources were asked, what each one answered, and pick the right
+    # remediation (token, retry, move on).
     attempts: list[dict] = []
 
-    # Try each source in priority order
-    for source in sources:
-        try:
-            client = FallbackClient(
-                source_url=source["url"],
-                source_type=source["source_type"],
-                token=source.get("token"),
-            )
+    async def _attempt(source):
+        return await _resolve_one_source(
+            source,
+            repo_type,
+            namespace,
+            name,
+            kohaku_path,
+            method,
+            attempts,
+            cache,
+        )
 
-            # Make HEAD request to check if file exists
-            response = await client.head(kohaku_path, repo_type)
-
-            # Accept 2xx (success) or 3xx (redirect) as "file exists"
-            # HuggingFace often returns 307 redirects to CDN
-            if 200 <= response.status_code < 400:
-                logger.debug(
-                    f"HEAD returned {response.status_code}, file exists at {source['name']}"
-                )
-
-                # Update cache
-                cache.set(
-                    repo_type,
-                    namespace,
-                    name,
-                    source["url"],
-                    source["name"],
-                    source["source_type"],
-                    exists=True,
-                )
-
-                logger.info(
-                    f"Fallback SUCCESS: {repo_type}/{namespace}/{name} found in {source['name']}"
-                )
-
-                if method == "HEAD":
-                    # Rewrite any relative Location against the upstream
-                    # request URL so clients following a 3xx hit the
-                    # upstream (e.g. huggingface.co) instead of KohakuHub
-                    # itself — HF's /api/resolve-cache/... path lives only
-                    # on the HF origin.
-                    resp_headers = dict(response.headers)
-                    location = resp_headers.get("location") or resp_headers.get(
-                        "Location"
-                    )
-                    if location:
-                        upstream_url = str(response.request.url)
-                        absolute_location = urljoin(upstream_url, location)
-                        for k in list(resp_headers.keys()):
-                            if k.lower() == "location":
-                                resp_headers.pop(k, None)
-                        resp_headers["location"] = absolute_location
-
-                    # For non-LFS 3xx redirects (no X-Linked-Size), HF's 307
-                    # Content-Length is the redirect body length (~278B),
-                    # not the file size. Without X-Linked-Size the hf_hub
-                    # client takes that bogus value as expected_size and
-                    # fails its post-download consistency check
-                    # (observed in imgutils' get_wd14_tags on
-                    # selected_tags.csv). One extra HEAD to the rewritten
-                    # Location picks up the real Content-Length / ETag.
-                    # LFS files already carry X-Linked-Size; hf_hub prefers
-                    # it over Content-Length so we skip the follow.
-                    if (
-                        300 <= response.status_code < 400
-                        and location
-                        and not any(
-                            k.lower() == "x-linked-size" for k in resp_headers
-                        )
-                    ):
-                        try:
-                            async with httpx.AsyncClient(
-                                timeout=client.timeout
-                            ) as hc:
-                                # `identity` asks HF not to gzip the
-                                # (empty) HEAD body; otherwise httpx's
-                                # auto-decoding strips Content-Length from
-                                # the response and we lose the size we
-                                # came here to fetch.
-                                extra_headers = {"Accept-Encoding": "identity"}
-                                if client.token:
-                                    extra_headers["Authorization"] = (
-                                        f"Bearer {client.token}"
-                                    )
-                                follow_resp = await hc.head(
-                                    resp_headers["location"],
-                                    headers=extra_headers,
-                                    follow_redirects=False,
-                                )
-                            for k in [
-                                k for k in list(resp_headers)
-                                if k.lower() in ("content-length", "etag")
-                            ]:
-                                resp_headers.pop(k)
-                            for k, v in follow_resp.headers.items():
-                                if k.lower() in ("content-length", "etag"):
-                                    resp_headers[k] = v
-                        except httpx.HTTPError:
-                            # Extra HEAD failed — return what we have; no
-                            # worse than the original PR#21 behavior.
-                            pass
-
-                    strip_xet_response_headers(resp_headers)
-                    resp_headers.update(
-                        add_source_headers(response, source["name"], source["url"])
-                    )
-                    final_resp = Response(
-                        status_code=response.status_code,
-                        content=response.content,
-                        headers=resp_headers,
-                    )
-                    return final_resp
-                else:
-                    # For GET: Make actual GET request to fetch content (proxy)
-                    get_response = await client.get(
-                        kohaku_path, repo_type, follow_redirects=True
-                    )
-
-                    if get_response.status_code == 200:
-                        # Proxy the content with original headers
-                        resp_headers = dict(get_response.headers)
-
-                        # Remove compression headers since httpx already decompressed
-                        # Otherwise browser will try to decompress already-decompressed content
-                        resp_headers.pop("content-encoding", None)
-                        resp_headers.pop(
-                            "content-length", None
-                        )  # Length may be wrong after decompression
-                        resp_headers.pop("transfer-encoding", None)
-
-                        strip_xet_response_headers(resp_headers)
-                        resp_headers.update(
-                            add_source_headers(
-                                get_response, source["name"], source["url"]
-                            )
-                        )
-                        final_resp = Response(
-                            status_code=get_response.status_code,
-                            content=get_response.content,
-                            headers=resp_headers,
-                        )
-                        return final_resp
-                    else:
-                        # GET failed, try next source. Log the attempt so
-                        # the aggregate response can explain what each
-                        # source actually answered.
-                        logger.warning(
-                            f"GET request failed for {source['name']}: {get_response.status_code}"
-                        )
-                        attempts.append(
-                            build_fallback_attempt(source, response=get_response)
-                        )
-                        continue
-
-            # Non-success HEAD response. Record and continue to the next
-            # source: a mirror that does not gate (or that simply has
-            # the artifact when the first source does not) can still
-            # serve the request. The old short-circuit on 4xx lost the
-            # status + body completely and blamed the local 404 for
-            # what was really an upstream auth failure (issue tied to
-            # PR#28: gated repos surfacing as RepoNotFound).
-            else:
-                logger.warning(
-                    f"Fallback attempt at {source['name']}: HTTP {response.status_code}"
-                )
-                attempts.append(build_fallback_attempt(source, response=response))
-                continue
-
-        except httpx.TimeoutException as e:
-            logger.warning(f"Fallback source {source['name']} timed out")
-            attempts.append(build_fallback_attempt(source, timeout=e))
-            continue
-
-        except Exception as e:
-            logger.warning(f"Fallback source {source['name']} failed: {e}")
-            attempts.append(build_fallback_attempt(source, network=e))
-            continue
-
-    # Every source produced a non-success response. Build an aggregated
-    # error with HF-compatible X-Error-Code (see
-    # build_aggregate_failure_response for the status-priority rules and
-    # the reason we align with huggingface_hub's `hf_raise_for_status`
-    # classification) and let the caller return it unchanged — the
-    # `with_repo_fallback` decorator passes non-None results through, so
-    # the aggregated 4xx/5xx bubbles up to the client instead of
-    # collapsing to the local "RepoNotFound".
-    # Reaching here means every enabled source produced a non-success
-    # outcome (every branch of the loop that does not `return` also
-    # `attempts.append(...)`), so the attempts list is always non-empty
-    # at this point. The early `if not sources: return None` above
-    # already handled the zero-source case.
-    logger.debug(
-        f"Fallback MISS: aggregating {len(attempts)} source failure(s) "
-        f"for {repo_type}/{namespace}/{name}"
+    return await _run_cached_then_chain(
+        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        # `resolve` is per-file. All-404 → EntryNotFound (default scope
+        # for the aggregate). The aggregate's own status-priority logic
+        # promotes that to RepoNotFound if any attempt was a bare-401
+        # anti-enum, matching hf_hub's behavior.
+        aggregate_scope="file",
     )
-    return build_aggregate_failure_response(attempts)
+
+
+async def _resolve_one_source(
+    source: dict,
+    repo_type: str,
+    namespace: str,
+    name: str,
+    kohaku_path: str,
+    method: str,
+    attempts: list[dict],
+    cache,
+) -> Optional[Response]:
+    """Run a resolve probe (HEAD, then GET if method=GET) against one source.
+
+    Returns:
+        ``Response`` if the source binds (BIND_AND_RESPOND or
+        BIND_AND_PROPAGATE) — the loop should stop and serve this.
+        ``None`` if the source falls through (TRY_NEXT_SOURCE) — the
+        attempt has already been appended to ``attempts``.
+    """
+    try:
+        client = FallbackClient(
+            source_url=source["url"],
+            source_type=source["source_type"],
+            token=source.get("token"),
+        )
+        response = await client.head(kohaku_path, repo_type)
+    except httpx.TimeoutException as e:
+        logger.warning(f"Fallback source {source['name']} HEAD timed out")
+        attempts.append(build_fallback_attempt(source, timeout=e))
+        return None
+    except Exception as e:
+        logger.warning(f"Fallback source {source['name']} HEAD failed: {e}")
+        attempts.append(build_fallback_attempt(source, network=e))
+        return None
+
+    decision = classify_upstream(response)
+
+    if decision is FallbackDecision.TRY_NEXT_SOURCE:
+        logger.warning(
+            f"Fallback {source['name']}: HEAD {response.status_code} "
+            f"{response.headers.get('x-error-code') or '(no X-Error-Code)'} "
+            f"→ TRY_NEXT_SOURCE"
+        )
+        attempts.append(build_fallback_attempt(source, response=response))
+        return None
+
+    # BIND_AND_RESPOND or BIND_AND_PROPAGATE: this source has the repo.
+    # Update cache so subsequent requests skip the chain probe.
+    cache.set(
+        repo_type,
+        namespace,
+        name,
+        source["url"],
+        source["name"],
+        source["source_type"],
+        exists=True,
+    )
+
+    if decision is FallbackDecision.BIND_AND_PROPAGATE:
+        # 4xx + EntryNotFound / RevisionNotFound / Disabled — the repo
+        # is here, but the requested entry/revision is not (or the repo
+        # is taken down here). Forward upstream verbatim so a hf_hub
+        # client raises the right specific exception. Crucially, do NOT
+        # try the next source — a sibling source's same-named repo
+        # would be a different repo (#75).
+        logger.info(
+            f"Fallback BIND_AND_PROPAGATE: {repo_type}/{namespace}/{name} "
+            f"at {source['name']} → upstream {response.status_code} "
+            f"{response.headers.get('x-error-code') or response.headers.get('x-error-message') or ''}"
+        )
+        return _propagate_upstream_response(response, source)
+
+    # BIND_AND_RESPOND: HEAD says repo+file present at this source.
+    logger.info(
+        f"Fallback SUCCESS: {repo_type}/{namespace}/{name} found at {source['name']}"
+    )
+
+    if method == "HEAD":
+        return await _build_resolve_head_response(response, source, client)
+
+    # GET phase. Once HEAD has bound this source we are committed:
+    # the GET response — whether 200, 5xx, or anything else — is what
+    # the user gets. Falling through to another source here is the
+    # cross-source mixing bug #75 fixes (HEAD-200 at A, GET-502 at A,
+    # then sneak over to B's same-named-but-different repo).
+    try:
+        get_response = await client.get(
+            kohaku_path, repo_type, follow_redirects=True
+        )
+    except httpx.TimeoutException as e:
+        logger.warning(
+            f"GET timed out at bound source {source['name']} after HEAD bind: {e}"
+        )
+        # Bound, no upstream response to forward. Synthesize a 502 from
+        # this single attempt; the aggregate-failure helper already
+        # produces the right shape.
+        return build_aggregate_failure_response(
+            [build_fallback_attempt(source, timeout=e)]
+        )
+    except Exception as e:
+        logger.warning(
+            f"GET failed at bound source {source['name']} after HEAD bind: {e}"
+        )
+        return build_aggregate_failure_response(
+            [build_fallback_attempt(source, network=e)]
+        )
+
+    if get_response.status_code == 200:
+        # Proxy the content with original headers, stripping the
+        # compression-related ones since httpx has already decoded the
+        # body and the next hop would otherwise try to decompress an
+        # already-decompressed payload.
+        resp_headers = dict(get_response.headers)
+        resp_headers.pop("content-encoding", None)
+        resp_headers.pop("content-length", None)
+        resp_headers.pop("transfer-encoding", None)
+        strip_xet_response_headers(resp_headers)
+        resp_headers.update(
+            add_source_headers(get_response, source["name"], source["url"])
+        )
+        return Response(
+            status_code=get_response.status_code,
+            content=get_response.content,
+            headers=resp_headers,
+        )
+
+    # GET non-200 at a bound source: forward upstream's status verbatim.
+    # No cross-source retry — see comment above.
+    logger.warning(
+        f"GET {get_response.status_code} at bound source {source['name']} "
+        f"→ propagating (bound)"
+    )
+    return _propagate_upstream_response(get_response, source)
+
+
+async def _build_resolve_head_response(
+    response: httpx.Response, source: dict, client: "FallbackClient"
+) -> Response:
+    """Build the HEAD-method response with HF-quirks handling.
+
+    Two HF-specific quirks survive from the original implementation:
+
+    1. **Relative Location → absolute.** HF returns 3xx redirects with
+       paths like ``/api/resolve-cache/...`` that only resolve on the HF
+       origin. Rewriting against ``response.request.url`` keeps clients
+       following the redirect on the upstream rather than bouncing it
+       back to KohakuHub.
+    2. **Extra HEAD on non-LFS 3xx for Content-Length/ETag.** HF's 307
+       on a small file carries the redirect body's Content-Length
+       (~278B), not the file's. Without ``X-Linked-Size`` the hf_hub
+       client trusts that bogus Content-Length and fails its
+       post-download consistency check (observed in
+       ``imgutils.get_wd14_tags`` on ``selected_tags.csv``). A second
+       HEAD against the rewritten Location picks up the real values.
+       LFS files already carry ``X-Linked-Size``; hf_hub prefers it
+       over Content-Length so we skip the follow there.
+    """
+    resp_headers = dict(response.headers)
+    location = resp_headers.get("location") or resp_headers.get("Location")
+    if location:
+        upstream_url = str(response.request.url)
+        absolute_location = urljoin(upstream_url, location)
+        for k in list(resp_headers.keys()):
+            if k.lower() == "location":
+                resp_headers.pop(k, None)
+        resp_headers["location"] = absolute_location
+
+    if (
+        300 <= response.status_code < 400
+        and location
+        and not any(k.lower() == "x-linked-size" for k in resp_headers)
+    ):
+        try:
+            async with httpx.AsyncClient(timeout=client.timeout) as hc:
+                # `identity` asks HF not to gzip the (empty) HEAD body;
+                # otherwise httpx's auto-decoding strips Content-Length
+                # from the response and we lose the value we came here
+                # to fetch.
+                extra_headers = {"Accept-Encoding": "identity"}
+                if client.token:
+                    extra_headers["Authorization"] = f"Bearer {client.token}"
+                follow_resp = await hc.head(
+                    resp_headers["location"],
+                    headers=extra_headers,
+                    follow_redirects=False,
+                )
+            for k in [
+                k
+                for k in list(resp_headers)
+                if k.lower() in ("content-length", "etag")
+            ]:
+                resp_headers.pop(k)
+            for k, v in follow_resp.headers.items():
+                if k.lower() in ("content-length", "etag"):
+                    resp_headers[k] = v
+        except httpx.HTTPError:
+            # Extra HEAD failed — return what we have; no worse than
+            # the original PR#21 behavior.
+            pass
+
+    strip_xet_response_headers(resp_headers)
+    resp_headers.update(
+        add_source_headers(response, source["name"], source["url"])
+    )
+    return Response(
+        status_code=response.status_code,
+        content=response.content,
+        headers=resp_headers,
+    )
 
 
 async def try_fallback_info(
@@ -302,79 +431,69 @@ async def try_fallback_info(
     if not sources:
         return None
 
-    # Check cache first
-    cached = cache.get(repo_type, namespace, name)
-    if cached and cached.get("exists"):
-        source_url = cached["source_url"]
-        source_config = next((s for s in sources if s["url"] == source_url), None)
-        if source_config:
-            sources = [source_config] + [s for s in sources if s["url"] != source_url]
-
     # Construct API path
     kohaku_path = f"/api/{repo_type}s/{namespace}/{name}"
-
-    # Every non-2xx source probe becomes an attempt dict; if we exit
-    # the loop without a success, aggregate the attempts into a
-    # classified JSONResponse (same contract as try_fallback_resolve,
-    # but with `scope="repo"` so all-404 maps to RepoNotFound rather
-    # than EntryNotFound — info is a repo-level operation).
     attempts: list[dict] = []
 
-    # Try each source
-    for source in sources:
+    async def _attempt(source):
         try:
             client = FallbackClient(
                 source_url=source["url"],
                 source_type=source["source_type"],
                 token=source.get("token"),
             )
-
             response = await client.get(kohaku_path, repo_type)
-
-            if response.status_code == 200:
-                data = response.json()
-
-                # Add source tag
-                data["_source"] = source["name"]
-                data["_source_url"] = source["url"]
-
-                # Update cache
-                cache.set(
-                    repo_type,
-                    namespace,
-                    name,
-                    source["url"],
-                    source["name"],
-                    source["source_type"],
-                    exists=True,
-                )
-
-                logger.info(
-                    f"Fallback info SUCCESS: {repo_type}/{namespace}/{name} from {source['name']}"
-                )
-                return data
-
-            logger.warning(
-                f"Fallback info attempt at {source['name']}: HTTP {response.status_code}"
-            )
-            attempts.append(build_fallback_attempt(source, response=response))
-
         except httpx.TimeoutException as e:
             logger.warning(f"Fallback info timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
-            continue
+            return None
         except Exception as e:
             logger.warning(f"Fallback info failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
-            continue
+            return None
 
-    if not attempts:
-        return None
-    logger.debug(
-        f"Fallback info MISS: aggregating {len(attempts)} source failure(s) "
-        f"for {repo_type}/{namespace}/{name}"
+        decision = classify_upstream(response)
+        if decision is FallbackDecision.TRY_NEXT_SOURCE:
+            logger.warning(
+                f"Fallback info {source['name']}: HTTP {response.status_code} "
+                f"{response.headers.get('x-error-code') or ''} → TRY_NEXT_SOURCE"
+            )
+            attempts.append(build_fallback_attempt(source, response=response))
+            return None
+
+        # BIND — write cache for repo-grain reuse.
+        cache.set(
+            repo_type, namespace, name,
+            source["url"], source["name"], source["source_type"],
+            exists=True,
+        )
+
+        if decision is FallbackDecision.BIND_AND_PROPAGATE:
+            # 4xx + EntryNotFound/RevisionNotFound on info is unusual
+            # (info is a repo-level endpoint, EntryNotFound semantics
+            # don't really apply). If it ever happens, propagate so
+            # hf_hub raises the right exception rather than masking it
+            # by trying another source.
+            logger.info(
+                f"Fallback info BIND_AND_PROPAGATE at {source['name']}: "
+                f"upstream {response.status_code} "
+                f"{response.headers.get('x-error-code') or ''}"
+            )
+            return _propagate_upstream_response(response, source)
+
+        # BIND_AND_RESPOND — parse and tag.
+        data = response.json()
+        data["_source"] = source["name"]
+        data["_source_url"] = source["url"]
+        logger.info(
+            f"Fallback info SUCCESS: {repo_type}/{namespace}/{name} from {source['name']}"
+        )
+        return data
+
+    return await _run_cached_then_chain(
+        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        aggregate_scope="repo",
     )
-    return build_aggregate_failure_response(attempts, scope="repo")
 
 
 async def try_fallback_tree(
@@ -402,6 +521,7 @@ async def try_fallback_tree(
     Returns:
         JSON response or None if not found
     """
+    cache = get_cache()
     sources = get_enabled_sources(namespace, user_tokens=user_tokens)
 
     if not sources:
@@ -410,68 +530,79 @@ async def try_fallback_tree(
     # Construct API path (strip leading slash from path to avoid double slash)
     clean_path = path.lstrip("/") if path else ""
     kohaku_path = f"/api/{repo_type}s/{namespace}/{name}/tree/{revision}/{clean_path}"
-
-    # Tree is a repo-level operation: `scope="repo"` on all-404 so
-    # hf_hub_download / HfApi.list_repo_files raise
-    # RepositoryNotFoundError (not EntryNotFoundError), matching what
-    # HF itself returns for a missing model.
     attempts: list[dict] = []
 
-    # Try each source
-    for source in sources:
+    params: dict = {"recursive": recursive, "expand": expand}
+    if limit is not None:
+        params["limit"] = limit
+    if cursor:
+        params["cursor"] = cursor
+
+    async def _attempt(source):
         try:
             client = FallbackClient(
                 source_url=source["url"],
                 source_type=source["source_type"],
                 token=source.get("token"),
             )
-
-            params = {
-                "recursive": recursive,
-                "expand": expand,
-            }
-            if limit is not None:
-                params["limit"] = limit
-            if cursor:
-                params["cursor"] = cursor
-
             response = await client.get(kohaku_path, repo_type, params=params)
-
-            if response.status_code == 200:
-                logger.info(
-                    f"Fallback tree SUCCESS: {repo_type}/{namespace}/{name}/tree from {source['name']}"
-                )
-                headers = {}
-                if response.headers.get("link"):
-                    headers["Link"] = response.headers["link"]
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    media_type=response.headers.get("content-type"),
-                    headers=headers,
-                )
-
-            logger.warning(
-                f"Fallback tree attempt at {source['name']}: HTTP {response.status_code}"
-            )
-            attempts.append(build_fallback_attempt(source, response=response))
-
         except httpx.TimeoutException as e:
             logger.warning(f"Fallback tree timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
-            continue
+            return None
         except Exception as e:
             logger.warning(f"Fallback tree failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
-            continue
+            return None
 
-    if not attempts:
-        return None
-    logger.debug(
-        f"Fallback tree MISS: aggregating {len(attempts)} source failure(s) "
-        f"for {repo_type}/{namespace}/{name}/tree"
+        decision = classify_upstream(response)
+        if decision is FallbackDecision.TRY_NEXT_SOURCE:
+            logger.warning(
+                f"Fallback tree {source['name']}: HTTP {response.status_code} "
+                f"{response.headers.get('x-error-code') or ''} → TRY_NEXT_SOURCE"
+            )
+            attempts.append(build_fallback_attempt(source, response=response))
+            return None
+
+        cache.set(
+            repo_type, namespace, name,
+            source["url"], source["name"], source["source_type"],
+            exists=True,
+        )
+
+        if decision is FallbackDecision.BIND_AND_PROPAGATE:
+            # tree on a path the repo doesn't have → 404 + EntryNotFound
+            # at this source. Repo is bound here; sibling sources'
+            # same-named repos are different repos, don't try them.
+            logger.info(
+                f"Fallback tree BIND_AND_PROPAGATE at {source['name']}: "
+                f"upstream {response.status_code} "
+                f"{response.headers.get('x-error-code') or ''}"
+            )
+            return _propagate_upstream_response(response, source)
+
+        # BIND_AND_RESPOND — forward upstream's body with content-type +
+        # Link (pagination cursor) intact.
+        logger.info(
+            f"Fallback tree SUCCESS: {repo_type}/{namespace}/{name}/tree "
+            f"from {source['name']}"
+        )
+        headers = {}
+        if response.headers.get("link"):
+            headers["Link"] = response.headers["link"]
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type"),
+            headers=headers,
+        )
+
+    return await _run_cached_then_chain(
+        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        # Tree is a repo-level operation: scope="repo" so all-404 maps
+        # to RepoNotFound (matches HF for a missing repo).
+        aggregate_scope="repo",
     )
-    return build_aggregate_failure_response(attempts, scope="repo")
 
 
 async def try_fallback_paths_info(
@@ -496,6 +627,7 @@ async def try_fallback_paths_info(
     Returns:
         List of path info objects or None if not found
     """
+    cache = get_cache()
     sources = get_enabled_sources(namespace, user_tokens=user_tokens)
 
     if not sources:
@@ -503,54 +635,64 @@ async def try_fallback_paths_info(
 
     # Construct API path
     kohaku_path = f"/api/{repo_type}s/{namespace}/{name}/paths-info/{revision}"
-
-    # paths-info is per-file (it answers "does file X exist at
-    # revision R"), so all-404 stays scope="file" → EntryNotFound.
     attempts: list[dict] = []
 
-    # Try each source
-    for source in sources:
+    async def _attempt(source):
         try:
             client = FallbackClient(
                 source_url=source["url"],
                 source_type=source["source_type"],
                 token=source.get("token"),
             )
-
-            # POST request with form data
             response = await client.post(
                 kohaku_path, repo_type, data={"paths": paths, "expand": expand}
             )
-
-            if response.status_code == 200:
-                data = response.json()
-
-                logger.info(
-                    f"Fallback paths-info SUCCESS: {repo_type}/{namespace}/{name} from {source['name']}"
-                )
-                return data
-
-            logger.warning(
-                f"Fallback paths-info attempt at {source['name']}: HTTP {response.status_code}"
-            )
-            attempts.append(build_fallback_attempt(source, response=response))
-
         except httpx.TimeoutException as e:
             logger.warning(f"Fallback paths-info timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
-            continue
+            return None
         except Exception as e:
             logger.warning(f"Fallback paths-info failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
-            continue
+            return None
 
-    if not attempts:
-        return None
-    logger.debug(
-        f"Fallback paths-info MISS: aggregating {len(attempts)} source failure(s) "
-        f"for {repo_type}/{namespace}/{name}"
+        decision = classify_upstream(response)
+        if decision is FallbackDecision.TRY_NEXT_SOURCE:
+            logger.warning(
+                f"Fallback paths-info {source['name']}: HTTP "
+                f"{response.status_code} "
+                f"{response.headers.get('x-error-code') or ''} → TRY_NEXT_SOURCE"
+            )
+            attempts.append(build_fallback_attempt(source, response=response))
+            return None
+
+        cache.set(
+            repo_type, namespace, name,
+            source["url"], source["name"], source["source_type"],
+            exists=True,
+        )
+
+        if decision is FallbackDecision.BIND_AND_PROPAGATE:
+            logger.info(
+                f"Fallback paths-info BIND_AND_PROPAGATE at {source['name']}: "
+                f"upstream {response.status_code} "
+                f"{response.headers.get('x-error-code') or ''}"
+            )
+            return _propagate_upstream_response(response, source)
+
+        # BIND_AND_RESPOND
+        logger.info(
+            f"Fallback paths-info SUCCESS: {repo_type}/{namespace}/{name} "
+            f"from {source['name']}"
+        )
+        return response.json()
+
+    return await _run_cached_then_chain(
+        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        # paths-info is per-file (answers "does file X exist at
+        # revision R"), so all-404 stays scope="file" → EntryNotFound.
+        aggregate_scope="file",
     )
-    return build_aggregate_failure_response(attempts, scope="file")
 
 
 async def fetch_external_list(

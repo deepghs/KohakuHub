@@ -1,5 +1,6 @@
 """Utility functions for fallback system."""
 
+import enum
 from typing import Optional
 
 import httpx
@@ -8,6 +9,35 @@ from fastapi.responses import JSONResponse
 from kohakuhub.logger import get_logger
 
 logger = get_logger("FALLBACK_UTILS")
+
+
+class FallbackDecision(enum.Enum):
+    """Per-source decision for one upstream response.
+
+    Drives the repo-grain binding rule (issue #75): once a source confirms
+    the repo exists at this layer (BIND_AND_*), the loop stops and serves
+    the upstream's answer instead of cycling through more sources for the
+    same ``repo_id``. Mixing reads of one repo across sources produces an
+    inconsistent view (info from A, tree from B, file from C all describe
+    a "bert-base-uncased" but they are three different repos).
+    """
+
+    BIND_AND_RESPOND = "bind_and_respond"
+    """Source has the repo and supplies the answer; return upstream's body."""
+
+    BIND_AND_PROPAGATE = "bind_and_propagate"
+    """Source has the repo, upstream's error is the right answer; do not try
+    further sources, forward upstream verbatim. Used for EntryNotFound /
+    RevisionNotFound / "Access to this resource is disabled." — these say
+    *the repo is here, the entry/revision is not* (or the repo is taken
+    down here), and a sibling source's same-named repo would be a
+    different repo."""
+
+    TRY_NEXT_SOURCE = "try_next_source"
+    """Source can't serve; advance the loop. Includes 401/403 (incl
+    GatedRepo — try a source where the user might have access; aggregate
+    layer preserves the GatedRepo signal if every source ends up gated),
+    404+RepoNotFound, bare 401/403/404, 5xx, timeout, network errors."""
 
 
 # Category labels attached to each fallback attempt, used for aggregation.
@@ -122,6 +152,101 @@ def should_retry_source(response: httpx.Response) -> bool:
 
     # Default: don't retry
     return False
+
+
+# ``X-Error-Message`` value HF emits for repos disabled by moderation.
+# `huggingface_hub.utils._http.hf_raise_for_status` keys off this exact
+# string to raise ``DisabledRepoError`` (no ``X-Error-Code`` is set on
+# these responses), so we have to compare equality, not contains.
+_HF_DISABLED_MESSAGE = "Access to this resource is disabled."
+
+
+def classify_upstream(response_or_exc) -> FallbackDecision:
+    """Classify one upstream response (or transport exception) for the loop.
+
+    The matrix below mirrors the priority of
+    ``huggingface_hub.utils._http.hf_raise_for_status`` (X-Error-Code is
+    consulted before the numeric status code), so that a hf_hub client
+    talking *through* KohakuHub's fallback gets the same exception type
+    it would have gotten talking to the upstream directly.
+
+    Empirically anchored against ``https://huggingface.co`` responses
+    captured 2026-04-30 (see #75 for the full table). Two contract shifts
+    that are easy to miss:
+
+    - HF returns ``401`` (no ``X-Error-Code``, message
+      ``"Invalid username or password."``) to *anonymous* callers asking
+      about a non-existent repo (anti-enumeration). The same probe with
+      a valid token returns ``404 + X-Error-Code: RepoNotFound``. Both
+      classify as ``TRY_NEXT_SOURCE`` here.
+    - ``X-Error-Code: GatedRepo`` rides on **either** 401 (anon /
+      bad-token) or 403 (authed but not in the access list). hf_hub
+      checks the header, not the status, so we do too — and we send
+      *both* to ``TRY_NEXT_SOURCE`` because another source might serve
+      this repo without gating. The aggregate layer
+      (`build_aggregate_failure_response`) preserves the GatedRepo
+      category if every source ends up gated.
+
+    Args:
+        response_or_exc: Either an ``httpx.Response`` to classify, or an
+            exception raised while making the request (timeout, network).
+
+    Returns:
+        ``FallbackDecision`` member. Callers should ``match`` on the
+        result and act per the docstrings on each enum value.
+    """
+    if isinstance(response_or_exc, BaseException):
+        # Timeout / connection refused / DNS / etc. — we cannot tell
+        # whether the repo lives here. Move on.
+        return FallbackDecision.TRY_NEXT_SOURCE
+
+    response: httpx.Response = response_or_exc
+
+    # Header lookups are case-insensitive on httpx.Headers; ``.get``
+    # returns ``None`` if absent, which all branches below tolerate.
+    error_code = (
+        response.headers.get("x-error-code") if response.headers else None
+    )
+    error_message = (
+        response.headers.get("x-error-message") if response.headers else None
+    )
+
+    # 2xx (success) and 3xx (redirect — common for HF's canonical-name
+    # redirects and the resolve-cache redirect). Either way, the repo is
+    # at this source and we want to serve.
+    if 200 <= response.status_code < 400:
+        return FallbackDecision.BIND_AND_RESPOND
+
+    # X-Error-Code wins over status, mirroring hf_hub. EntryNotFound and
+    # RevisionNotFound are *positive* signals that the repo is at this
+    # source — only the entry/revision is missing — so we bind and
+    # forward the 404 verbatim. Continuing to the next source here is
+    # exactly the cross-source mixing bug #75 is fixing.
+    if error_code == "EntryNotFound":
+        return FallbackDecision.BIND_AND_PROPAGATE
+    if error_code == "RevisionNotFound":
+        return FallbackDecision.BIND_AND_PROPAGATE
+
+    # Disabled-repo: HF identifies this by an exact X-Error-Message
+    # string (no X-Error-Code is set), so we compare equality.
+    if error_message == _HF_DISABLED_MESSAGE:
+        return FallbackDecision.BIND_AND_PROPAGATE
+
+    # GatedRepo and RepoNotFound are *negative* signals from this
+    # source's perspective — try the next one. The aggregate layer
+    # preserves the GatedRepo category, so an all-gated chain still
+    # surfaces ``X-Error-Code: GatedRepo`` to the hf_hub client and
+    # raises ``GatedRepoError`` correctly.
+    if error_code == "GatedRepo":
+        return FallbackDecision.TRY_NEXT_SOURCE
+    if error_code == "RepoNotFound":
+        return FallbackDecision.TRY_NEXT_SOURCE
+
+    # No actionable X-Error-Code: fall back to status semantics. Bare
+    # 401 (HF anti-enum or just broken token), bare 403 (no GatedRepo
+    # marker), bare 404, 5xx, 4xx (other) all mean "this source can't
+    # serve" — TRY_NEXT_SOURCE.
+    return FallbackDecision.TRY_NEXT_SOURCE
 
 
 def strip_xet_response_headers(headers: dict) -> None:

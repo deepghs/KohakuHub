@@ -5,7 +5,9 @@ import pytest
 
 from kohakuhub.api.fallback.utils import (
     add_source_headers,
+    classify_upstream,
     extract_error_message,
+    FallbackDecision,
     is_client_error,
     is_not_found_error,
     is_server_error,
@@ -357,3 +359,209 @@ def test_build_aggregate_failure_response_empty_attempts_is_generic_502():
     resp = build_aggregate_failure_response([])
     assert resp.status_code == 502
     assert resp.headers.get("x-error-code") is None
+
+
+# ---------------------------------------------------------------------------
+# classify_upstream — the matrix from #75. Each row is a parametrized
+# case here, anchored to *real* HuggingFace responses captured
+# 2026-04-30 (status / X-Error-Code / X-Error-Message). The matrix
+# mirrors hf_raise_for_status' priority: X-Error-Code wins over
+# numeric status, then 2xx/3xx → BIND_AND_RESPOND, else
+# TRY_NEXT_SOURCE.
+# ---------------------------------------------------------------------------
+
+
+_MATRIX_CASES = [
+    # ---- BIND_AND_RESPOND (2xx / 3xx) ----
+    pytest.param(
+        200, {}, FallbackDecision.BIND_AND_RESPOND,
+        id="200-ok",
+    ),
+    pytest.param(
+        # HF redirects bert-base-uncased → google-bert/bert-base-uncased.
+        307, {"location": "/api/models/google-bert/bert-base-uncased"},
+        FallbackDecision.BIND_AND_RESPOND,
+        id="307-canonical-name-redirect",
+    ),
+    pytest.param(
+        # HF resolve-cache redirect on a known file.
+        307,
+        {
+            "location": "/api/resolve-cache/models/openai-community/gpt2/abc/config.json",
+            "x-linked-size": "1234",
+        },
+        FallbackDecision.BIND_AND_RESPOND,
+        id="307-resolve-cache-redirect-with-x-linked-size",
+    ),
+    pytest.param(
+        302, {"location": "https://elsewhere.example/x"},
+        FallbackDecision.BIND_AND_RESPOND,
+        id="302-generic-redirect",
+    ),
+    # ---- BIND_AND_PROPAGATE (X-Error-Code says repo IS here) ----
+    pytest.param(
+        404,
+        {"x-error-code": "EntryNotFound", "x-error-message": "Entry not found"},
+        FallbackDecision.BIND_AND_PROPAGATE,
+        id="404-EntryNotFound-file-missing-but-repo-here",
+    ),
+    pytest.param(
+        404,
+        {
+            "x-error-code": "RevisionNotFound",
+            "x-error-message": "Invalid rev id: refs",
+        },
+        FallbackDecision.BIND_AND_PROPAGATE,
+        id="404-RevisionNotFound-revision-missing-but-repo-here",
+    ),
+    pytest.param(
+        # HF emits the disabled marker via X-Error-Message *only* (no
+        # X-Error-Code is set on these responses); hf_hub matches on
+        # the exact string.
+        403,
+        {"x-error-message": "Access to this resource is disabled."},
+        FallbackDecision.BIND_AND_PROPAGATE,
+        id="disabled-repo-via-magic-x-error-message",
+    ),
+    pytest.param(
+        # X-Error-Code wins over status: same EntryNotFound on 410
+        # (Gone) should still bind and propagate.
+        410,
+        {"x-error-code": "EntryNotFound"},
+        FallbackDecision.BIND_AND_PROPAGATE,
+        id="410-EntryNotFound-still-binds",
+    ),
+    # ---- TRY_NEXT_SOURCE — explicit X-Error-Code says "not here" ----
+    pytest.param(
+        # Authed caller → HF returns 404 + RepoNotFound (not the anon
+        # anti-enum 401).
+        404,
+        {"x-error-code": "RepoNotFound", "x-error-message": "Repository not found"},
+        FallbackDecision.TRY_NEXT_SOURCE,
+        id="404-RepoNotFound-authed",
+    ),
+    pytest.param(
+        # Anon → HF returns 401 + GatedRepo on a gated repo's resolve URL.
+        401,
+        {
+            "x-error-code": "GatedRepo",
+            "x-error-message": "Access to model X is restricted...",
+        },
+        FallbackDecision.TRY_NEXT_SOURCE,
+        id="401-GatedRepo-anonymous",
+    ),
+    pytest.param(
+        # Authed-but-not-in-access-list → HF returns 403 + GatedRepo.
+        # Both 401 and 403 forms with GatedRepo header must classify
+        # the same way.
+        403,
+        {
+            "x-error-code": "GatedRepo",
+            "x-error-message": "...you are not in the authorized list...",
+        },
+        FallbackDecision.TRY_NEXT_SOURCE,
+        id="403-GatedRepo-authed-no-access",
+    ),
+    # ---- TRY_NEXT_SOURCE — bare statuses ----
+    pytest.param(
+        # HF anti-enum to anonymous callers asking about a missing
+        # repo. The exact message string matters — see hf_hub's
+        # `_http.py` "401 is misleading" branch.
+        401, {"x-error-message": "Invalid username or password."},
+        FallbackDecision.TRY_NEXT_SOURCE,
+        id="401-bare-anti-enum-anonymous",
+    ),
+    pytest.param(
+        # Real auth failure (token format invalid). hf_hub specifically
+        # excludes this string from its 401→RepoNotFound mapping.
+        401,
+        {"x-error-message": "Invalid credentials in Authorization header"},
+        FallbackDecision.TRY_NEXT_SOURCE,
+        id="401-bare-invalid-credentials",
+    ),
+    pytest.param(403, {}, FallbackDecision.TRY_NEXT_SOURCE, id="403-bare"),
+    pytest.param(404, {}, FallbackDecision.TRY_NEXT_SOURCE, id="404-bare"),
+    pytest.param(429, {}, FallbackDecision.TRY_NEXT_SOURCE, id="429-rate-limited"),
+    pytest.param(500, {}, FallbackDecision.TRY_NEXT_SOURCE, id="500-server-error"),
+    pytest.param(502, {}, FallbackDecision.TRY_NEXT_SOURCE, id="502-bad-gateway"),
+    pytest.param(
+        503, {}, FallbackDecision.TRY_NEXT_SOURCE, id="503-service-unavailable"
+    ),
+    pytest.param(
+        504, {}, FallbackDecision.TRY_NEXT_SOURCE, id="504-gateway-timeout"
+    ),
+]
+
+
+@pytest.mark.parametrize(("status", "headers", "expected"), _MATRIX_CASES)
+def test_classify_upstream_matrix(status, headers, expected):
+    """Every row of the #75 status-code matrix must classify exactly as
+    spelled out in the issue. Anchored to actual HuggingFace responses
+    captured by direct probe."""
+    request = httpx.Request("GET", "https://fallback.local/api/models/x/y")
+    response = httpx.Response(status, headers=headers, request=request)
+    assert classify_upstream(response) is expected
+
+
+def test_classify_upstream_timeout_exception_is_try_next_source():
+    """Transport-level timeout: no response to look at, so we move on
+    to the next source. The aggregate layer maps an all-timeout chain
+    to 502."""
+    assert (
+        classify_upstream(httpx.TimeoutException("read timed out"))
+        is FallbackDecision.TRY_NEXT_SOURCE
+    )
+
+
+def test_classify_upstream_connect_error_is_try_next_source():
+    """Same for any other transport failure (DNS, refused, reset)."""
+    assert (
+        classify_upstream(httpx.ConnectError("connection refused"))
+        is FallbackDecision.TRY_NEXT_SOURCE
+    )
+
+
+def test_classify_upstream_x_error_code_wins_over_status():
+    """The defining property: a 404 with EntryNotFound is
+    BIND_AND_PROPAGATE *because* of the header (not the status), while
+    a 404 with RepoNotFound is TRY_NEXT_SOURCE — same status, opposite
+    decision based purely on X-Error-Code. A bare 404 (no header)
+    defaults to TRY_NEXT_SOURCE."""
+    request = httpx.Request("GET", "https://fallback.local/x")
+    bind_propagate = classify_upstream(
+        httpx.Response(
+            404, headers={"x-error-code": "EntryNotFound"}, request=request
+        )
+    )
+    next_source = classify_upstream(
+        httpx.Response(
+            404, headers={"x-error-code": "RepoNotFound"}, request=request
+        )
+    )
+    bare = classify_upstream(httpx.Response(404, request=request))
+    assert bind_propagate is FallbackDecision.BIND_AND_PROPAGATE
+    assert next_source is FallbackDecision.TRY_NEXT_SOURCE
+    assert bare is FallbackDecision.TRY_NEXT_SOURCE
+
+
+def test_classify_upstream_disabled_message_must_match_exactly():
+    """hf_hub matches the disabled-repo X-Error-Message via *equality*
+    on the exact string. A near-miss (different casing or extra
+    whitespace) doesn't trigger DisabledRepoError on the client, so it
+    shouldn't trigger our BIND_AND_PROPAGATE either — keep the contract
+    aligned with hf_hub.
+    """
+    request = httpx.Request("GET", "https://fallback.local/x")
+    exact = httpx.Response(
+        403,
+        headers={"x-error-message": "Access to this resource is disabled."},
+        request=request,
+    )
+    near_miss = httpx.Response(
+        403,
+        headers={"x-error-message": "Access to this resource is DISABLED."},
+        request=request,
+    )
+    assert classify_upstream(exact) is FallbackDecision.BIND_AND_PROPAGATE
+    assert classify_upstream(near_miss) is FallbackDecision.TRY_NEXT_SOURCE
+
