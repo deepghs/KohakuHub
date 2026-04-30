@@ -19,7 +19,9 @@ declare module 'vue-router/auto-routes' {
    */
   export interface RouteNamedMap {
     '/': RouteRecordInfo<'/', '/', Record<never, never>, Record<never, never>>,
+    '/cache': RouteRecordInfo<'/cache', '/cache', Record<never, never>, Record<never, never>>,
     '/commits': RouteRecordInfo<'/commits', '/commits', Record<never, never>, Record<never, never>>,
+    '/credentials': RouteRecordInfo<'/credentials', '/credentials', Record<never, never>, Record<never, never>>,
     '/DatabaseViewer': RouteRecordInfo<'/DatabaseViewer', '/DatabaseViewer', Record<never, never>, Record<never, never>>,
     '/fallback-sources': RouteRecordInfo<'/fallback-sources', '/fallback-sources', Record<never, never>, Record<never, never>>,
     '/health': RouteRecordInfo<'/health', '/health', Record<never, never>, Record<never, never>>,
@@ -47,8 +49,16 @@ declare module 'vue-router/auto-routes' {
       routes: '/'
       views: never
     }
+    'src/pages/cache.vue': {
+      routes: '/cache'
+      views: never
+    }
     'src/pages/commits.vue': {
       routes: '/commits'
+      views: never
+    }
+    'src/pages/credentials.vue': {
+      routes: '/credentials'
       views: never
     }
     'src/pages/DatabaseViewer.vue': {
