@@ -371,6 +371,7 @@ async def test_list_routes_cover_trending_invalid_path_and_user_repo_error_paths
 ):
     client = _FakeClient()
     repo_row = SimpleNamespace(
+        id=42,
         full_id="alice/demo",
         namespace="alice",
         private=False,
@@ -381,6 +382,10 @@ async def test_list_routes_cover_trending_invalid_path_and_user_repo_error_paths
 
     monkeypatch.setattr(repo_info, "Repository", _FakeRepositoryModel)
     monkeypatch.setattr(repo_info, "UserOrganization", _FakeUserOrganizationModel)
+    # Force the LakeFS fallback path for these unit tests — the SQL aggregate
+    # itself is exercised by the integration tests and a dedicated unit test
+    # below.
+    monkeypatch.setattr(repo_info, "_latest_main_commits", lambda repo_ids: {})
     monkeypatch.setattr(repo_info, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(repo_info, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
     monkeypatch.setattr(
