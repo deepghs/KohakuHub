@@ -407,6 +407,26 @@ import asyncio
 from datetime import datetime as _dt
 
 
+# huggingface_hub re-exports ``ModelInfo`` / ``DatasetInfo`` / ``SpaceInfo``
+# at the top level only in newer releases. 0.20.3 (the oldest version in
+# our CI matrix) keeps them under ``huggingface_hub.hf_api`` only. Resolve
+# both shapes here so the tests work across the full matrix.
+try:
+    from huggingface_hub import ModelInfo as _ModelInfo  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover — exercised on huggingface_hub<0.21
+    from huggingface_hub.hf_api import ModelInfo as _ModelInfo
+
+try:
+    from huggingface_hub import DatasetInfo as _DatasetInfo  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    from huggingface_hub.hf_api import DatasetInfo as _DatasetInfo
+
+try:
+    from huggingface_hub import SpaceInfo as _SpaceInfo  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    from huggingface_hub.hf_api import SpaceInfo as _SpaceInfo
+
+
 async def test_huggingface_hub_list_models_parses_modelinfo_with_sha_and_last_modified(
     live_server_url, hf_api_token
 ):
@@ -423,7 +443,7 @@ async def test_huggingface_hub_list_models_parses_modelinfo_with_sha_and_last_mo
     - ``ModelInfo.created_at``, ``downloads``, ``likes``, ``private`` round
       trip as expected
     """
-    from huggingface_hub import HfApi, ModelInfo
+    from huggingface_hub import HfApi
 
     api = HfApi(endpoint=live_server_url, token=hf_api_token)
 
@@ -435,7 +455,7 @@ async def test_huggingface_hub_list_models_parses_modelinfo_with_sha_and_last_mo
     by_id = {m.id: m for m in models}
     demo = by_id.get("owner/demo-model")
     assert demo is not None, f"expected owner/demo-model in {list(by_id)}"
-    assert isinstance(demo, ModelInfo)
+    assert isinstance(demo, _ModelInfo)
 
     # The two fields the SQL aggregate populates.
     assert isinstance(demo.sha, str) and len(demo.sha) >= 40, (
@@ -463,7 +483,7 @@ async def test_huggingface_hub_list_datasets_parses_datasetinfo_with_sha_and_las
     Uses owner's token because owner created the seed's
     ``acme-labs/private-dataset`` (and is the org's admin), so the privacy
     filter still surfaces it."""
-    from huggingface_hub import HfApi, DatasetInfo
+    from huggingface_hub import HfApi
 
     api = HfApi(endpoint=live_server_url, token=hf_api_token)
     datasets = await asyncio.to_thread(
@@ -474,7 +494,7 @@ async def test_huggingface_hub_list_datasets_parses_datasetinfo_with_sha_and_las
     by_id = {d.id: d for d in datasets}
     private_ds = by_id.get("acme-labs/private-dataset")
     assert private_ds is not None
-    assert isinstance(private_ds, DatasetInfo)
+    assert isinstance(private_ds, _DatasetInfo)
     assert isinstance(private_ds.sha, str) and len(private_ds.sha) >= 40
     assert isinstance(private_ds.last_modified, _dt)
     assert private_ds.private is True
@@ -487,7 +507,7 @@ async def test_huggingface_hub_list_spaces_parses_spaceinfo(
     ``lastModified`` (the seed doesn't always plant a commit), the
     response must still parse without raising. The contract is ``sha``
     and ``last_modified`` may be ``None``, never malformed."""
-    from huggingface_hub import HfApi, SpaceInfo
+    from huggingface_hub import HfApi
 
     api = HfApi(endpoint=live_server_url, token=hf_api_token)
 
@@ -506,7 +526,7 @@ async def test_huggingface_hub_list_spaces_parses_spaceinfo(
     by_id = {s.id: s for s in spaces}
     space = by_id.get("owner/hf-list-space")
     assert space is not None
-    assert isinstance(space, SpaceInfo)
+    assert isinstance(space, _SpaceInfo)
     # Newly-created space may have no DB Commit yet → fallback to LakeFS,
     # which returns the initial dangling commit's sha. Either way, sha is
     # populated; last_modified may be None depending on LakeFS' handling
