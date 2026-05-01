@@ -349,3 +349,285 @@ async def test_with_user_fallback_re_raises_original_404_on_miss(monkeypatch):
         await handler(username="alice", request=_request("/api/users/alice/avatar"))
 
     assert exc.value.status_code == 404
+
+
+# ===========================================================================
+# X-Error-Code gating: local 404 with EntryNotFound / RevisionNotFound
+# means the local repo *exists*, only the entry/revision is missing.
+# Per the strict-consistency contract, the fallback chain must NOT run
+# in that case — a sibling source's same-named-but-different repo
+# would mix data from two distinct repos for one ``repo_id``.
+# Only RepoNotFound (or no X-Error-Code) triggers fallback.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_with_repo_fallback_skips_chain_on_local_EntryNotFound_response(monkeypatch):
+    """Local handler returns Response(404, X-Error-Code=EntryNotFound).
+    The fallback decorator must surface that response unchanged
+    instead of calling the chain."""
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("fallback chain must NOT run on local EntryNotFound")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_resolve", fail_if_called)
+
+    local_404 = Response(
+        status_code=404,
+        headers={
+            "X-Error-Code": "EntryNotFound",
+            "X-Error-Message": "Entry 'foo' not found in repository 'owner/demo'",
+        },
+    )
+
+    @fallback_decorators.with_repo_fallback("resolve")
+    async def handler(
+        repo_type, namespace, name, revision, path, request=None,
+        fallback: bool = True, user=None,
+    ):
+        return local_404
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        revision="main", path="foo",
+        request=_request("/owner/demo/resolve/main/foo"),
+    )
+    assert result is local_404
+    assert result.status_code == 404
+    assert result.headers["X-Error-Code"] == "EntryNotFound"
+
+
+@pytest.mark.asyncio
+async def test_with_repo_fallback_skips_chain_on_local_RevisionNotFound_response(monkeypatch):
+    """Same gating but for X-Error-Code=RevisionNotFound."""
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("fallback must NOT run on local RevisionNotFound")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_tree", fail_if_called)
+
+    local_404 = Response(
+        status_code=404,
+        headers={
+            "X-Error-Code": "RevisionNotFound",
+            "X-Error-Message": "Revision 'no-branch' not found in repository 'owner/demo'",
+        },
+    )
+
+    @fallback_decorators.with_repo_fallback("tree")
+    async def handler(
+        repo_type, namespace, name, revision, path="", request=None,
+        fallback: bool = True, user=None,
+    ):
+        return local_404
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        revision="no-branch",
+        request=_request("/api/models/owner/demo/tree/no-branch"),
+    )
+    assert result is local_404
+
+
+@pytest.mark.asyncio
+async def test_with_repo_fallback_skips_chain_on_local_EntryNotFound_HTTPException(monkeypatch):
+    """Same gating when the local handler raises
+    ``HTTPException(headers={"X-Error-Code": "EntryNotFound"})`` rather
+    than returning a Response. The decorator must re-raise the
+    HTTPException without consulting the fallback chain. The local
+    file-resolve handler in ``api/files.py:_get_file_metadata``
+    raises HTTPException(headers=...) on missing-file."""
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("fallback must NOT run on local EntryNotFound HTTPException")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_resolve", fail_if_called)
+
+    @fallback_decorators.with_repo_fallback("resolve")
+    async def handler(
+        repo_type, namespace, name, revision, path, request=None,
+        fallback: bool = True, user=None,
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "Entry 'foo' not found"},
+            headers={
+                "X-Error-Code": "EntryNotFound",
+                "X-Error-Message": "Entry 'foo' not found in repository 'owner/demo'",
+            },
+        )
+
+    with pytest.raises(HTTPException) as exc:
+        await handler(
+            repo_type="model", namespace="owner", name="demo",
+            revision="main", path="foo",
+            request=_request("/owner/demo/resolve/main/foo"),
+        )
+    assert exc.value.status_code == 404
+    assert (exc.value.headers or {}).get("X-Error-Code") == "EntryNotFound"
+
+
+@pytest.mark.asyncio
+async def test_with_repo_fallback_still_triggers_on_RepoNotFound(monkeypatch):
+    """Regression guard: when the local handler signals
+    ``X-Error-Code: RepoNotFound`` (or no X-Error-Code at all), the
+    fallback chain MUST still run — otherwise we'd lose the entire
+    "fall through to upstream when the local repo is missing"
+    behavior the system is built around."""
+
+    fallback_calls: list[tuple] = []
+
+    async def stub_resolve(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        return Response(status_code=200, content=b"from-fallback")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_resolve", stub_resolve)
+    monkeypatch.setattr(fallback_decorators, "get_merged_external_tokens", lambda u, h: {})
+
+    @fallback_decorators.with_repo_fallback("resolve")
+    async def handler(
+        repo_type, namespace, name, revision, path, request=None,
+        fallback: bool = True, user=None,
+    ):
+        return Response(
+            status_code=404,
+            headers={
+                "X-Error-Code": "RepoNotFound",
+                "X-Error-Message": "Repository 'owner/demo' not found",
+            },
+        )
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        revision="main", path="foo",
+        request=_request("/owner/demo/resolve/main/foo"),
+    )
+    # Fallback MUST have been called for RepoNotFound.
+    assert len(fallback_calls) == 1
+    assert result.body == b"from-fallback"
+
+
+@pytest.mark.asyncio
+async def test_with_repo_fallback_still_triggers_on_HTTPException_without_xerror(monkeypatch):
+    """Defensive: a raw HTTPException(404) with no headers (or no
+    ``X-Error-Code``) is treated as ``RepoNotFound`` semantics —
+    fallback is triggered. This preserves back-compat for any local
+    handler that doesn't (yet) attach the HF-compatible header set."""
+
+    fallback_calls: list[tuple] = []
+
+    async def stub_resolve(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        return Response(status_code=200, content=b"from-fallback")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_resolve", stub_resolve)
+    monkeypatch.setattr(fallback_decorators, "get_merged_external_tokens", lambda u, h: {})
+
+    @fallback_decorators.with_repo_fallback("resolve")
+    async def handler(
+        repo_type, namespace, name, revision, path, request=None,
+        fallback: bool = True, user=None,
+    ):
+        raise HTTPException(status_code=404, detail="No headers attached")
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        revision="main", path="foo",
+        request=_request("/owner/demo/resolve/main/foo"),
+    )
+    assert len(fallback_calls) == 1
+    assert result.body == b"from-fallback"
+
+
+# ===========================================================================
+# with_user_fallback: namespace-existence gating
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_with_user_fallback_local_user_short_circuits_fallback(monkeypatch):
+    """If the local DB has a user with the requested username, the
+    decorator does NOT call the fallback chain — the local handler
+    is authoritative for every feature of that user (profile,
+    avatar, repos), even when the local handler returns a 404
+    (e.g., user has no avatar uploaded). Otherwise we'd silently
+    pull a same-named HF user's avatar into our user's profile —
+    a different person."""
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("fallback must NOT run when local user exists")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_user_avatar", fail_if_called)
+
+    # Mock get_user_by_username / get_organization to simulate a
+    # local user named 'alice'.
+    monkeypatch.setattr(
+        fallback_decorators, "get_user_by_username",
+        lambda name: SimpleNamespace(id=1, username=name) if name == "alice" else None,
+    )
+    monkeypatch.setattr(
+        fallback_decorators, "get_organization", lambda name: None,
+    )
+
+    @fallback_decorators.with_user_fallback("avatar")
+    async def handler(username, request=None, fallback: bool = True):
+        # Local handler "no avatar uploaded" — 404 from local.
+        raise HTTPException(status_code=404, detail="No avatar set")
+
+    with pytest.raises(HTTPException) as exc:
+        await handler(username="alice", request=_request("/api/users/alice/avatar"))
+    assert exc.value.status_code == 404
+    assert "No avatar set" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_with_user_fallback_local_org_short_circuits_fallback(monkeypatch):
+    """Same rule but for organizations."""
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("fallback must NOT run when local org exists")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_org_avatar", fail_if_called)
+
+    monkeypatch.setattr(
+        fallback_decorators, "get_user_by_username", lambda name: None,
+    )
+    monkeypatch.setattr(
+        fallback_decorators, "get_organization",
+        lambda name: SimpleNamespace(id=2, username=name) if name == "acme" else None,
+    )
+
+    @fallback_decorators.with_user_fallback("avatar")
+    async def handler(org_name, request=None, fallback: bool = True):
+        raise HTTPException(status_code=404, detail="No org avatar set")
+
+    with pytest.raises(HTTPException) as exc:
+        await handler(org_name="acme", request=_request("/api/organizations/acme/avatar"))
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_with_user_fallback_unknown_local_namespace_falls_through(monkeypatch):
+    """Regression guard for ``with_user_fallback``: if neither user
+    nor org exists locally, the chain MUST still run. The user/org
+    namespace doesn't exist in this khub, so an upstream lookup is
+    the right action."""
+
+    fallback_calls: list[tuple] = []
+
+    async def stub_profile(*args, **kwargs):
+        fallback_calls.append((args, kwargs))
+        return {"username": "nobody", "_source": "HF"}
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_user_profile", stub_profile)
+    monkeypatch.setattr(fallback_decorators, "get_merged_external_tokens", lambda u, h: {})
+    monkeypatch.setattr(fallback_decorators, "get_user_by_username", lambda name: None)
+    monkeypatch.setattr(fallback_decorators, "get_organization", lambda name: None)
+
+    @fallback_decorators.with_user_fallback("profile")
+    async def handler(username, request=None, fallback: bool = True):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    result = await handler(username="nobody", request=_request("/api/users/nobody/profile"))
+    assert len(fallback_calls) == 1
+    assert result["_source"] == "HF"

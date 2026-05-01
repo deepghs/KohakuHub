@@ -10,7 +10,11 @@ from fastapi.responses import Response
 
 from kohakuhub.config import cfg
 from kohakuhub.logger import get_logger
-from kohakuhub.db_operations import get_merged_external_tokens
+from kohakuhub.db_operations import (
+    get_merged_external_tokens,
+    get_organization,
+    get_user_by_username,
+)
 from kohakuhub.api.fallback.config import get_enabled_sources
 from kohakuhub.api.fallback.operations import (
     fetch_external_list,
@@ -137,10 +141,35 @@ def with_repo_fallback(operation: OperationType):
                     isinstance(local_result, Response)
                     and getattr(local_result, "status_code", 200) == 404
                 ):
+                    # Gate the fallback trigger on the local response's
+                    # ``X-Error-Code``: ``EntryNotFound`` and
+                    # ``RevisionNotFound`` mean the local repo *exists*
+                    # — only the entry/revision is missing — and the
+                    # right answer per the strict-consistency contract
+                    # is the local response itself, NOT a sibling
+                    # source's same-named-but-different repo.
+                    #
+                    # Only ``RepoNotFound`` (repo absent locally) or
+                    # an absent X-Error-Code (raw 404 from a non-HF-
+                    # compliant local route) triggers the fallback
+                    # chain. See PR #77 manual verification, Section D.
+                    local_error_code = local_result.headers.get(
+                        "x-error-code"
+                    )
+                    if local_error_code in ("EntryNotFound", "RevisionNotFound"):
+                        logger.debug(
+                            f"Local 404 with X-Error-Code={local_error_code} "
+                            f"for {repo_type}/{namespace}/{name} — local repo "
+                            f"exists, returning local response unchanged "
+                            f"(no fallback)"
+                        )
+                        return local_result
                     is_404 = True
                     original_response = local_result
                     logger.info(
-                        f"Local 404 response for {repo_type}/{namespace}/{name}, trying fallback sources..."
+                        f"Local 404 response for {repo_type}/{namespace}/{name} "
+                        f"(X-Error-Code={local_error_code or 'none'}), trying "
+                        f"fallback sources..."
                     )
                 else:
                     return local_result
@@ -150,10 +179,32 @@ def with_repo_fallback(operation: OperationType):
                 if e.status_code != 404:
                     raise
 
+                # Same X-Error-Code gating as the Response branch
+                # above — local handlers in this codebase
+                # (notably ``_get_file_metadata`` in api/files.py)
+                # *do* attach ``X-Error-Code`` to the
+                # ``HTTPException(headers=...)``; we read it back
+                # via ``e.headers`` and apply the same rule:
+                # EntryNotFound / RevisionNotFound → local repo
+                # exists, do not fall through to a sibling source.
+                local_error_code = (e.headers or {}).get("X-Error-Code") or (
+                    e.headers or {}
+                ).get("x-error-code")
+                if local_error_code in ("EntryNotFound", "RevisionNotFound"):
+                    logger.debug(
+                        f"Local 404 HTTPException with "
+                        f"X-Error-Code={local_error_code} for "
+                        f"{repo_type}/{namespace}/{name} — local repo "
+                        f"exists, re-raising local error (no fallback)"
+                    )
+                    raise
+
                 is_404 = True
                 original_error = e
                 logger.info(
-                    f"Local 404 exception for {repo_type}/{namespace}/{name}, trying fallback sources..."
+                    f"Local 404 HTTPException for {repo_type}/{namespace}/{name} "
+                    f"(X-Error-Code={local_error_code or 'none'}), trying "
+                    f"fallback sources..."
                 )
 
             # If we got here, we have a 404 - try fallback
@@ -457,6 +508,31 @@ def with_user_fallback(operation: UserOperationType):
             username = kwargs.get("username") or kwargs.get("org_name")
 
             if not username:
+                return await func(*args, **kwargs)
+
+            # Strict-consistency rule for the user/org family
+            # (parallel to the X-Error-Code gating in
+            # ``with_repo_fallback``): if the namespace exists locally
+            # — as either a user or an organization — this khub
+            # instance owns it. Every feature of that namespace
+            # (profile, avatar, repos, etc.) is answered locally,
+            # regardless of whether the specific feature returns a
+            # 200 or a 404 (e.g. user has no avatar uploaded).
+            #
+            # Without this, a local user with no avatar would fall
+            # through to a *same-named* HF user's avatar — pulling
+            # an unrelated person's image into our user's profile.
+            # Since the user/org local handlers raise raw
+            # HTTPException(404) and don't carry a discriminating
+            # X-Error-Code, the cleanest gate is a DB existence
+            # check up front.
+            local_user = get_user_by_username(username)
+            local_org = get_organization(username)
+            if local_user is not None or local_org is not None:
+                logger.debug(
+                    f"Namespace {username!r} exists locally — local handler "
+                    f"is authoritative for {operation!r}, no fallback"
+                )
                 return await func(*args, **kwargs)
 
             is_404 = False
