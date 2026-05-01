@@ -2019,10 +2019,162 @@ async def test_resolve_cache_hit_restricts_to_bound_source(monkeypatch):
     assert not cache.invalidate_calls  # cache stayed authoritative
 
 
+class YieldingFakeFallbackClient(FakeFallbackClient):
+    """Variant that inserts an explicit ``asyncio.sleep(0)`` before
+    each dispatch so concurrent coroutines actually interleave under
+    ``asyncio.gather``. Without this, ``FakeFallbackClient`` never
+    yields control (queue.pop is sync), so a coroutine that enters
+    ``async with binding_lock:`` runs the entire chain to completion
+    before any other coroutine gets the chance to enter the cache
+    check — meaning the post-lock cache-recheck branch in
+    ``_run_cached_then_chain`` is never exercised."""
+
+    async def _dispatch(self, method: str, path: str, **kwargs):
+        import asyncio as _asyncio
+        await _asyncio.sleep(0)
+        return await super()._dispatch(method, path, **kwargs)
+
+
 @pytest.mark.asyncio
-async def test_resolve_cache_stale_invalidates_and_falls_through(monkeypatch):
-    """#75: cached source no longer binds → invalidate + full chain
-    skipping the cached one."""
+async def test_concurrent_first_binders_serialize_on_lock_post_cache_recheck(monkeypatch):
+    """Strict-consistency rule #2: when two coroutines both miss the
+    cache for the same repo at the same time, they must serialize on
+    the binding lock. The first acquires, scans the chain, binds. The
+    second waits; on acquire it re-checks the cache, finds the
+    binding, and reuses it (this is the post-lock cache-recheck
+    branch in ``_run_cached_then_chain``).
+
+    Without the lock, both would scan the chain in parallel and the
+    upstream would see the chain probe twice. We assert this by
+    counting per-source HEAD/GET calls across both coroutines and
+    asserting that the first source (which TRY_NEXT_SOURCEs) was
+    contacted EXACTLY ONCE — only by the binder; the post-lock
+    waiter went directly to the bound source via the cache."""
+    fallback_ops._reset_binding_locks_for_tests()
+    # Real RepoSourceCache so cache.set() actually persists for the
+    # post-lock cache.get() in the waiter coroutine. DummyCache is a
+    # spy that doesn't store, so it can't drive the post-lock-recheck
+    # branch.
+    from kohakuhub.api.fallback.cache import RepoSourceCache
+    cache = RepoSourceCache(ttl_seconds=60)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    # Use the yielding variant so the binder coroutine yields control
+    # between cache-miss and cache-set, giving the other coroutine
+    # the chance to be queued at the lock when cache.set fires.
+    monkeypatch.setattr(fallback_ops, "FallbackClient", YieldingFakeFallbackClient)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+
+    info_path = "/api/models/owner/concurrent"
+    # Source A (priority 1): RepoNotFound → TRY_NEXT — the binder
+    # must touch this once. The post-lock waiter must NOT touch it.
+    FakeFallbackClient.queue(
+        "https://a.local", "GET", info_path,
+        _content_response(404, b"", headers={"x-error-code": "RepoNotFound"}),
+    )
+    # Source B (priority 2): 200 — pass both responses in one queue()
+    # call (queue() *overwrites* the registry per call).
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", info_path,
+        _json_response(200, {"id": "owner/concurrent"}),
+        _json_response(200, {"id": "owner/concurrent"}),
+    )
+
+    # Drive two coroutines concurrently. They share the same event
+    # loop and the same cache instance.
+    async def _one():
+        return await fallback_ops.try_fallback_info("model", "owner", "concurrent")
+
+    import asyncio as _asyncio
+    results = await _asyncio.gather(_one(), _one())
+    for r in results:
+        assert isinstance(r, dict)
+        assert r["_source"] == "B"
+
+    # Critical: source A was contacted EXACTLY ONCE (by the binder).
+    # If the lock were missing, both coroutines would have scanned
+    # the chain and we'd see TWO contacts to A.
+    a_calls = [c for c in FakeFallbackClient.calls if c[0] == "https://a.local"]
+    b_calls = [c for c in FakeFallbackClient.calls if c[0] == "https://b.local"]
+    assert len(a_calls) == 1, f"source A contacted {len(a_calls)}× (expected 1)"
+    assert len(b_calls) == 2, f"source B contacted {len(b_calls)}× (expected 2)"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_post_lock_recheck_bound_source_failure_returns_aggregate(monkeypatch):
+    """Companion of the above: when the post-lock waiter re-checks the
+    cache and finds a binding, but the bound source's response NOW
+    classifies as TRY_NEXT_SOURCE (e.g., transient failure), the
+    waiter returns the aggregate-of-one-attempt error per the
+    strict-consistency rule (no rebind).
+
+    This drives the post-lock recheck → bound-source-fails branch in
+    ``_run_cached_then_chain`` (the lines that were otherwise only
+    covered by the live-server test, which pytest-cov can't see)."""
+    fallback_ops._reset_binding_locks_for_tests()
+    from kohakuhub.api.fallback.cache import RepoSourceCache
+    cache = RepoSourceCache(ttl_seconds=60)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(fallback_ops, "FallbackClient", YieldingFakeFallbackClient)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+
+    info_path = "/api/models/owner/concurrent2"
+    # Binder: A 503 → TRY_NEXT, B 200 → BIND.
+    FakeFallbackClient.queue("https://a.local", "GET", info_path, _content_response(503))
+    # B is queued with TWO responses in a single queue() call (queue
+    # *overwrites* per call): first response is the binder's 200; second
+    # is the waiter's 503 (post-lock recheck → bound-source-fails path).
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", info_path,
+        _json_response(200, {"id": "owner/concurrent2"}),
+        _content_response(503),
+    )
+
+    async def _coro():
+        return await fallback_ops.try_fallback_info("model", "owner", "concurrent2")
+
+    # No artificial delay — both coroutines race to the binding lock.
+    # With YieldingFakeFallbackClient inserting yields inside the
+    # binder's chain probe, the waiter is queued at the lock by the
+    # time the binder's cache.set fires; on lock acquire the waiter
+    # takes the post-lock cache-recheck branch (lines 187+) and its
+    # cached-source attempt fails, exercising the
+    # ``build_aggregate_failure_response`` return at lines 197-199.
+    import asyncio as _asyncio
+    binder_result, waiter_result = await _asyncio.gather(_coro(), _coro())
+
+    # Binder bound and got success.
+    assert isinstance(binder_result, dict)
+    assert binder_result["_source"] == "B"
+
+    # Waiter re-checked cache, found B, queried B, B failed → aggregate
+    # of one attempt (502 for 5xx-only category).
+    assert hasattr(waiter_result, "status_code")
+    assert waiter_result.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_resolve_cache_bound_source_failure_does_NOT_invalidate(monkeypatch):
+    """Strict-consistency policy (PR #77 follow-up): once cached, the
+    bound source's transient failure does NOT trigger a rebind to a
+    sibling source. The error is surfaced to the caller; cache is
+    preserved within TTL so client retries hit the same source. This
+    is the *opposite* of the old (#75-only) behavior, which would
+    invalidate + fall through to the next source — exactly the
+    cross-source mixing the strict-consistency rule prevents.
+
+    Source B is queued with a working response purely as a TRAP — if
+    the new policy is broken and we DO walk to B, the test would see
+    a 200 from B and fail the status assertion below. With the rule
+    enforced, B is never contacted."""
+    fallback_ops._reset_binding_locks_for_tests()
     cached_entry = {
         "source_url": "https://a.local",
         "source_name": "A",
@@ -2037,7 +2189,8 @@ async def test_resolve_cache_stale_invalidates_and_falls_through(monkeypatch):
         lambda namespace, user_tokens=None: _two_sources(),
     )
     path = "/models/owner/moved/resolve/main/config.json"
-    # A had it cached but no longer serves (404 + RepoNotFound).
+    # A is cached. A returns 404 + RepoNotFound on HEAD — TRY_NEXT_SOURCE
+    # under classifier rules.
     FakeFallbackClient.queue(
         "https://a.local",
         "HEAD",
@@ -2046,7 +2199,9 @@ async def test_resolve_cache_stale_invalidates_and_falls_through(monkeypatch):
             404, b"", headers={"x-error-code": "RepoNotFound"}
         ),
     )
-    # B picks it up.
+    # B is a TRAP. If the test fails (i.e. we incorrectly walk to B),
+    # the test will see 200 + X-Source=B and the status assertion
+    # below blows up.
     FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
     FakeFallbackClient.queue(
         "https://b.local", "GET", path, _content_response(200, b"served-by-b")
@@ -2055,10 +2210,16 @@ async def test_resolve_cache_stale_invalidates_and_falls_through(monkeypatch):
     response = await fallback_ops.try_fallback_resolve(
         "model", "owner", "moved", "main", "config.json"
     )
-    assert response.status_code == 200
-    assert response.headers["X-Source"] == "B"
-    # Stale-cache hook fired exactly once for this repo_id.
-    assert len(cache.invalidate_calls) == 1
+    # Bound source A's failure is surfaced as the aggregate-of-one-attempt.
+    # Aggregate priority: NOT_FOUND with X-Error-Code=RepoNotFound from
+    # the only attempt → 404 + RepoNotFound.
+    assert response.status_code == 404
+    assert response.headers.get("x-error-code") == "RepoNotFound"
+    # Source B was never contacted — the rebind didn't happen.
+    assert all(c[0] != "https://b.local" for c in FakeFallbackClient.calls)
+    # Cache was NOT invalidated — within TTL the binding survives so
+    # the next call from the same client retries against A.
+    assert not cache.invalidate_calls
 
 
 @pytest.mark.asyncio

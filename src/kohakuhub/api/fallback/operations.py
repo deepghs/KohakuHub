@@ -1,6 +1,7 @@
 """Fallback operations for different endpoint types."""
 
 import asyncio
+from collections import defaultdict
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -61,6 +62,41 @@ def _propagate_upstream_response(
 logger = get_logger("FALLBACK_OPS")
 
 
+# Per-loop, per-repo binding lock registry. Used to serialize
+# concurrent first-binding attempts for the same
+# ``(repo_type, namespace, name)`` so two cache-miss callers cannot
+# independently scan the chain and bind to different sources due to
+# per-source latency variation — that's the strict-consistency
+# property required by the user-facing guarantee "same auth + same
+# external state ⇒ same source".
+#
+# Why ``id(loop)`` is part of the key: ``asyncio.Lock`` instances
+# bind to the event loop that runs their first ``acquire()``. In
+# normal operation KohakuHub has exactly one loop (uvicorn's), so
+# all locks live in the same loop slot — no overhead. In tests
+# however, the live-server fixture starts and stops uvicorn per
+# test, producing a fresh loop each time; reusing a Lock across
+# loops raises ``RuntimeError: bound to a different event loop``.
+# Keying by loop id keeps each loop's locks isolated and lets the
+# dict carry stale entries from torn-down loops without harm
+# (they're never looked up again). Tests can call
+# ``_reset_binding_locks_for_tests()`` to drop accumulated entries.
+_BINDING_LOCKS: defaultdict[
+    tuple[int, str, str, str], asyncio.Lock
+] = defaultdict(asyncio.Lock)
+
+
+def _binding_lock(repo_type: str, namespace: str, name: str) -> asyncio.Lock:
+    """Return the per-loop, per-repo binding lock."""
+    loop_id = id(asyncio.get_running_loop())
+    return _BINDING_LOCKS[(loop_id, repo_type, namespace, name)]
+
+
+def _reset_binding_locks_for_tests() -> None:
+    """Clear the binding-lock registry. Test-only hook."""
+    _BINDING_LOCKS.clear()
+
+
 async def _run_cached_then_chain(
     repo_type: str,
     namespace: str,
@@ -71,32 +107,44 @@ async def _run_cached_then_chain(
     attempt_fn,
     aggregate_scope: str,
 ):
-    """Orchestrate the cache-authoritative probe + full-chain fallback.
+    """Orchestrate cache-authoritative probe + first-binding under lock.
 
-    Used by ``try_fallback_info`` / ``try_fallback_tree`` /
-    ``try_fallback_paths_info`` (and indirectly by
-    ``try_fallback_resolve``, which inlines the same shape because it
-    has the additional HEAD/GET split). The shared logic is:
+    Strict-consistency rules (the user-facing guarantee for #77):
 
-    1. If the cache binds this ``repo_id`` to a known source, probe
-       that source *and only that source* on the first pass (within
-       TTL the cache is authoritative — see #75 on why a cache hit
-       previously degenerated to "reorder + still scan the chain").
-    2. On stale cache, invalidate and fall through to the full chain
-       skipping the already-tried cached source.
-    3. If every source falls through (TRY_NEXT_SOURCE), aggregate
-       attempts with the right ``scope`` so the final
-       ``X-Error-Code`` is RepoNotFound (repo-level ops) or
-       EntryNotFound (file-level ops).
+    1. **TTL-window stickiness.** Within the cache TTL window, every
+       call for a given ``(repo_type, namespace, name)`` is routed to
+       the same source. If that source's response classifies as
+       ``TRY_NEXT_SOURCE`` (5xx, transient auth, etc.), we surface the
+       error to the caller **without invalidating the cache**.
+       Rationale: invalidating + rebinding to a sibling source under
+       transient bound-source failure produces cross-source mixing
+       across calls — exactly the inconsistency #77 fixes. The client
+       can retry; retries within TTL hit the same source. (Operator
+       remediation: explicit ``cache.invalidate`` via the admin API
+       when rebinding is desired.)
 
-    The ``attempt_fn`` is op-specific: it does the request, calls
-    ``classify_upstream``, writes the cache on bind, and returns the
-    final response (Response / dict / list) on bind, ``None`` on
-    TRY_NEXT_SOURCE (the function is responsible for appending to
-    ``attempts`` in that case).
+    2. **Concurrent-binding lock.** When the cache misses and the
+       chain probe is needed, concurrent callers serialize on a
+       per-repo ``asyncio.Lock``. The first holder writes the cache;
+       subsequent holders re-check the cache after acquiring the lock
+       and use the now-bound source. Eliminates the race where two
+       concurrent first-binders can bind to different sources due to
+       per-source latency variation.
+
+    3. **Orphaned-cache invalidation only.** The single case that
+       *does* invalidate the cache is when the cached source URL is
+       no longer in the active ``sources`` list (admin removed it
+       from config). That isn't a transient failure — it's a
+       configuration change — and the only correct behavior is to
+       re-bind via the (new) chain.
+
+    4. **Deterministic chain order.** Sources are configured in a
+       priority-ordered list (``get_enabled_sources``); the chain
+       walks them in order and the first ``BIND_*`` outcome wins.
+       So under "same auth + same external state", even after TTL
+       expiry, the next chain probe binds the same source.
     """
     cached_entry = cache.get(repo_type, namespace, name)
-    cached_url: str | None = None
     if cached_entry and cached_entry.get("exists"):
         cached_url = cached_entry["source_url"]
         cached_source = next((s for s in sources if s["url"] == cached_url), None)
@@ -108,40 +156,72 @@ async def _run_cached_then_chain(
             result = await attempt_fn(cached_source)
             if result is not None:
                 return result
+            # Strict-consistency rule #1: bound source's TRY_NEXT
+            # response surfaces as the caller-visible error WITHOUT
+            # invalidating. Within TTL the bound source stays bound.
             logger.debug(
-                f"Cache stale: {cached_source['name']} no longer binds "
-                f"{repo_type}/{namespace}/{name}; invalidating + falling through"
+                f"Bound source {cached_source['name']} returned "
+                f"TRY_NEXT_SOURCE for {repo_type}/{namespace}/{name}; "
+                f"surfacing error without rebinding (TTL still in force)"
+            )
+            return build_aggregate_failure_response(
+                attempts, scope=aggregate_scope
+            )
+        else:
+            # Strict-consistency rule #3: orphaned cache (admin
+            # removed the source from config) must invalidate so the
+            # chain can find a new home for this repo_id.
+            logger.debug(
+                f"Cache hit on orphan source url={cached_url} "
+                f"(no longer in active config); invalidating + rebinding"
             )
             cache.invalidate(repo_type, namespace, name)
-        else:
-            cache.invalidate(repo_type, namespace, name)
-            cached_url = None
 
-    for source in sources:
-        if cached_url is not None and source["url"] == cached_url:
-            continue
-        result = await attempt_fn(source)
-        if result is not None:
-            return result
+    # Strict-consistency rule #2: concurrent-binding lock.
+    binding_lock = _binding_lock(repo_type, namespace, name)
+    async with binding_lock:
+        # Re-check the cache after lock acquisition: another waiter may
+        # have already bound this repo while we were queued. If they
+        # did, fall back to the cache-hit fast-path (which also applies
+        # the "bound-source failure does not invalidate" rule).
+        cached_entry = cache.get(repo_type, namespace, name)
+        if cached_entry and cached_entry.get("exists"):
+            cached_url = cached_entry["source_url"]
+            cached_source = next(
+                (s for s in sources if s["url"] == cached_url), None
+            )
+            if cached_source:
+                result = await attempt_fn(cached_source)
+                if result is not None:
+                    return result
+                return build_aggregate_failure_response(
+                    attempts, scope=aggregate_scope
+                )
+            # Concurrent waiter bound to a source we don't have in
+            # config — extremely rare (admin reconfig race between
+            # the binder's ``cache.set`` and the waiter's post-lock
+            # cache-recheck); treat as orphan and proceed to a
+            # fresh chain. Practically unreachable from a unit test
+            # because reproducing it requires an admin to remove a
+            # source from config in the asyncio yield window inside
+            # the binding lock.
+            cache.invalidate(repo_type, namespace, name)  # pragma: no cover
 
-    if not attempts:  # pragma: no cover
-        # Defensive: practically unreachable. Every attempt_fn call
-        # appends to ``attempts`` on TRY_NEXT_SOURCE, and the only
-        # way to skip every source in the loop is for ``cached_url``
-        # to equal every source.url — which can only happen when the
-        # cached source was already tried in the cached pass and that
-        # call also appended. Caller-side ``if not sources: return
-        # None`` covers the literal zero-source case. Kept as belt-
-        # and-braces against future refactors that move the order of
-        # the cache check vs. the attempt-append; cheaper than a bug
-        # that aggregates an empty list and produces a misleading
-        # 502.
-        return None
-    logger.debug(
-        f"Fallback MISS: aggregating {len(attempts)} source failure(s) "
-        f"for {repo_type}/{namespace}/{name}"
-    )
-    return build_aggregate_failure_response(attempts, scope=aggregate_scope)
+        # Fresh chain probe: deterministic priority order, first
+        # BIND wins.
+        for source in sources:
+            result = await attempt_fn(source)
+            if result is not None:
+                return result
+
+        if not attempts:  # pragma: no cover
+            # Defensive: caller already filtered out empty ``sources``.
+            return None
+        logger.debug(
+            f"Fallback MISS: aggregating {len(attempts)} source failure(s) "
+            f"for {repo_type}/{namespace}/{name}"
+        )
+        return build_aggregate_failure_response(attempts, scope=aggregate_scope)
 
 
 async def try_fallback_resolve(
