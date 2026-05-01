@@ -45,6 +45,7 @@ class FallbackDecision(enum.Enum):
 # vs "org access revoked") ride in the `message` field pulled from the
 # upstream body, because there is no portable way to distinguish them.
 CATEGORY_AUTH = "auth"  # HTTP 401 — authentication required
+CATEGORY_DISABLED = "disabled"  # X-Error-Message magic-string: HF moderation takedown
 CATEGORY_FORBIDDEN = "forbidden"  # HTTP 403 — explicit deny
 CATEGORY_NOT_FOUND = "not-found"  # HTTP 404 / 410
 CATEGORY_SERVER = "server"  # HTTP 5xx
@@ -227,19 +228,23 @@ def classify_upstream(response_or_exc) -> FallbackDecision:
     if error_code == "RevisionNotFound":
         return FallbackDecision.BIND_AND_PROPAGATE
 
-    # Disabled-repo: HF identifies this by an exact X-Error-Message
-    # string (no X-Error-Code is set), so we compare equality.
-    if error_message == _HF_DISABLED_MESSAGE:
-        return FallbackDecision.BIND_AND_PROPAGATE
-
-    # GatedRepo and RepoNotFound are *negative* signals from this
-    # source's perspective — try the next one. The aggregate layer
-    # preserves the GatedRepo category, so an all-gated chain still
-    # surfaces ``X-Error-Code: GatedRepo`` to the hf_hub client and
-    # raises ``GatedRepoError`` correctly.
+    # GatedRepo, RepoNotFound, and the "disabled" X-Error-Message
+    # marker are *negative* signals from THIS source's perspective —
+    # the source can't serve, but a different source's same-named repo
+    # might. Try the next one; the aggregate layer preserves the
+    # category, so an all-gated / all-disabled chain still surfaces
+    # the right ``X-Error-Code`` / ``X-Error-Message`` to the hf_hub
+    # client and raises ``GatedRepoError`` / ``DisabledRepoError``.
+    #
+    # Note ``disabled`` lives here, not under BIND_AND_PROPAGATE: a
+    # repo that HF disabled (moderation takedown) on one source might
+    # still be available on another KohakuHub mirror that wasn't
+    # asked to disable it. Same logic as gated.
     if error_code == "GatedRepo":
         return FallbackDecision.TRY_NEXT_SOURCE
     if error_code == "RepoNotFound":
+        return FallbackDecision.TRY_NEXT_SOURCE
+    if error_message == _HF_DISABLED_MESSAGE:
         return FallbackDecision.TRY_NEXT_SOURCE
 
     # No actionable X-Error-Code: fall back to status semantics. Bare
@@ -316,11 +321,17 @@ def _categorize_status(
       "Invalid credentials in Authorization header" → genuine auth
       failure). Accepted today for API stability; unused for now.
     """
-    del error_message  # reserved for a later refinement; keep in the signature
     if error_code == "GatedRepo":
         return CATEGORY_AUTH
     if error_code in ("RepoNotFound", "EntryNotFound", "RevisionNotFound"):
         return CATEGORY_NOT_FOUND
+    # Disabled-repo marker (HF moderation takedown). Detected via the
+    # exact X-Error-Message string ``hf_raise_for_status`` keys off.
+    # Has its own category so the aggregate can preserve the marker
+    # all the way back to the hf_hub client (which raises
+    # ``DisabledRepoError``).
+    if error_message == _HF_DISABLED_MESSAGE:
+        return CATEGORY_DISABLED
     if status == 401:
         # No GatedRepo code → HF is telling us the repo doesn't exist
         # (or at best is indistinguishable from missing to an
@@ -449,6 +460,16 @@ def build_aggregate_failure_response(
             "repository. Attach an access token for that source in "
             "KohakuHub account settings."
         )
+    elif CATEGORY_DISABLED in categories:
+        # HF moderation marker — every probed source either disabled
+        # this resource or fell through with a category that ranks
+        # below disabled. Re-emit the exact ``X-Error-Message`` that
+        # ``hf_raise_for_status`` keys off so the hf_hub client raises
+        # ``DisabledRepoError`` exactly as it would talking to HF
+        # directly.
+        status_code = 403
+        error_code = None  # disabled is signaled via X-Error-Message
+        detail = _HF_DISABLED_MESSAGE
     elif CATEGORY_FORBIDDEN in categories:
         status_code = 403
         error_code = None  # HF has no specific code for plain 403.

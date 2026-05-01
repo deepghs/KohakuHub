@@ -1903,10 +1903,13 @@ async def test_resolve_head_403_gated_repo_classifies_same_as_401(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_head_disabled_message_propagates(monkeypatch):
+async def test_resolve_head_disabled_message_falls_through(monkeypatch):
     """X-Error-Message: 'Access to this resource is disabled.' →
-    BIND_AND_PROPAGATE (the repo is here, just disabled). hf_hub
-    raises DisabledRepoError on this exact message."""
+    TRY_NEXT_SOURCE (matching GatedRepo semantics: this layer can't
+    serve, try next). The aggregate layer preserves the marker so an
+    all-disabled chain still raises DisabledRepoError on the hf_hub
+    client. Covered here: source A disabled, source B 200_ok →
+    download succeeds via B, no DisabledRepoError surfaces."""
     _setup_two_source_resolve(monkeypatch)
     path = "/models/owner/disabled/resolve/main/config.json"
     FakeFallbackClient.queue(
@@ -1919,14 +1922,47 @@ async def test_resolve_head_disabled_message_propagates(monkeypatch):
             headers={"x-error-message": "Access to this resource is disabled."},
         ),
     )
+    FakeFallbackClient.queue("https://b.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://b.local", "GET", path, _content_response(200, b"served-by-b")
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "disabled", "main", "config.json"
+    )
+    # Source B served — the disabled marker at A doesn't poison B.
+    assert response.status_code == 200
+    assert response.headers["X-Source"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_all_disabled_aggregate_preserves_disabled_marker(monkeypatch):
+    """All-disabled chain: aggregate must re-emit the disabled
+    X-Error-Message so a hf_hub client raises DisabledRepoError
+    end-to-end. Sister of the per-source-falls-through test above."""
+    _setup_two_source_resolve(monkeypatch)
+    path = "/models/owner/disabled/resolve/main/config.json"
+    disabled_headers = {
+        "x-error-message": "Access to this resource is disabled.",
+    }
+    FakeFallbackClient.queue(
+        "https://a.local", "HEAD", path,
+        _content_response(403, b"", headers=disabled_headers),
+    )
+    FakeFallbackClient.queue(
+        "https://b.local", "HEAD", path,
+        _content_response(403, b"", headers=disabled_headers),
+    )
 
     response = await fallback_ops.try_fallback_resolve(
         "model", "owner", "disabled", "main", "config.json"
     )
     assert response.status_code == 403
-    assert response.headers["x-error-message"] == "Access to this resource is disabled."
-    assert response.headers["X-Source"] == "A"
-    assert _b_was_not_called()
+    # Exact-string match — hf_hub's hf_raise_for_status keys off this.
+    assert (
+        response.headers.get("x-error-message")
+        == "Access to this resource is disabled."
+    )
 
 
 @pytest.mark.asyncio
@@ -2252,6 +2288,69 @@ async def test_resolve_get_generic_exception_after_head_bind_synthesizes_502(mon
     assert response is not None
     assert response.status_code == 502
     assert _b_was_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_head_redirect_backfills_x_repo_commit_when_original_307_lacks_it(monkeypatch):
+    """Updated x-repo-commit handling: HF's resolve-cache 307 always
+    carries ``x-repo-commit`` (PR#21 design). Non-HF mirrors might
+    not. When the original 307 has no x-repo-commit, the extra HEAD
+    that backfills Content-Length / ETag must also pull
+    ``x-repo-commit`` if present so hf_hub can read commit_hash on
+    the metadata side. Regression-guards the conditional we added
+    after pattern_A's existing-commit case revealed the override
+    bug."""
+    cache = DummyCache()
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://a.local", "name": "A", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/cfg.json"
+    # Original 307 has NO x-repo-commit (the case we want to drive).
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "HEAD",
+        path,
+        _content_response(
+            307,
+            b"",
+            headers={
+                "location": "/api/resolve-cache/owner/demo/abc/cfg.json",
+                "content-length": "278",
+                "etag": '"placeholder-redirect-etag"',
+            },
+            url="https://a.local/models/owner/demo/resolve/main/cfg.json",
+        ),
+    )
+
+    follow_stub = AbsoluteHeadStub()
+    # Follow_resp DOES carry x-repo-commit — backfill must take it.
+    follow_stub.queue(
+        httpx.Response(
+            200,
+            headers={
+                "content-length": "12345",
+                "etag": '"real-etag"',
+                "x-repo-commit": "from-follow-head",
+            },
+            request=httpx.Request("HEAD", "https://a.local/api/resolve-cache/owner/demo/abc/cfg.json"),
+        )
+    )
+    monkeypatch.setattr(httpx.AsyncClient, "head", follow_stub)
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "cfg.json", method="HEAD",
+    )
+    assert response.status_code == 307
+    # Backfilled from the follow HEAD.
+    assert response.headers.get("x-repo-commit") == "from-follow-head"
+    # Replace-keys also took effect.
+    assert response.headers.get("content-length") == "12345"
+    assert response.headers.get("etag") == '"real-etag"'
 
 
 @pytest.mark.asyncio

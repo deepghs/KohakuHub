@@ -152,12 +152,34 @@ class FallbackClient:
             response = await client.head(external_url, headers=headers, **kwargs)
             return response
 
-    async def post(self, kohaku_path: str, repo_type: str, **kwargs) -> httpx.Response:
+    async def post(
+        self,
+        kohaku_path: str,
+        repo_type: str,
+        follow_redirects: bool = True,
+        **kwargs,
+    ) -> httpx.Response:
         """Make POST request to external source with URL mapping.
+
+        ``follow_redirects`` defaults to ``True`` because HuggingFace
+        emits 307 redirects on POST routes that pre-date its
+        canonical-name normalization (notably ``/paths-info/``,
+        observed 2026-04-30 against ``bert-base-uncased``: HF returns
+        ``307`` with ``Location: /api/models/google-bert/bert-base-uncased/paths-info/main``
+        that the client is expected to follow as a POST). Without
+        following, the classifier sees the 307 — classifies it as
+        ``BIND_AND_RESPOND`` — and the caller's ``response.json()``
+        fails on the empty redirect body.
+
+        HTTP 307 preserves the request method per RFC 7231, so httpx
+        re-POSTs the body to the new Location.
 
         Args:
             kohaku_path: KohakuHub request path
             repo_type: "model", "dataset", or "space"
+            follow_redirects: Whether httpx should auto-follow 3xx
+                (default ``True`` — see above for the
+                paths-info-on-canonical-name case).
             **kwargs: Additional arguments passed to httpx.post()
 
         Returns:
@@ -176,5 +198,10 @@ class FallbackClient:
         logger.debug(f"POST {external_url}")
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(external_url, headers=headers, **kwargs)
+            response = await client.post(
+                external_url,
+                headers=headers,
+                follow_redirects=follow_redirects,
+                **kwargs,
+            )
             return response

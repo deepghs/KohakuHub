@@ -943,10 +943,13 @@ async def test_pattern_G_first_source_revision_not_found_raises_RevisionNotFound
 
 
 @pytest.mark.asyncio
-async def test_pattern_G_first_source_disabled_raises_DisabledRepoError(monkeypatch):
-    """X-Error-Message: 'Access to this resource is disabled.' (no
-    X-Error-Code) at the first source. hf_hub matches this exact
-    message in `hf_raise_for_status` and raises `DisabledRepoError`."""
+async def test_pattern_G_all_sources_disabled_aggregate_raises_DisabledRepoError(monkeypatch):
+    """X-Error-Message: 'Access to this resource is disabled.' is now
+    classified as TRY_NEXT_SOURCE (a moderation takedown on one
+    source doesn't bind the chain — sibling sources may still serve).
+    The aggregate layer preserves the marker so an *all-disabled*
+    chain re-emits the exact X-Error-Message and a hf_hub client
+    raises ``DisabledRepoError`` end-to-end."""
     try:
         DisabledRepoError = _hf_error("DisabledRepoError")
     except AttributeError:
@@ -966,30 +969,68 @@ async def test_pattern_G_first_source_disabled_raises_DisabledRepoError(monkeypa
         ],
     )
     path = f"{REPO_PREFIX}/config.json"
+    disabled_headers = {
+        "X-Error-Message": "Access to this resource is disabled.",
+    }
+    # BOTH sources disabled — neither binds, the aggregate has to
+    # carry the disabled marker.
     FakeFallbackClient.queue(
-        HF_ENDPOINT,
-        "HEAD",
-        path,
-        _content_response(
-            403,
-            content=b"",
-            headers={
-                "X-Error-Message": "Access to this resource is disabled.",
-            },
-            url=f"{HF_ENDPOINT}{path}",
-        ),
+        HF_ENDPOINT, "HEAD", path,
+        _content_response(403, content=b"", headers=disabled_headers,
+                         url=f"{HF_ENDPOINT}{path}"),
+    )
+    FakeFallbackClient.queue(
+        "https://mirror.local", "HEAD", path,
+        _content_response(403, content=b"", headers=disabled_headers,
+                         url=f"https://mirror.local{path}"),
     )
 
     resp = await fallback_ops.try_fallback_resolve(
         "model", "owner", "demo", "main", "config.json", method="HEAD",
     )
-    assert all(c[0] != "https://mirror.local" for c in FakeFallbackClient.calls)
 
     hx = _to_hf_response(resp, request_url=f"{KHUB_BASE}{path}")
     assert hx.status_code == 403
     assert hx.headers.get("x-error-message") == "Access to this resource is disabled."
     with pytest.raises(DisabledRepoError):
         hf_raise_for_status(hx)
+
+
+@pytest.mark.asyncio
+async def test_pattern_G_disabled_first_source_falls_through_to_serving_second(monkeypatch):
+    """Companion: source A disabled, source B serves. The chain must
+    *not* short-circuit on A's disabled marker — that would mean a
+    moderation takedown on one mirror prevents users from hitting
+    another mirror that still has the resource."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": HF_ENDPOINT, "name": "HF", "source_type": "huggingface"},
+            {"url": "https://mirror.local", "name": "Mirror", "source_type": "huggingface"},
+        ],
+    )
+    path = f"{REPO_PREFIX}/config.json"
+    FakeFallbackClient.queue(
+        HF_ENDPOINT, "HEAD", path,
+        _content_response(
+            403, content=b"",
+            headers={"X-Error-Message": "Access to this resource is disabled."},
+            url=f"{HF_ENDPOINT}{path}",
+        ),
+    )
+    FakeFallbackClient.queue(
+        "https://mirror.local", "HEAD", path,
+        _content_response(200, headers={"x-repo-commit": "abc"},
+                         url=f"https://mirror.local{path}"),
+    )
+
+    resp = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json", method="HEAD",
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("x-source") == "Mirror"
 
 
 @pytest.mark.asyncio

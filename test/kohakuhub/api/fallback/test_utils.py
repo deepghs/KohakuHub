@@ -417,10 +417,15 @@ _MATRIX_CASES = [
     pytest.param(
         # HF emits the disabled marker via X-Error-Message *only* (no
         # X-Error-Code is set on these responses); hf_hub matches on
-        # the exact string.
+        # the exact string. Routed to TRY_NEXT_SOURCE — a moderation
+        # takedown on one source doesn't mean a sibling source can't
+        # serve the same-named repo (different KohakuHub mirrors are
+        # under different moderation policies). The aggregate layer
+        # preserves the disabled marker so an all-disabled chain
+        # still raises DisabledRepoError on the hf_hub client.
         403,
         {"x-error-message": "Access to this resource is disabled."},
-        FallbackDecision.BIND_AND_PROPAGATE,
+        FallbackDecision.TRY_NEXT_SOURCE,
         id="disabled-repo-via-magic-x-error-message",
     ),
     pytest.param(
@@ -544,12 +549,15 @@ def test_classify_upstream_x_error_code_wins_over_status():
     assert bare is FallbackDecision.TRY_NEXT_SOURCE
 
 
-def test_classify_upstream_disabled_message_must_match_exactly():
+def test_classify_upstream_disabled_message_routes_to_try_next_source():
     """hf_hub matches the disabled-repo X-Error-Message via *equality*
-    on the exact string. A near-miss (different casing or extra
-    whitespace) doesn't trigger DisabledRepoError on the client, so it
-    shouldn't trigger our BIND_AND_PROPAGATE either — keep the contract
-    aligned with hf_hub.
+    on the exact string. We route it to TRY_NEXT_SOURCE (matching
+    GatedRepo semantics: this layer can't serve, try next). The
+    aggregate layer preserves the marker so an all-disabled chain
+    still raises DisabledRepoError on the hf_hub client. A
+    near-miss (different casing or extra whitespace) doesn't trigger
+    DisabledRepoError on hf_hub, so we don't carry a special category
+    for it either — it falls into the generic 403 forbidden bucket.
     """
     request = httpx.Request("GET", "https://fallback.local/x")
     exact = httpx.Response(
@@ -562,6 +570,65 @@ def test_classify_upstream_disabled_message_must_match_exactly():
         headers={"x-error-message": "Access to this resource is DISABLED."},
         request=request,
     )
-    assert classify_upstream(exact) is FallbackDecision.BIND_AND_PROPAGATE
+    # Both route to TRY_NEXT_SOURCE — but only ``exact`` carries the
+    # CATEGORY_DISABLED tag in the attempt aggregator; the near-miss
+    # falls into the generic 403/forbidden bucket. That distinction
+    # is exercised by the aggregator-side tests below.
+    assert classify_upstream(exact) is FallbackDecision.TRY_NEXT_SOURCE
     assert classify_upstream(near_miss) is FallbackDecision.TRY_NEXT_SOURCE
+
+
+def test_aggregate_preserves_disabled_marker_so_hf_hub_raises_DisabledRepoError():
+    """Companion of the classifier-routes-disabled-to-TRY_NEXT rule:
+    when every probed source falls through and at least one had the
+    disabled marker, the aggregate must re-emit
+    ``X-Error-Message: "Access to this resource is disabled."`` (the
+    exact string ``hf_raise_for_status`` keys off) so the hf_hub
+    client raises ``DisabledRepoError`` end-to-end."""
+    src = {"name": "S", "url": "https://s"}
+    disabled_attempt = build_fallback_attempt(
+        src,
+        response=_plain_response(
+            403,
+            headers={"X-Error-Message": "Access to this resource is disabled."},
+        ),
+    )
+    # Mix in a generic RepoNotFound to prove disabled wins over
+    # not-found in the aggregate priority.
+    not_found_attempt = build_fallback_attempt(
+        src,
+        response=_plain_response(404, headers={"X-Error-Code": "RepoNotFound"}),
+    )
+
+    resp = build_aggregate_failure_response([not_found_attempt, disabled_attempt])
+    assert resp.status_code == 403
+    # No X-Error-Code: hf_hub keys off X-Error-Message for disabled.
+    assert resp.headers.get("x-error-code") is None
+    assert (
+        resp.headers.get("x-error-message")
+        == "Access to this resource is disabled."
+    )
+
+
+def test_aggregate_disabled_loses_to_gated_repo():
+    """Priority order: AUTH (GatedRepo) > DISABLED. Rationale: a user
+    who hits a chain where one source is gated and another is
+    disabled has an actionable next step (attach a token for the
+    gated source) — that wins over the moderation-takedown signal,
+    which isn't directly resolvable by the user."""
+    src = {"name": "S", "url": "https://s"}
+    gated = build_fallback_attempt(
+        src,
+        response=_plain_response(401, headers={"X-Error-Code": "GatedRepo"}),
+    )
+    disabled = build_fallback_attempt(
+        src,
+        response=_plain_response(
+            403,
+            headers={"X-Error-Message": "Access to this resource is disabled."},
+        ),
+    )
+    resp = build_aggregate_failure_response([disabled, gated])
+    assert resp.status_code == 401
+    assert resp.headers.get("x-error-code") == "GatedRepo"
 

@@ -391,15 +391,33 @@ async def _build_resolve_head_response(
                     headers=extra_headers,
                     follow_redirects=False,
                 )
+            # ``content-length`` and ``etag`` always come from the
+            # follow_resp — the 307 itself only carries the redirect
+            # body length, which is wrong for the file. ``x-repo-commit``
+            # is *additive*: HF's resolve-cache 307 already carries
+            # the right value (PR #21 design) and the resolve-cache
+            # CDN HEAD response often does not include it, so we
+            # only backfill from the follow when the original 307
+            # didn't carry it. This keeps the existing PR #21 path
+            # working unchanged while supporting non-HF mirrors that
+            # emit x-repo-commit-less 307s on resolve.
+            replace_keys = ("content-length", "etag")
             for k in [
                 k
                 for k in list(resp_headers)
-                if k.lower() in ("content-length", "etag")
+                if k.lower() in replace_keys
             ]:
                 resp_headers.pop(k)
             for k, v in follow_resp.headers.items():
-                if k.lower() in ("content-length", "etag"):
+                if k.lower() in replace_keys:
                     resp_headers[k] = v
+            has_commit = any(
+                k.lower() == "x-repo-commit" for k in resp_headers
+            )
+            if not has_commit:
+                for k, v in follow_resp.headers.items():
+                    if k.lower() == "x-repo-commit":
+                        resp_headers[k] = v
         except httpx.HTTPError:
             # Extra HEAD failed — return what we have; no worse than
             # the original PR#21 behavior.
