@@ -290,6 +290,105 @@ async def _probe_one_source(
     )
 
 
+async def probe_full_chain(
+    op: ProbeOp,
+    repo_type: str,
+    namespace: str,
+    name: str,
+    sources: list[dict],
+    *,
+    revision: str = "main",
+    file_path: str = "",
+    paths: Optional[list[str]] = None,
+    user=None,
+    client_factory=None,
+) -> "ProbeReport":
+    """Local-first chain probe — the simulate endpoint's entry point (#78 v2).
+
+    Runs ``probe_local`` (which calls the real local handler via
+    ``__wrapped__``) to capture the local hop, then advances into the
+    fallback chain only when the local decision is ``LOCAL_MISS``. This
+    mirrors what ``with_repo_fallback`` does in production:
+
+    - ``LOCAL_HIT``: local owns the repo → final outcome is ``LOCAL_HIT``,
+      fallback chain is *not* walked.
+    - ``LOCAL_FILTERED``: local owns the repo, entry/revision missing →
+      final outcome is ``LOCAL_FILTERED``, fallback chain is *not* walked
+      (this is the strict-consistency rule from PR #75/#77).
+    - ``LOCAL_OTHER_ERROR``: local error (4xx/5xx that is not a 404) →
+      surfaces as the final outcome, fallback chain is *not* walked.
+    - ``LOCAL_MISS``: local doesn't have the repo → fallback chain runs
+      via ``probe_chain`` against the supplied sources.
+
+    The returned ``ProbeReport.attempts`` is the concatenation of the
+    local hop and any fallback hops that ran. ``final_outcome`` is the
+    binding outcome from whichever stage ended the probe.
+    """
+    # Local imported here to avoid a probe_local→core import cycle
+    # (probe_local itself imports ``ProbeAttempt`` and ``_build_kohaku_path``
+    # from this module).
+    from kohakuhub.api.fallback.probe_local import probe_local
+
+    overall_started = time.perf_counter()
+    local_attempt = await probe_local(
+        op,
+        repo_type,
+        namespace,
+        name,
+        revision=revision,
+        file_path=file_path,
+        paths=paths,
+        user=user,
+    )
+
+    # The local hop short-circuits the chain unless decision is MISS.
+    if local_attempt.decision != "LOCAL_MISS":
+        bound = (
+            {"name": "local", "url": "", "source_type": "local"}
+            if local_attempt.decision in ("LOCAL_HIT", "LOCAL_FILTERED")
+            else None
+        )
+        final_response = {
+            "status_code": local_attempt.status_code,
+            "headers": dict(local_attempt.response_headers or {}),
+            "body_preview": local_attempt.response_body_preview,
+        }
+        duration_ms = int((time.perf_counter() - overall_started) * 1000)
+        return ProbeReport(
+            op=op,
+            repo_id=f"{namespace}/{name}",
+            revision=revision if op != "info" else None,
+            file_path=file_path or None,
+            attempts=[local_attempt],
+            final_outcome=local_attempt.decision,
+            bound_source=bound,
+            duration_ms=duration_ms,
+            final_response=final_response,
+        )
+
+    # LOCAL_MISS → walk the fallback chain.
+    fallback_report = await probe_chain(
+        op,
+        repo_type,
+        namespace,
+        name,
+        sources,
+        revision=revision,
+        file_path=file_path,
+        paths=paths,
+        client_factory=client_factory,
+    )
+    duration_ms = int((time.perf_counter() - overall_started) * 1000)
+    fallback_report.attempts = [local_attempt, *fallback_report.attempts]
+    fallback_report.duration_ms = duration_ms
+    # ``final_outcome`` / ``bound_source`` / ``final_response`` come
+    # from the fallback chain unchanged: if the chain bound, those
+    # describe the bound source; if it exhausted, ``CHAIN_EXHAUSTED``
+    # (with ``final_response=None``) — the local hop having LOCAL_MISS
+    # is already represented in ``attempts[0]``.
+    return fallback_report
+
+
 async def probe_chain(
     op: ProbeOp,
     repo_type: str,

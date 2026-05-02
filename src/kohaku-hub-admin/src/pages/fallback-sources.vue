@@ -1,7 +1,8 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import AdminLayout from "@/components/AdminLayout.vue";
+import ProbeReportView from "@/components/ProbeReportView.vue";
 import { useAdminStore } from "@/stores/admin";
 import {
   listFallbackSources,
@@ -16,6 +17,7 @@ import {
   listUsers,
   listRepositories,
   bulkReplaceFallbackSources,
+  runFallbackChainSimulate,
   runFallbackProbe,
 } from "@/utils/api";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -543,17 +545,6 @@ const PROBE_OPS = PROBE_OP_OPTIONS.map((o) => o.value);
 const REPO_TYPES = ["model", "dataset", "space"];
 const SOURCE_TYPES = ["huggingface", "kohakuhub"];
 
-// Probe target / op selector.
-const probeForm = ref({
-  op: "info",
-  repo_type: "model",
-  namespace: "",
-  name: "",
-  revision: "main",
-  file_path: "",
-  paths_csv: "", // comma-separated; parsed to a list before submit
-});
-
 // System-state draft. Independent from ``sources`` (the live config).
 // Edits accumulate; only ``pushDraftToSystem`` propagates them back.
 const draftSources = ref([]);
@@ -659,92 +650,191 @@ async function pushDraftToSystem() {
   }
 }
 
-// User-state — Authorization header builder.
+// Tab selector for the two probe modes.
 //
-// The chain tester sends a real production request from the browser
-// (axios → KohakuHub → fallback chain) and reads ``X-Chain-Trace`` off
-// the response, so the only "user state" knob it needs is what
-// Authorization header to attach. Two pieces:
-//
-// - ``khubToken``: the personal-access-token portion (the ``Bearer xxx``
-//   prefix). Empty ⇒ anonymous from KohakuHub's perspective.
-// - ``headerTokens``: per-URL fallback-source tokens, encoded into the
-//   ``|<url>,<token>|...`` segments after the bearer token. Mirrors
-//   the production parser at ``api/auth/external_token_parser.py``.
-//
-// Combined into one ``Authorization`` header string — see
-// ``_buildAuthorizationHeader``. Empty everywhere ⇒ no header sent.
-const khubToken = ref("");
-const headerTokens = ref([]);
+// - ``simulate`` (Frame 1): probes a *draft* source list against an
+//   impersonated identity via the ``/admin/api/fallback/test/simulate``
+//   endpoint. Pure read — never touches the production cache or the
+//   live fallback config. The right place to test "what would happen
+//   if I added source X for user Y".
+// - ``real`` (Frame 2): sends a real production request from the
+//   browser to this KohakuHub instance, with the operator's *own*
+//   credentials (admin can't fake another user's token), and reads
+//   the chain off ``X-Chain-Trace`` on the response. The right place
+//   to verify "live config is actually working as expected" — what
+//   simulate can't tell you.
+const probeTab = ref("simulate");
 
-function addHeaderToken() {
-  headerTokens.value.push({ url: "", token: "" });
-}
-function removeHeaderToken(index) {
-  headerTokens.value.splice(index, 1);
-}
+// Probe target shared by both frames — the operator typically tests
+// the same (op, repo) on draft vs live to compare outcomes, so making
+// the target form sticky across tabs is the right default.
+const probeForm = ref({
+  op: "info",
+  repo_type: "model",
+  namespace: "",
+  name: "",
+  revision: "main",
+  file_path: "",
+  paths_csv: "", // comma-separated; parsed to a list before submit
+});
 
-function _buildAuthorizationHeader() {
-  const segments = [];
-  for (const row of headerTokens.value) {
-    if (row.url && row.token) {
-      // ``url,token`` entries inside ``|...|`` are the wire shape parsed
-      // by ``parse_external_tokens`` on the backend.
-      segments.push(`${row.url},${row.token}`);
-    }
+// =====================================================================
+// Frame 1: Draft simulate
+// =====================================================================
+//
+// Left (system state): the ``draftSources`` list + its load / push /
+// discard controls (already defined above).
+// Right (user state): which identity to impersonate + per-URL token
+// overlay. Impersonation is only meaningful in simulate mode — admin
+// doesn't bear other users' khub credentials, so for the real-probe
+// frame we drop it and use the operator's own auth instead.
+
+const simIdentity = ref({
+  mode: "anonymous", // "anonymous" | "username" | "user_id"
+  username: "",
+  user_id: null,
+});
+const simHeaderTokens = ref([]);
+
+function addSimHeaderToken() {
+  simHeaderTokens.value.push({ url: "", token: "" });
+}
+function removeSimHeaderToken(index) {
+  simHeaderTokens.value.splice(index, 1);
+}
+function _simHeaderTokensToObj() {
+  const out = {};
+  for (const row of simHeaderTokens.value) {
+    if (row.url && row.token) out[row.url] = row.token;
   }
-  const t = (khubToken.value || "").trim();
-  if (!t && segments.length === 0) return null;
-  // Construct the full header. If only external tokens are supplied
-  // we still need the ``Bearer `` prefix so the auth middleware
-  // doesn't reject the shape; the empty bearer slot is parsed as
-  // "anonymous khub identity, but consult external tokens".
-  return `Bearer ${t}${segments.length > 0 ? "|" + segments.join("|") : ""}`;
+  return out;
 }
 
-// Probe runner.
-const probeRunning = ref(false);
-const probeReport = ref(null);
-const probeError = ref(null);
+const simRunning = ref(false);
+const simReport = ref(null);
+const simError = ref(null);
 
-function _validateProbeTarget() {
-  if (!probeForm.value.namespace || !probeForm.value.name) {
+function _validateProbeTargetForm(form) {
+  if (!form.namespace || !form.name) {
     ElMessage.error("namespace and name are required for the probe target");
     return false;
   }
   return true;
 }
 
-async function runRealRequest() {
+function _parsePathsCsv(form) {
+  return form.op === "paths_info" && form.paths_csv
+    ? form.paths_csv
+        .split(",")
+        .map((p) => p.trim())
+        .filter(Boolean)
+    : null;
+}
+
+async function runSimulate() {
   if (!checkAuth()) return;
-  if (!_validateProbeTarget()) return;
-  probeRunning.value = true;
-  probeError.value = null;
+  if (!_validateProbeTargetForm(probeForm.value)) return;
+  simRunning.value = true;
+  simError.value = null;
   try {
-    const paths =
-      probeForm.value.op === "paths_info" && probeForm.value.paths_csv
-        ? probeForm.value.paths_csv
-            .split(",")
-            .map((p) => p.trim())
-            .filter(Boolean)
-        : null;
-    probeReport.value = await runFallbackProbe({
+    const payload = {
       op: probeForm.value.op,
       repo_type: probeForm.value.repo_type,
       namespace: probeForm.value.namespace,
       name: probeForm.value.name,
       revision: probeForm.value.revision || "main",
       file_path: probeForm.value.file_path || "",
-      paths,
-      authorization: _buildAuthorizationHeader(),
+      paths: _parsePathsCsv(probeForm.value),
+      sources: draftSources.value.map((s) => ({
+        name: s.name || s.url,
+        url: s.url,
+        source_type: s.source_type,
+        token: s.token || null,
+        priority: Number(s.priority) || 100,
+      })),
+      header_tokens: _simHeaderTokensToObj(),
+    };
+    if (simIdentity.value.mode === "username" && simIdentity.value.username) {
+      payload.as_username = simIdentity.value.username.trim();
+    } else if (
+      simIdentity.value.mode === "user_id" &&
+      simIdentity.value.user_id != null &&
+      Number(simIdentity.value.user_id) > 0
+    ) {
+      payload.as_user_id = Number(simIdentity.value.user_id);
+    }
+    simReport.value = await runFallbackChainSimulate(adminStore.token, payload);
+  } catch (error) {
+    console.error("simulate probe failed:", error);
+    simError.value =
+      error.response?.data?.detail?.error || error.message || "Simulate failed";
+    simReport.value = null;
+  } finally {
+    simRunning.value = false;
+  }
+}
+
+// =====================================================================
+// Frame 2: Live real probe
+// =====================================================================
+//
+// Left (system state): read-only summary of the *currently-applied*
+// fallback source list (the same ``sources`` ref the live management
+// table renders).
+// Right (user state): admin's own KohakuHub access token + per-URL
+// fallback-source tokens, combined into a single ``Authorization``
+// header in the production "Bearer khub_xxx|url,token|..." shape.
+// Empty everywhere ⇒ anonymous, no header sent.
+
+const realKhubToken = ref("");
+const realHeaderTokens = ref([]);
+
+function addRealHeaderToken() {
+  realHeaderTokens.value.push({ url: "", token: "" });
+}
+function removeRealHeaderToken(index) {
+  realHeaderTokens.value.splice(index, 1);
+}
+
+function _buildRealAuthorizationHeader() {
+  const segments = [];
+  for (const row of realHeaderTokens.value) {
+    if (row.url && row.token) {
+      segments.push(`${row.url},${row.token}`);
+    }
+  }
+  const t = (realKhubToken.value || "").trim();
+  if (!t && segments.length === 0) return null;
+  return `Bearer ${t}${segments.length > 0 ? "|" + segments.join("|") : ""}`;
+}
+
+const realRunning = ref(false);
+const realReport = ref(null);
+const realError = ref(null);
+
+async function runRealRequest() {
+  if (!checkAuth()) return;
+  if (!_validateProbeTargetForm(probeForm.value)) return;
+  realRunning.value = true;
+  realError.value = null;
+  try {
+    realReport.value = await runFallbackProbe({
+      op: probeForm.value.op,
+      repo_type: probeForm.value.repo_type,
+      namespace: probeForm.value.namespace,
+      name: probeForm.value.name,
+      revision: probeForm.value.revision || "main",
+      file_path: probeForm.value.file_path || "",
+      paths: _parsePathsCsv(probeForm.value),
+      authorization: _buildRealAuthorizationHeader(),
     });
   } catch (error) {
     console.error("real request failed:", error);
-    probeError.value =
+    realError.value =
       error.response?.data?.detail?.error || error.message || "Probe failed";
-    probeReport.value = null;
+    realReport.value = null;
   } finally {
-    probeRunning.value = false;
+    realRunning.value = false;
   }
 }
 
@@ -992,363 +1082,466 @@ onMounted(() => {
           </div>
         </el-form>
 
-        <!-- System state draft -->
-        <h3 class="tester-section-title">
-          System state — draft
-          <span class="tester-section-hint">
-            ({{ draftSources.length }} source{{ draftSources.length === 1 ? "" : "s" }})
-          </span>
-        </h3>
-        <div class="tester-empty" v-if="draftSources.length === 0">
-          Draft is empty. Click
-          <strong>Load from System</strong> to seed it with the current
-          configuration, or
-          <a href="javascript:void(0)" @click="addDraftSource">add a source</a>
-          manually.
-        </div>
-        <div
-          v-else
-          class="draft-list"
-          data-testid="draft-list"
+        <!-- Tabbed two-frame layout: Draft simulate vs Live real probe.
+             Each frame has system-state on the left (draft sources for
+             simulate; read-only live sources for real probe), user-state
+             on the right (impersonation+per-URL tokens for simulate;
+             admin token+per-URL tokens for real), and its own run+report
+             section below the grid. -->
+        <el-tabs
+          v-model="probeTab"
+          class="tester-tabs"
+          data-testid="tester-tabs"
         >
-          <div
-            v-for="(src, idx) in draftSources"
-            :key="idx"
-            class="draft-row"
-            :data-testid="`draft-row-${idx}`"
-          >
-            <div class="draft-row-grid">
-              <el-form-item label="Name">
-                <el-input
-                  v-model="src.name"
-                  @input="_markDirty"
-                  placeholder="HuggingFace"
-                />
-              </el-form-item>
-              <el-form-item label="URL">
-                <el-input
-                  v-model="src.url"
-                  @input="_markDirty"
-                  placeholder="https://huggingface.co"
-                />
-              </el-form-item>
-              <el-form-item label="Type">
-                <el-select
-                  v-model="src.source_type"
-                  @change="_markDirty"
-                  style="width: 100%"
+          <!-- ===== Tab 1: Draft simulate ===== -->
+          <el-tab-pane name="simulate" data-testid="tester-tab-simulate">
+            <template #label>
+              <span data-testid="tester-tab-simulate-label">
+                <i class="i-carbon-edit mr-1"></i>
+                Draft simulate
+              </span>
+            </template>
+
+            <p class="tester-section-hint">
+              Run the chain probe against an editable draft source list +
+              an impersonated identity. Hits the
+              <code>/admin/api/fallback/test/simulate</code>
+              endpoint — pure read, never writes the live config or the
+              bind cache. The local hop runs through the *real* handler
+              code (via
+              <code>__wrapped__</code>) so
+              <code>LOCAL_HIT</code>/<code>LOCAL_FILTERED</code>/<code>LOCAL_MISS</code>
+              decisions are byte-identical to production.
+            </p>
+
+            <div class="tester-frame-grid">
+              <!-- Left: system state (draft sources editor) -->
+              <div class="tester-frame-col">
+                <h3 class="tester-section-title">
+                  System state — draft sources
+                  <span class="tester-section-hint">
+                    ({{ draftSources.length }} source{{ draftSources.length === 1 ? "" : "s" }})
+                  </span>
+                </h3>
+                <div class="tester-empty" v-if="draftSources.length === 0">
+                  Draft is empty. Click
+                  <strong>Load from System</strong> above to seed it with
+                  the current configuration, or
+                  <a href="javascript:void(0)" @click="addDraftSource">add a source</a>
+                  manually.
+                </div>
+                <div
+                  v-else
+                  class="draft-list"
+                  data-testid="draft-list"
                 >
-                  <el-option
-                    v-for="st in SOURCE_TYPES"
-                    :key="st"
-                    :label="st"
-                    :value="st"
-                  />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="Priority">
-                <el-input-number
-                  v-model="src.priority"
-                  :min="1"
-                  :max="1000"
-                  @change="_markDirty"
-                  style="width: 100%"
-                />
-              </el-form-item>
-              <el-form-item label="Namespace">
-                <el-input
-                  v-model="src.namespace"
-                  @input="_markDirty"
-                  placeholder="(empty for global)"
-                />
-              </el-form-item>
-              <el-form-item label="Token">
-                <el-input
-                  v-model="src.token"
-                  @input="_markDirty"
-                  type="password"
-                  placeholder="hf_xxx (optional)"
-                  show-password
-                />
-              </el-form-item>
-              <el-form-item label="Enabled">
-                <el-switch v-model="src.enabled" @change="_markDirty" />
-              </el-form-item>
+                  <div
+                    v-for="(src, idx) in draftSources"
+                    :key="idx"
+                    class="draft-row"
+                    :data-testid="`draft-row-${idx}`"
+                  >
+                    <div class="draft-row-grid">
+                      <el-form-item label="Name">
+                        <el-input
+                          v-model="src.name"
+                          @input="_markDirty"
+                          placeholder="HuggingFace"
+                        />
+                      </el-form-item>
+                      <el-form-item label="URL">
+                        <el-input
+                          v-model="src.url"
+                          @input="_markDirty"
+                          placeholder="https://huggingface.co"
+                        />
+                      </el-form-item>
+                      <el-form-item label="Type">
+                        <el-select
+                          v-model="src.source_type"
+                          @change="_markDirty"
+                          style="width: 100%"
+                        >
+                          <el-option
+                            v-for="st in SOURCE_TYPES"
+                            :key="st"
+                            :label="st"
+                            :value="st"
+                          />
+                        </el-select>
+                      </el-form-item>
+                      <el-form-item label="Priority">
+                        <el-input-number
+                          v-model="src.priority"
+                          :min="1"
+                          :max="1000"
+                          @change="_markDirty"
+                          style="width: 100%"
+                        />
+                      </el-form-item>
+                      <el-form-item label="Namespace">
+                        <el-input
+                          v-model="src.namespace"
+                          @input="_markDirty"
+                          placeholder="(empty for global)"
+                        />
+                      </el-form-item>
+                      <el-form-item label="Token">
+                        <el-input
+                          v-model="src.token"
+                          @input="_markDirty"
+                          type="password"
+                          placeholder="hf_xxx (optional)"
+                          show-password
+                        />
+                      </el-form-item>
+                      <el-form-item label="Enabled">
+                        <el-switch v-model="src.enabled" @change="_markDirty" />
+                      </el-form-item>
+                    </div>
+                    <div class="draft-row-actions">
+                      <el-button
+                        size="small"
+                        type="danger"
+                        @click="removeDraftSource(idx)"
+                        :data-testid="`draft-remove-${idx}`"
+                      >
+                        <i class="i-carbon-trash-can"></i>
+                      </el-button>
+                    </div>
+                  </div>
+                </div>
+                <div class="draft-add-row">
+                  <el-button
+                    size="small"
+                    @click="addDraftSource"
+                    data-testid="draft-add-btn"
+                  >
+                    <i class="i-carbon-add mr-1"></i>
+                    Add Draft Source
+                  </el-button>
+                </div>
+              </div>
+
+              <!-- Right: user state (impersonation + token overlay) -->
+              <div class="tester-frame-col">
+                <h3 class="tester-section-title">User state — identity</h3>
+                <p class="tester-section-hint">
+                  Impersonate which user the probe runs as. Anonymous
+                  is a public caller; by-username / by-user_id load
+                  that user's
+                  <code>UserExternalToken</code>
+                  rows from the DB so per-user tokens enter the chain
+                  exactly as they would in production.
+                </p>
+                <el-form label-width="120px" class="tester-form">
+                  <el-form-item label="Identity">
+                    <el-radio-group
+                      v-model="simIdentity.mode"
+                      data-testid="sim-identity-mode"
+                    >
+                      <el-radio value="anonymous">Anonymous</el-radio>
+                      <el-radio value="username">By username</el-radio>
+                      <el-radio value="user_id">By user_id</el-radio>
+                    </el-radio-group>
+                  </el-form-item>
+                  <el-form-item v-if="simIdentity.mode === 'username'" label="Username">
+                    <el-input
+                      v-model="simIdentity.username"
+                      placeholder="e.g. mai_lin"
+                      data-testid="sim-identity-username"
+                    />
+                  </el-form-item>
+                  <el-form-item v-if="simIdentity.mode === 'user_id'" label="User ID">
+                    <el-input-number
+                      v-model="simIdentity.user_id"
+                      :min="1"
+                      style="width: 100%"
+                      data-testid="sim-identity-userid"
+                    />
+                  </el-form-item>
+                </el-form>
+
+                <h4 class="tester-subsection-title">
+                  Per-URL token overrides
+                  <span class="tester-section-hint">
+                    (Authorization-header-style overrides applied on
+                    top of the impersonated user's DB tokens — header
+                    wins on URL collision, mirroring production's
+                    <code>get_merged_external_tokens</code>)
+                  </span>
+                </h4>
+                <div
+                  v-if="simHeaderTokens.length === 0"
+                  class="tester-empty"
+                >
+                  No header overrides.
+                  <a href="javascript:void(0)" @click="addSimHeaderToken">Add one</a>.
+                </div>
+                <div v-else class="header-tokens" data-testid="sim-header-tokens">
+                  <div
+                    v-for="(row, idx) in simHeaderTokens"
+                    :key="idx"
+                    class="header-token-row"
+                  >
+                    <el-input
+                      v-model="row.url"
+                      placeholder="https://huggingface.co"
+                      :data-testid="`sim-header-token-url-${idx}`"
+                      style="flex: 2"
+                    />
+                    <el-input
+                      v-model="row.token"
+                      type="password"
+                      placeholder="hf_xxx"
+                      show-password
+                      :data-testid="`sim-header-token-token-${idx}`"
+                      style="flex: 2"
+                    />
+                    <el-button
+                      size="small"
+                      type="danger"
+                      @click="removeSimHeaderToken(idx)"
+                      :data-testid="`sim-header-token-remove-${idx}`"
+                    >
+                      <i class="i-carbon-trash-can"></i>
+                    </el-button>
+                  </div>
+                </div>
+                <div class="draft-add-row">
+                  <el-button
+                    size="small"
+                    @click="addSimHeaderToken"
+                    data-testid="sim-header-token-add"
+                  >
+                    <i class="i-carbon-add mr-1"></i>
+                    Add header override
+                  </el-button>
+                </div>
+              </div>
             </div>
-            <div class="draft-row-actions">
+
+            <!-- Run + results (simulate) -->
+            <h3 class="tester-section-title">Run simulate</h3>
+            <div class="run-buttons">
               <el-button
-                size="small"
-                type="danger"
-                @click="removeDraftSource(idx)"
-                :data-testid="`draft-remove-${idx}`"
+                type="primary"
+                @click="runSimulate"
+                :loading="simRunning"
+                data-testid="run-simulate-btn"
               >
-                <i class="i-carbon-trash-can"></i>
+                <i class="i-carbon-play-filled mr-1"></i>
+                Run simulate against draft
               </el-button>
             </div>
-          </div>
-        </div>
-        <div class="draft-add-row">
-          <el-button
-            size="small"
-            @click="addDraftSource"
-            data-testid="draft-add-btn"
-          >
-            <i class="i-carbon-add mr-1"></i>
-            Add Draft Source
-          </el-button>
-        </div>
 
-        <!-- User state — Authorization header builder -->
-        <h3 class="tester-section-title">User state — Authorization header</h3>
-        <p class="tester-section-hint">
-          The probe sends a real request to this KohakuHub instance and
-          reads
-          <code>X-Chain-Trace</code>
-          off the response to render the timeline below. The token
-          fields here are wired into a single
-          <code>Authorization</code>
-          header in the
-          <code>Bearer khub_xxx|url1,token1|...</code>
-          shape — leave everything blank to send anonymously.
-        </p>
-        <el-form label-width="160px" class="tester-form">
-          <el-form-item label="KohakuHub token">
-            <el-input
-              v-model="khubToken"
-              type="password"
-              placeholder="khub_xxx (optional)"
-              show-password
-              data-testid="probe-khub-token"
-            />
-          </el-form-item>
-        </el-form>
-        <h4 class="tester-subsection-title">
-          External-source tokens
-          <span class="tester-section-hint">
-            (per-URL fallback-source tokens, encoded into the
-            <code>|url,token|...</code>
-            segments of the Authorization header)
-          </span>
-        </h4>
-        <div
-          v-if="headerTokens.length === 0"
-          class="tester-empty"
-        >
-          No header overrides.
-          <a href="javascript:void(0)" @click="addHeaderToken">Add one</a>.
-        </div>
-        <div v-else class="header-tokens" data-testid="header-tokens">
-          <div
-            v-for="(row, idx) in headerTokens"
-            :key="idx"
-            class="header-token-row"
-          >
-            <el-input
-              v-model="row.url"
-              placeholder="https://huggingface.co"
-              :data-testid="`header-token-url-${idx}`"
-              style="flex: 2"
-            />
-            <el-input
-              v-model="row.token"
-              type="password"
-              placeholder="hf_xxx"
-              show-password
-              :data-testid="`header-token-token-${idx}`"
-              style="flex: 2"
-            />
-            <el-button
-              size="small"
-              type="danger"
-              @click="removeHeaderToken(idx)"
-              :data-testid="`header-token-remove-${idx}`"
-            >
-              <i class="i-carbon-trash-can"></i>
-            </el-button>
-          </div>
-        </div>
-        <div class="draft-add-row">
-          <el-button
-            size="small"
-            @click="addHeaderToken"
-            data-testid="header-token-add"
-          >
-            <i class="i-carbon-add mr-1"></i>
-            Add header override
-          </el-button>
-        </div>
-
-        <!-- Run + results -->
-        <h3 class="tester-section-title">Run real request</h3>
-        <p class="tester-section-hint">
-          Sends a real HTTP request straight to this KohakuHub
-          instance — same handler chain a production
-          <code>huggingface_hub</code>
-          client would hit. The chain (local hop first, then any
-          fallback hops walked) is reconstructed from the
-          <code>X-Chain-Trace</code>
-          response header.
-        </p>
-        <div class="run-buttons">
-          <el-button
-            type="primary"
-            @click="runRealRequest"
-            :loading="probeRunning"
-            data-testid="run-real-btn"
-          >
-            <i class="i-carbon-play-filled mr-1"></i>
-            Run real request
-          </el-button>
-        </div>
-
-        <div
-          v-if="probeError"
-          class="probe-error"
-          data-testid="probe-error"
-        >
-          {{ probeError }}
-        </div>
-
-        <div
-          v-if="probeReport"
-          class="probe-report"
-          data-testid="probe-report"
-        >
-          <div class="probe-report-summary">
-            <strong>Final outcome:</strong>
-            <el-tag
-              :type="
-                probeReport.final_outcome === 'BIND_AND_RESPOND'
-                  ? 'success'
-                  : probeReport.final_outcome === 'BIND_AND_PROPAGATE'
-                  ? 'warning'
-                  : 'info'
-              "
-              data-testid="probe-final-outcome"
-            >
-              {{ probeReport.final_outcome }}
-            </el-tag>
-            <span v-if="probeReport.bound_source" class="probe-bound-source">
-              bound to
-              <code data-testid="probe-bound-source">
-                {{ probeReport.bound_source.name || probeReport.bound_source.url }}
-              </code>
-            </span>
-            <span class="probe-duration">
-              {{ probeReport.duration_ms }} ms total
-            </span>
-          </div>
-          <div class="probe-attempts">
             <div
-              v-for="(att, idx) in probeReport.attempts"
-              :key="idx"
-              class="probe-attempt"
-              :data-testid="`probe-attempt-${idx}`"
+              v-if="simError"
+              class="probe-error"
+              data-testid="sim-probe-error"
             >
-              <div class="probe-attempt-line">
-                <el-tag
-                  :type="decisionTagType(att.decision)"
-                  size="small"
-                >
-                  {{ att.decision }}
-                </el-tag>
-                <code class="probe-attempt-source">
-                  {{ att.source_name }}
-                </code>
-                <span class="probe-attempt-method">
-                  {{ att.method }}
-                </span>
-                <span class="probe-attempt-status">
-                  <span v-if="att.status_code">{{ att.status_code }}</span>
-                  <span v-else class="probe-attempt-error">no response</span>
-                </span>
-                <span
-                  v-if="att.x_error_code"
-                  class="probe-attempt-xerror"
-                >
-                  X-Error-Code: {{ att.x_error_code }}
-                </span>
-                <span class="probe-attempt-ms">
-                  {{ att.duration_ms }} ms
-                </span>
-              </div>
-              <div
-                v-if="att.upstream_path"
-                class="probe-attempt-path"
-              >
-                <span class="probe-label">Upstream:</span>
-                <code>{{ att.upstream_path }}</code>
-              </div>
-              <div
-                v-if="att.response_headers && Object.keys(att.response_headers).length > 0"
-                class="probe-attempt-headers"
-                :data-testid="`probe-attempt-${idx}-headers`"
-              >
-                <span class="probe-label">Response headers:</span>
-                <code
-                  v-for="(val, key) in att.response_headers"
-                  :key="key"
-                  class="probe-attempt-header"
-                >
-                  {{ key }}: {{ val }}
-                </code>
-              </div>
-              <details
-                v-if="att.response_body_preview"
-                class="probe-attempt-body"
-              >
-                <summary>
-                  Response body preview ({{
-                    att.response_body_preview.length
-                  }}
-                  chars)
-                </summary>
-                <pre :data-testid="`probe-attempt-${idx}-body`">{{ att.response_body_preview }}</pre>
-              </details>
-              <div
-                v-if="att.error"
-                class="probe-attempt-error-detail"
-              >
-                {{ att.error }}
-              </div>
+              {{ simError }}
             </div>
-          </div>
 
-          <div
-            v-if="probeReport.final_response"
-            class="probe-final-response"
-            data-testid="probe-final-response"
-          >
-            <h4 class="probe-final-title">
-              Final response (what a production caller would see)
-            </h4>
-            <div class="probe-final-status">
-              <span class="probe-label">Status:</span>
-              <strong>{{ probeReport.final_response.status_code }}</strong>
+            <ProbeReportView
+              v-if="simReport"
+              :report="simReport"
+              data-testid-prefix="sim-probe"
+              :decision-tag-type="decisionTagType"
+            />
+          </el-tab-pane>
+
+          <!-- ===== Tab 2: Live real probe ===== -->
+          <el-tab-pane name="real" data-testid="tester-tab-real">
+            <template #label>
+              <span data-testid="tester-tab-real-label">
+                <i class="i-carbon-cloud-satellite mr-1"></i>
+                Live real probe
+              </span>
+            </template>
+
+            <p class="tester-section-hint">
+              Send a real HTTP request from this browser to the live
+              KohakuHub instance — same handler chain a production
+              <code>huggingface_hub</code>
+              client would hit. The chain (local hop first, then any
+              fallback hops walked) is reconstructed from the
+              <code>X-Chain-Trace</code>
+              response header. Use this when simulate says "OK" but
+              you still want to confirm the live config is actually
+              wired up correctly — the simulate path can't catch a
+              broken cache, a misconfigured nginx hop, etc.
+            </p>
+
+            <div class="tester-frame-grid">
+              <!-- Left: system state (live config, read-only) -->
+              <div class="tester-frame-col">
+                <h3 class="tester-section-title">
+                  System state — live config
+                  <span class="tester-section-hint">
+                    (read-only summary of the {{ sources.length }}
+                    currently-applied source{{ sources.length === 1 ? "" : "s" }})
+                  </span>
+                </h3>
+                <div class="tester-empty" v-if="sources.length === 0">
+                  No sources currently applied. Configure them in the
+                  <strong>Configured Sources</strong>
+                  card below, or stage a draft above and
+                  <strong>Push to System</strong>.
+                </div>
+                <div
+                  v-else
+                  class="live-config-list"
+                  data-testid="live-config-list"
+                >
+                  <div
+                    v-for="src in sources"
+                    :key="src.id"
+                    class="live-config-row"
+                    :data-testid="`live-config-row-${src.id}`"
+                  >
+                    <div class="live-config-name">
+                      <strong>{{ src.name }}</strong>
+                      <el-tag
+                        :type="src.source_type === 'huggingface' ? 'primary' : 'success'"
+                        size="small"
+                      >
+                        {{ src.source_type }}
+                      </el-tag>
+                      <el-tag
+                        :type="src.enabled ? 'success' : 'info'"
+                        size="small"
+                      >
+                        {{ src.enabled ? "enabled" : "disabled" }}
+                      </el-tag>
+                      <el-tag v-if="src.namespace" type="warning" size="small">
+                        {{ src.namespace }}
+                      </el-tag>
+                    </div>
+                    <div class="live-config-url">
+                      <code>{{ src.url }}</code>
+                      <span class="live-config-priority">
+                        priority {{ src.priority }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Right: user state (admin's khub token + per-URL tokens) -->
+              <div class="tester-frame-col">
+                <h3 class="tester-section-title">User state — Authorization</h3>
+                <p class="tester-section-hint">
+                  The probe sends a real request to this instance with
+                  these credentials encoded into a single
+                  <code>Authorization</code>
+                  header in the
+                  <code>Bearer khub_xxx|url1,token1|...</code>
+                  shape. Admin can't impersonate other users in this
+                  mode — paste the user-in-question's
+                  <em>own</em>
+                  KohakuHub access token here when debugging
+                  user-specific issues. Leave blank to send anonymously.
+                </p>
+                <el-form label-width="160px" class="tester-form">
+                  <el-form-item label="KohakuHub token">
+                    <el-input
+                      v-model="realKhubToken"
+                      type="password"
+                      placeholder="khub_xxx (optional)"
+                      show-password
+                      data-testid="real-khub-token"
+                    />
+                  </el-form-item>
+                </el-form>
+                <h4 class="tester-subsection-title">
+                  Per-URL fallback tokens
+                  <span class="tester-section-hint">
+                    (encoded into the
+                    <code>|url,token|...</code>
+                    segments of the Authorization header)
+                  </span>
+                </h4>
+                <div
+                  v-if="realHeaderTokens.length === 0"
+                  class="tester-empty"
+                >
+                  No header overrides.
+                  <a href="javascript:void(0)" @click="addRealHeaderToken">Add one</a>.
+                </div>
+                <div v-else class="header-tokens" data-testid="real-header-tokens">
+                  <div
+                    v-for="(row, idx) in realHeaderTokens"
+                    :key="idx"
+                    class="header-token-row"
+                  >
+                    <el-input
+                      v-model="row.url"
+                      placeholder="https://huggingface.co"
+                      :data-testid="`real-header-token-url-${idx}`"
+                      style="flex: 2"
+                    />
+                    <el-input
+                      v-model="row.token"
+                      type="password"
+                      placeholder="hf_xxx"
+                      show-password
+                      :data-testid="`real-header-token-token-${idx}`"
+                      style="flex: 2"
+                    />
+                    <el-button
+                      size="small"
+                      type="danger"
+                      @click="removeRealHeaderToken(idx)"
+                      :data-testid="`real-header-token-remove-${idx}`"
+                    >
+                      <i class="i-carbon-trash-can"></i>
+                    </el-button>
+                  </div>
+                </div>
+                <div class="draft-add-row">
+                  <el-button
+                    size="small"
+                    @click="addRealHeaderToken"
+                    data-testid="real-header-token-add"
+                  >
+                    <i class="i-carbon-add mr-1"></i>
+                    Add header override
+                  </el-button>
+                </div>
+              </div>
             </div>
-            <div
-              v-if="probeReport.final_response.headers && Object.keys(probeReport.final_response.headers).length > 0"
-              class="probe-final-headers"
-            >
-              <span class="probe-label">Headers:</span>
-              <code
-                v-for="(val, key) in probeReport.final_response.headers"
-                :key="key"
-                class="probe-attempt-header"
+
+            <!-- Run + results (real) -->
+            <h3 class="tester-section-title">Run real request</h3>
+            <div class="run-buttons">
+              <el-button
+                type="primary"
+                @click="runRealRequest"
+                :loading="realRunning"
+                data-testid="run-real-btn"
               >
-                {{ key }}: {{ val }}
-              </code>
+                <i class="i-carbon-play-filled mr-1"></i>
+                Run real request
+              </el-button>
             </div>
-            <details
-              v-if="probeReport.final_response.body_preview"
-              open
-              class="probe-attempt-body"
+
+            <div
+              v-if="realError"
+              class="probe-error"
+              data-testid="real-probe-error"
             >
-              <summary>Body</summary>
-              <pre data-testid="probe-final-body">{{ probeReport.final_response.body_preview }}</pre>
-            </details>
-          </div>
-        </div>
+              {{ realError }}
+            </div>
+
+            <ProbeReportView
+              v-if="realReport"
+              :report="realReport"
+              data-testid-prefix="real-probe"
+              :decision-tag-type="decisionTagType"
+            />
+          </el-tab-pane>
+        </el-tabs>
       </el-card>
 
       <!-- Sources List Card -->
@@ -1859,6 +2052,71 @@ onMounted(() => {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 0 24px;
+}
+
+/* Two-frame layout per tester tab: left = system state, right = user
+   state. Stacks on narrow viewports so the form items stay legible. */
+.tester-tabs {
+  margin-top: 8px;
+}
+
+.tester-frame-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0 24px;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 1024px) {
+  .tester-frame-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.tester-frame-col {
+  min-width: 0;
+}
+
+.live-config-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.live-config-row {
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 6px;
+  background: var(--el-bg-color-page);
+}
+
+.live-config-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.live-config-url {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.live-config-url code {
+  font-family: var(--el-font-family-mono, monospace);
+  background: var(--el-fill-color, #ececec);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.live-config-priority {
+  margin-left: auto;
+  color: var(--el-text-color-secondary, #909399);
+  font-size: 11px;
 }
 
 .tester-empty {

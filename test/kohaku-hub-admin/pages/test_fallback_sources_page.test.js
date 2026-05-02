@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
     listRepositories: vi.fn(),
     bulkReplaceFallbackSources: vi.fn(),
     runFallbackProbe: vi.fn(),
+    runFallbackChainSimulate: vi.fn(),
   },
 }));
 
@@ -54,6 +55,8 @@ vi.mock("@/utils/api", () => ({
   listRepositories: (...a) => mocks.api.listRepositories(...a),
   bulkReplaceFallbackSources: (...a) => mocks.api.bulkReplaceFallbackSources(...a),
   runFallbackProbe: (...a) => mocks.api.runFallbackProbe(...a),
+  runFallbackChainSimulate: (...a) =>
+    mocks.api.runFallbackChainSimulate(...a),
 }));
 
 vi.mock("@/components/AdminLayout.vue", () => ({
@@ -1782,7 +1785,7 @@ describe("admin fallback-sources page", () => {
     // Anonymous: no Authorization header.
     expect(payload.authorization).toBeNull();
     // Result rendered.
-    expect(wrapper.find('[data-testid="probe-report"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="real-probe-report"]').exists()).toBe(true);
     expect(wrapper.text()).toContain("BIND_AND_RESPOND");
   });
 
@@ -1824,7 +1827,7 @@ describe("admin fallback-sources page", () => {
     await _seedProbeForm(wrapper);
     await wrapper.get('[data-testid="run-real-btn"]').trigger("click");
     await flushPromises();
-    expect(wrapper.find('[data-testid="probe-error"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="real-probe-error"]').exists()).toBe(true);
     expect(wrapper.text()).toContain("probe blew up");
   });
 
@@ -1850,16 +1853,16 @@ describe("admin fallback-sources page", () => {
 
     // Personal access token.
     await wrapper
-      .get('[data-testid="probe-khub-token"] input')
+      .get('[data-testid="real-khub-token"] input')
       .setValue("khub_xxx");
     // Per-URL fallback token.
-    await wrapper.get('[data-testid="header-token-add"]').trigger("click");
+    await wrapper.get('[data-testid="real-header-token-add"]').trigger("click");
     await flushPromises();
     await wrapper
-      .get('[data-testid="header-token-url-0"] input')
+      .get('[data-testid="real-header-token-url-0"] input')
       .setValue("https://huggingface.co");
     await wrapper
-      .get('[data-testid="header-token-token-0"] input')
+      .get('[data-testid="real-header-token-token-0"] input')
       .setValue("hf_test");
 
     await wrapper.get('[data-testid="run-real-btn"]').trigger("click");
@@ -1893,10 +1896,10 @@ describe("admin fallback-sources page", () => {
     // Add a token row but only fill the URL — should be filtered out
     // (mirrors the production token parser shape, which only emits a
     // segment when both url and token are present).
-    await wrapper.get('[data-testid="header-token-add"]').trigger("click");
+    await wrapper.get('[data-testid="real-header-token-add"]').trigger("click");
     await flushPromises();
     await wrapper
-      .get('[data-testid="header-token-url-0"] input')
+      .get('[data-testid="real-header-token-url-0"] input')
       .setValue("https://incomplete.example");
     await wrapper.get('[data-testid="run-real-btn"]').trigger("click");
     await flushPromises();
@@ -2002,7 +2005,7 @@ describe("admin fallback-sources page", () => {
     await wrapper.get('[data-testid="run-real-btn"]').trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("CHAIN_EXHAUSTED");
-    expect(wrapper.find('[data-testid="probe-final-response"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="real-probe-final-response"]').exists()).toBe(false);
   });
 
   it("BIND_AND_RESPOND outcome surfaces final_response with body preview", async () => {
@@ -2014,8 +2017,8 @@ describe("admin fallback-sources page", () => {
     await _seedProbeForm(wrapper);
     await wrapper.get('[data-testid="run-real-btn"]').trigger("click");
     await flushPromises();
-    expect(wrapper.find('[data-testid="probe-final-response"]').exists()).toBe(true);
-    expect(wrapper.find('[data-testid="probe-final-body"]').text())
+    expect(wrapper.find('[data-testid="real-probe-final-response"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="real-probe-final-body"]').text())
       .toContain('"id":"openai/gpt2"');
   });
 
@@ -2024,15 +2027,15 @@ describe("admin fallback-sources page", () => {
     mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
     const wrapper = mountPage();
     await flushPromises();
-    await wrapper.get('[data-testid="header-token-add"]').trigger("click");
-    await wrapper.get('[data-testid="header-token-add"]').trigger("click");
+    await wrapper.get('[data-testid="real-header-token-add"]').trigger("click");
+    await wrapper.get('[data-testid="real-header-token-add"]').trigger("click");
     await flushPromises();
-    expect(wrapper.find('[data-testid="header-token-url-0"]').exists()).toBe(true);
-    expect(wrapper.find('[data-testid="header-token-url-1"]').exists()).toBe(true);
-    await wrapper.get('[data-testid="header-token-remove-0"]').trigger("click");
+    expect(wrapper.find('[data-testid="real-header-token-url-0"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="real-header-token-url-1"]').exists()).toBe(true);
+    await wrapper.get('[data-testid="real-header-token-remove-0"]').trigger("click");
     await flushPromises();
-    expect(wrapper.find('[data-testid="header-token-url-1"]').exists()).toBe(false);
-    expect(wrapper.find('[data-testid="header-token-url-0"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="real-header-token-url-1"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="real-header-token-url-0"]').exists()).toBe(true);
   });
 
   it("Editing a draft row field marks the draft dirty", async () => {
@@ -2077,6 +2080,240 @@ describe("admin fallback-sources page", () => {
     await wrapper.get('[data-testid="run-real-btn"]').trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("FUTURE_UNKNOWN_DECISION");
+  });
+
+  // -----------------------------------------------------------------
+  // Draft simulate flow (#78 v2). The simulate tab POSTs to
+  // /admin/api/fallback/test/simulate via runFallbackChainSimulate.
+  // The local hop runs through the real handler on the server side
+  // (see test_probe_local.py + test_fallback_debug.py for backend
+  // coverage); these tests focus on the page wiring — payload
+  // construction, identity radio, sim header tokens, report render.
+  // -----------------------------------------------------------------
+
+  function _stubSimReport(opts = {}) {
+    return {
+      op: "info",
+      repo_id: "openai/gpt2",
+      revision: null,
+      file_path: null,
+      attempts: [
+        {
+          kind: "local",
+          source_name: "local",
+          source_url: "",
+          source_type: "local",
+          method: "GET",
+          upstream_path: "/api/models/openai/gpt2",
+          status_code: 200,
+          x_error_code: null,
+          x_error_message: null,
+          decision: "LOCAL_HIT",
+          duration_ms: 7,
+          error: null,
+          response_body_preview: '{"id":"openai/gpt2"}',
+          response_headers: {},
+        },
+      ],
+      final_outcome: "LOCAL_HIT",
+      bound_source: { name: "local", url: "", source_type: "local" },
+      duration_ms: 9,
+      final_response: {
+        status_code: 200,
+        headers: {},
+        body_preview: '{"id":"openai/gpt2"}',
+      },
+      ...opts,
+    };
+  }
+
+  it("Run simulate posts payload with draft sources + sim identity + sim header tokens", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.runFallbackChainSimulate.mockResolvedValue(_stubSimReport());
+    const wrapper = mountPage();
+    await flushPromises();
+
+    // Seed shared probe target.
+    await wrapper.get('[data-testid="probe-namespace"] input').setValue("openai");
+    await wrapper.get('[data-testid="probe-name"] input').setValue("gpt2");
+
+    // Load draft from system + add a token row.
+    await wrapper.get('[data-testid="load-from-system-btn"]').trigger("click");
+    await flushPromises();
+
+    // Switch identity to username mode.
+    const userMode = wrapper.get('[data-testid="sim-identity-mode"]');
+    await userMode.get('[data-radio-value="username"]').trigger("click");
+    await flushPromises();
+    await wrapper
+      .get('[data-testid="sim-identity-username"] input')
+      .setValue("mai_lin");
+
+    // Add a sim header token.
+    await wrapper.get('[data-testid="sim-header-token-add"]').trigger("click");
+    await flushPromises();
+    await wrapper
+      .get('[data-testid="sim-header-token-url-0"] input')
+      .setValue("https://huggingface.co");
+    await wrapper
+      .get('[data-testid="sim-header-token-token-0"] input')
+      .setValue("hf_test");
+
+    await wrapper.get('[data-testid="run-simulate-btn"]').trigger("click");
+    await flushPromises();
+
+    expect(mocks.api.runFallbackChainSimulate).toHaveBeenCalledTimes(1);
+    const [, payload] = mocks.api.runFallbackChainSimulate.mock.calls[0];
+    expect(payload.op).toBe("info");
+    expect(payload.namespace).toBe("openai");
+    expect(payload.name).toBe("gpt2");
+    expect(payload.sources).toHaveLength(1);
+    expect(payload.as_username).toBe("mai_lin");
+    expect(payload.as_user_id).toBeUndefined();
+    expect(payload.header_tokens).toEqual({
+      "https://huggingface.co": "hf_test",
+    });
+    // Result rendered with sim-probe testID prefix.
+    expect(wrapper.find('[data-testid="sim-probe-report"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("LOCAL_HIT");
+  });
+
+  it("Run simulate uses as_user_id when identity mode is user_id", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.runFallbackChainSimulate.mockResolvedValue(_stubSimReport());
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="probe-namespace"] input').setValue("openai");
+    await wrapper.get('[data-testid="probe-name"] input').setValue("gpt2");
+    const userMode = wrapper.get('[data-testid="sim-identity-mode"]');
+    await userMode.get('[data-radio-value="user_id"]').trigger("click");
+    await flushPromises();
+    const uid = wrapper.get('[data-testid="sim-identity-userid"]');
+    uid.element.value = "42";
+    await uid.trigger("input");
+    await wrapper.get('[data-testid="run-simulate-btn"]').trigger("click");
+    await flushPromises();
+    const [, payload] = mocks.api.runFallbackChainSimulate.mock.calls[0];
+    expect(payload.as_user_id).toBe(42);
+    expect(payload.as_username).toBeUndefined();
+  });
+
+  it("Run simulate anonymous → no as_* fields", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.runFallbackChainSimulate.mockResolvedValue(_stubSimReport());
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="probe-namespace"] input').setValue("openai");
+    await wrapper.get('[data-testid="probe-name"] input').setValue("gpt2");
+    await wrapper.get('[data-testid="run-simulate-btn"]').trigger("click");
+    await flushPromises();
+    const [, payload] = mocks.api.runFallbackChainSimulate.mock.calls[0];
+    expect(payload.as_username).toBeUndefined();
+    expect(payload.as_user_id).toBeUndefined();
+  });
+
+  it("Run simulate shows backend error in sim-probe-error region", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    const failure = new Error("api err");
+    failure.response = { data: { detail: { error: "simulate blew up" } } };
+    mocks.api.runFallbackChainSimulate.mockRejectedValue(failure);
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="probe-namespace"] input').setValue("openai");
+    await wrapper.get('[data-testid="probe-name"] input').setValue("gpt2");
+    await wrapper.get('[data-testid="run-simulate-btn"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="sim-probe-error"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("simulate blew up");
+  });
+
+  it("Run simulate validates probe target before calling API", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="run-simulate-btn"]').trigger("click");
+    await flushPromises();
+    expect(messageErrorSpy).toHaveBeenCalledWith(
+      "namespace and name are required for the probe target",
+    );
+    expect(mocks.api.runFallbackChainSimulate).not.toHaveBeenCalled();
+  });
+
+  it("Sim header token Add and Remove flows", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="sim-header-token-add"]').trigger("click");
+    await wrapper.get('[data-testid="sim-header-token-add"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="sim-header-token-url-0"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="sim-header-token-url-1"]').exists()).toBe(true);
+    await wrapper.get('[data-testid="sim-header-token-remove-0"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="sim-header-token-url-1"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="sim-header-token-url-0"]').exists()).toBe(true);
+  });
+
+  it("Sim simulate report shows local hop kind=local + LOCAL_HIT", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.runFallbackChainSimulate.mockResolvedValue(_stubSimReport());
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="probe-namespace"] input').setValue("openai");
+    await wrapper.get('[data-testid="probe-name"] input').setValue("gpt2");
+    await wrapper.get('[data-testid="run-simulate-btn"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="sim-probe-final-response"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="sim-probe-final-body"]').text())
+      .toContain('"id":"openai/gpt2"');
+    // The local-hop attempt is rendered with kind="local".
+    expect(wrapper.text()).toContain("LOCAL_HIT");
+  });
+
+  it("Sim simulate handles empty draft (sources=[])", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.runFallbackChainSimulate.mockResolvedValue(_stubSimReport());
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="probe-namespace"] input').setValue("x");
+    await wrapper.get('[data-testid="probe-name"] input').setValue("y");
+    await wrapper.get('[data-testid="run-simulate-btn"]').trigger("click");
+    await flushPromises();
+    const [, payload] = mocks.api.runFallbackChainSimulate.mock.calls[0];
+    expect(payload.sources).toEqual([]);
+  });
+
+  // Live config view in the real-probe tab — read-only summary of the
+  // currently-applied source list.
+  it("Live config summary in real tab renders one row per applied source", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([
+      {
+        id: 1, namespace: "", url: "https://hf.example", token: null,
+        priority: 10, name: "HF", source_type: "huggingface", enabled: true,
+        created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        id: 2, namespace: "", url: "https://k.example", token: null,
+        priority: 20, name: "Khub", source_type: "kohakuhub", enabled: false,
+        created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+      },
+    ]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    const wrapper = mountPage();
+    await flushPromises();
+    expect(wrapper.find('[data-testid="live-config-list"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="live-config-row-1"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="live-config-row-2"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("https://hf.example");
+    expect(wrapper.text()).toContain("https://k.example");
   });
 
   // -----------------------------------------------------------------

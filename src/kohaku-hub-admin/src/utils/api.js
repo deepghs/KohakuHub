@@ -884,6 +884,53 @@ export async function bulkReplaceFallbackSources(token, sources) {
 }
 
 /**
+ * Run a unified local→fallback chain simulation against an
+ * operator-supplied draft source list and identity.
+ *
+ * Calls the single ``/admin/api/fallback/test/simulate`` endpoint
+ * (#78 redesign v2). Pure read — never writes the production cache,
+ * never holds the binding lock, and (crucially) the draft source
+ * list is NOT applied to the live config, so it's safe to test
+ * "what if I added source X" hypotheticals.
+ *
+ * The returned ProbeReport puts the local hop first (decision is
+ * one of LOCAL_HIT / LOCAL_FILTERED / LOCAL_MISS / LOCAL_OTHER_ERROR)
+ * and only walks the fallback chain on LOCAL_MISS — same gating
+ * rule the production ``with_repo_fallback`` decorator uses, so
+ * "simulate says local hit" means production would hit local too.
+ *
+ * @param {string} token - Admin token
+ * @param {Object} payload
+ * @param {("info"|"tree"|"resolve"|"paths_info")} payload.op
+ * @param {("model"|"dataset"|"space")} payload.repo_type
+ * @param {string} payload.namespace
+ * @param {string} payload.name
+ * @param {string} [payload.revision]
+ * @param {string} [payload.file_path]
+ * @param {Array<string>} [payload.paths]
+ * @param {Array<Object>} payload.sources - Draft sources
+ *   (``{name, url, source_type, token?, priority?}``).
+ * @param {string} [payload.as_username] - Identity to impersonate.
+ *   ``as_username`` wins over ``as_user_id`` if both supplied;
+ *   anonymous if both absent. Real impersonation in simulate mode —
+ *   not possible in the live-real probe (admin can't bear other
+ *   users' tokens).
+ * @param {number} [payload.as_user_id]
+ * @param {Object<string,string>} [payload.header_tokens] - Per-URL
+ *   token overlay applied on top of the impersonated user's DB
+ *   tokens. Mirrors production's ``Bearer xxx|url,token|...``
+ *   precedence (header wins).
+ * @returns {Promise<Object>} ProbeReport (``op``, ``repo_id``,
+ *   ``revision``, ``file_path``, ``attempts[]``, ``final_outcome``,
+ *   ``bound_source``, ``duration_ms``, ``final_response``).
+ */
+export async function runFallbackChainSimulate(token, payload) {
+  const client = createAdminClient(token);
+  const response = await client.post("/fallback/test/simulate", payload);
+  return response.data;
+}
+
+/**
  * Decode an ``X-Chain-Trace`` response header (base64-encoded JSON
  * envelope ``{"version": 1, "hops": [...]}``) into the hop array.
  *

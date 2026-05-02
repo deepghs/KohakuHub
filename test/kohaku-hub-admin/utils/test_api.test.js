@@ -184,6 +184,21 @@ describe("admin API client", () => {
         enabled: true,
       },
     ]);
+    await api.runFallbackChainSimulate("admin-token", {
+      op: "info",
+      repo_type: "model",
+      namespace: "owner",
+      name: "demo",
+      revision: "main",
+      sources: [
+        {
+          name: "HF", url: "https://hf.example",
+          source_type: "huggingface", token: null, priority: 10,
+        },
+      ],
+      as_username: "mai_lin",
+      header_tokens: { "https://hf.example": "hf_xxx" },
+    });
 
     await api.deleteRepositoryAdmin(
       "admin-token",
@@ -311,6 +326,15 @@ describe("admin API client", () => {
       "/fallback/sources-bulk-replace",
       expect.objectContaining({
         sources: expect.any(Array),
+      }),
+    );
+    expect(client.post).toHaveBeenCalledWith(
+      "/fallback/test/simulate",
+      expect.objectContaining({
+        op: "info",
+        as_username: "mai_lin",
+        sources: expect.any(Array),
+        header_tokens: { "https://hf.example": "hf_xxx" },
       }),
     );
     expect(client.delete).toHaveBeenCalledWith(
