@@ -276,7 +276,7 @@ async def test_user_token_mutation_during_probe_rejects_cache_set(monkeypatch):
     # User 1's bucket: empty (safe_set rejected).
     assert cache.get(1, "", "model", "owner", "demo") is None
     # The bump didn't affect user 2 — safe_set for user 2 would still succeed.
-    assert cache.user_gens[2] == 0
+    assert cache.user_gens.get(2, 0) == 0
 
 
 @pytest.mark.asyncio
@@ -310,7 +310,7 @@ async def test_repo_crud_during_probe_rejects_cache_set(monkeypatch):
     # No revival: cache stays empty for owner/demo.
     assert cache.get(1, "", "model", "owner", "demo") is None
     # repo_gen for OTHER repos untouched, so safe_set for them still works.
-    assert cache.repo_gens[("model", "owner", "other")] == 0
+    assert cache.repo_gens.get(("model", "owner", "other"), 0) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,6 @@ Strict-freshness contract (#79):
 import hashlib
 import json
 import time
-from collections import defaultdict
 from typing import Optional
 
 from cachetools import TTLCache
@@ -75,9 +74,17 @@ class RepoSourceCache:
         # Generations are monotonic counters bumped by mutation methods.
         # ``snapshot`` reads them at probe start; ``safe_set`` re-reads at
         # probe end and rejects the write if any has been bumped.
+        #
+        # Storage is a plain ``dict`` (not ``defaultdict``) so that the
+        # read-only ``snapshot`` path uses ``.get(key, 0)`` and never
+        # materializes a phantom entry. Without this, every distinct
+        # ``(user_id, repo_type, namespace, name)`` ever queried would
+        # leave a permanent zero-valued counter in ``user_gens`` /
+        # ``repo_gens`` — an unbounded leak under workloads with high
+        # repo / user cardinality.
         self.global_gen: int = 0
-        self.user_gens: defaultdict = defaultdict(int)
-        self.repo_gens: defaultdict = defaultdict(int)
+        self.user_gens: dict[Optional[int], int] = {}
+        self.repo_gens: dict[tuple[str, str, str], int] = {}
 
     @staticmethod
     def _user_key(user_id: Optional[int]) -> str:
@@ -172,10 +179,12 @@ class RepoSourceCache:
         three counters has been bumped, indicating an invalidation
         event landed during the probe window.
         """
+        # ``.get(key, 0)`` rather than indexing — keeps the read-only
+        # snapshot path from creating phantom entries (see __init__).
         return (
             self.global_gen,
-            self.user_gens[user_id],
-            self.repo_gens[(repo_type, namespace, name)],
+            self.user_gens.get(user_id, 0),
+            self.repo_gens.get((repo_type, namespace, name), 0),
         )
 
     def safe_set(
@@ -264,7 +273,8 @@ class RepoSourceCache:
         and the admin per-repo eviction endpoint — see the strict
         freshness contract.
         """
-        self.repo_gens[(repo_type, namespace, name)] += 1
+        key = (repo_type, namespace, name)
+        self.repo_gens[key] = self.repo_gens.get(key, 0) + 1
         suffix = f":{repo_type}:{namespace}/{name}"
         evicted_keys = [k for k in list(self.cache.keys()) if k.endswith(suffix)]
         for k in evicted_keys:
@@ -286,7 +296,7 @@ class RepoSourceCache:
         Triggered by user external-token POST/DELETE/PUT bulk and the
         admin per-user eviction endpoint.
         """
-        self.user_gens[user_id] += 1
+        self.user_gens[user_id] = self.user_gens.get(user_id, 0) + 1
         prefix = f"fallback:repo:u={self._user_key(user_id)}:"
         evicted_keys = [
             k for k in list(self.cache.keys()) if k.startswith(prefix)

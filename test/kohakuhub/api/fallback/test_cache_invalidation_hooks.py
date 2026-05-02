@@ -60,7 +60,7 @@ async def test_external_token_post_clears_user_cache(owner_client, backend_test_
     _seed(cache, user_id=owner_id, name="r1")
     _seed(cache, user_id=owner_id, name="r2")
     _seed(cache, user_id=owner_id + 9999, name="r1")  # different user, must survive
-    initial_user_gen = cache.user_gens[owner_id]
+    initial_user_gen = cache.user_gens.get(owner_id, 0)
 
     response = await owner_client.post(
         "/api/users/owner/external-tokens",
@@ -87,7 +87,7 @@ async def test_external_token_delete_clears_user_cache(owner_client, backend_tes
     assert add_response.status_code == 200
 
     _seed(cache, user_id=owner_id, name="r1")
-    initial_user_gen = cache.user_gens[owner_id]
+    initial_user_gen = cache.user_gens.get(owner_id, 0)
 
     delete_response = await owner_client.delete(
         "/api/users/owner/external-tokens/"
@@ -106,7 +106,7 @@ async def test_external_token_bulk_clears_user_cache(owner_client, backend_test_
 
     _seed(cache, user_id=owner_id, name="r1")
     _seed(cache, user_id=owner_id, name="r2")
-    initial_user_gen = cache.user_gens[owner_id]
+    initial_user_gen = cache.user_gens.get(owner_id, 0)
 
     response = await owner_client.put(
         "/api/users/owner/external-tokens/bulk",
@@ -137,7 +137,7 @@ async def test_repo_create_invalidates_repo_cache(owner_client, backend_test_sta
     _seed(cache, user_id=owner_id, name="ghost-create")
     _seed(cache, user_id=None, name="ghost-create")
     _seed(cache, user_id=owner_id, name="other-repo")  # different repo, must survive
-    initial_repo_gen = cache.repo_gens[("model", "owner", "ghost-create")]
+    initial_repo_gen = cache.repo_gens.get(("model", "owner", "ghost-create"), 0)
 
     response = await owner_client.post(
         "/api/repos/create",
@@ -174,7 +174,7 @@ async def test_repo_delete_invalidates_repo_cache(owner_client, backend_test_sta
     # Seed cache AFTER create (create itself bumps the gen).
     _seed(cache, user_id=owner_id, name="ghost-delete")
     _seed(cache, user_id=owner_id + 9999, name="ghost-delete")
-    initial_repo_gen = cache.repo_gens[("model", "owner", "ghost-delete")]
+    initial_repo_gen = cache.repo_gens.get(("model", "owner", "ghost-delete"), 0)
 
     delete_response = await owner_client.request(
         "DELETE",
@@ -204,8 +204,8 @@ async def test_repo_move_invalidates_both_old_and_new_repo_caches(
     # Seed both ids (the move endpoint should evict both).
     _seed(cache, user_id=owner_id, name="rename-source")
     _seed(cache, user_id=owner_id, name="rename-dest")
-    initial_src_gen = cache.repo_gens[("model", "owner", "rename-source")]
-    initial_dst_gen = cache.repo_gens[("model", "owner", "rename-dest")]
+    initial_src_gen = cache.repo_gens.get(("model", "owner", "rename-source"), 0)
+    initial_dst_gen = cache.repo_gens.get(("model", "owner", "rename-dest"), 0)
 
     move_response = await owner_client.post(
         "/api/repos/move",
@@ -245,7 +245,7 @@ async def test_repo_visibility_toggle_invalidates_repo_cache(
 
     _seed(cache, user_id=owner_id, name="visflip")
     _seed(cache, user_id=None, name="visflip")  # anonymous bucket too
-    initial_repo_gen = cache.repo_gens[("model", "owner", "visflip")]
+    initial_repo_gen = cache.repo_gens.get(("model", "owner", "visflip"), 0)
 
     settings_response = await owner_client.put(
         "/api/models/owner/visflip/settings",
@@ -281,7 +281,7 @@ async def test_repo_settings_non_visibility_does_not_invalidate(
     assert create_response.status_code == 200, create_response.text
 
     _seed(cache, user_id=owner_id, name="lfsonly")
-    initial_repo_gen = cache.repo_gens[("model", "owner", "lfsonly")]
+    initial_repo_gen = cache.repo_gens.get(("model", "owner", "lfsonly"), 0)
 
     # Update only an LFS setting — visibility unchanged.
     settings_response = await owner_client.put(
@@ -352,7 +352,7 @@ async def test_admin_invalidate_repo_endpoint(admin_client, backend_test_state):
     _seed(cache, user_id=1, name="target")
     _seed(cache, user_id=2, name="target")
     _seed(cache, user_id=1, name="other")
-    initial_target_gen = cache.repo_gens[("model", "owner", "target")]
+    initial_target_gen = cache.repo_gens.get(("model", "owner", "target"), 0)
 
     response = await admin_client.delete(
         "/admin/api/fallback-sources/cache/repo/model/owner/target"
@@ -374,7 +374,7 @@ async def test_admin_invalidate_user_endpoint(admin_client, backend_test_state):
     _seed(cache, user_id=42, name="r1")
     _seed(cache, user_id=42, name="r2")
     _seed(cache, user_id=99, name="r1")
-    initial_user_gen = cache.user_gens[42]
+    initial_user_gen = cache.user_gens.get(42, 0)
 
     response = await admin_client.delete(
         "/admin/api/fallback-sources/cache/user/42"
@@ -406,7 +406,7 @@ async def test_admin_invalidate_endpoints_require_admin_token(client):
 async def test_admin_invalidate_repo_with_no_entries(admin_client, backend_test_state):
     cache = _get_cache(backend_test_state)
     cache.clear()
-    initial_gen = cache.repo_gens[("model", "ghost", "ghost")]
+    initial_gen = cache.repo_gens.get(("model", "ghost", "ghost"), 0)
 
     response = await admin_client.delete(
         "/admin/api/fallback-sources/cache/repo/model/ghost/ghost"

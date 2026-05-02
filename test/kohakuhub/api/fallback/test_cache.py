@@ -101,8 +101,8 @@ def test_cache_invalidate_single_entry_no_gen_bump():
     assert cache.get(42, "abc", "model", "owner", "demo") is None
     # No generation bump — invalidate is a per-entry hygiene op only.
     assert cache.global_gen == 0
-    assert cache.user_gens[42] == 0
-    assert cache.repo_gens[("model", "owner", "demo")] == 0
+    assert cache.user_gens.get(42, 0) == 0
+    assert cache.repo_gens.get(("model", "owner", "demo"), 0) == 0
 
 
 def test_cache_invalidate_returns_false_when_absent():
@@ -178,11 +178,11 @@ def test_invalidate_repo_clears_all_user_buckets_for_one_repo():
 def test_invalidate_repo_bumps_repo_gen():
     cache = RepoSourceCache()
     _seed(cache, user_id=1)
-    initial = cache.repo_gens[("model", "owner", "demo")]
+    initial = cache.repo_gens.get(("model", "owner", "demo"), 0)
     cache.invalidate_repo("model", "owner", "demo")
     assert cache.repo_gens[("model", "owner", "demo")] == initial + 1
     # other repos' gens untouched
-    assert cache.repo_gens[("model", "owner", "other")] == 0
+    assert cache.repo_gens.get(("model", "owner", "other"), 0) == 0
 
 
 def test_invalidate_repo_with_no_entries_still_bumps_gen():
@@ -199,7 +199,7 @@ def test_invalidate_repo_does_not_touch_global_or_user_gens():
     _seed(cache, user_id=1)
     cache.invalidate_repo("model", "owner", "demo")
     assert cache.global_gen == 0
-    assert cache.user_gens[1] == 0
+    assert cache.user_gens.get(1, 0) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +235,11 @@ def test_clear_user_anonymous_clears_anon_bucket():
 def test_clear_user_bumps_user_gen():
     cache = RepoSourceCache()
     _seed(cache, user_id=42)
-    initial = cache.user_gens[42]
+    initial = cache.user_gens.get(42, 0)
     cache.clear_user(42)
     assert cache.user_gens[42] == initial + 1
     # Other user gens untouched
-    assert cache.user_gens[7] == 0
+    assert cache.user_gens.get(7, 0) == 0
 
 
 def test_clear_user_with_no_entries_still_bumps_gen():
@@ -253,7 +253,7 @@ def test_clear_user_does_not_touch_global_or_repo_gens():
     _seed(cache, user_id=1)
     cache.clear_user(1)
     assert cache.global_gen == 0
-    assert cache.repo_gens[("model", "owner", "demo")] == 0
+    assert cache.repo_gens.get(("model", "owner", "demo"), 0) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +395,69 @@ def test_reset_cache_for_tests_drops_singleton():
     cache_module.reset_cache_for_tests()
     b = cache_module.get_cache()
     assert a is not b
+
+
+# ---------------------------------------------------------------------------
+# Phantom-entry regression (PR #81 review item #1)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_does_not_create_phantom_user_gens_entries():
+    """Read-only ``snapshot`` MUST NOT materialize entries in
+    ``user_gens``. With the old ``defaultdict(int)`` implementation
+    every ``snapshot(user_id, ...)`` left a permanent zero-valued
+    entry — an unbounded leak under workloads with high user
+    cardinality (e.g. every request adds one). The fix uses
+    ``dict.get(key, 0)`` in ``snapshot``; this test pins the
+    invariant.
+    """
+    cache = RepoSourceCache()
+    for uid in range(1000):
+        cache.snapshot(uid, "model", "ns", "demo")
+    assert len(cache.user_gens) == 0, (
+        "snapshot must not insert into user_gens — that's the leak fixed in #81"
+    )
+
+
+def test_snapshot_does_not_create_phantom_repo_gens_entries():
+    """Same invariant for ``repo_gens``: distinct repo identities
+    queried via ``snapshot`` must not accumulate phantom entries.
+    """
+    cache = RepoSourceCache()
+    for i in range(1000):
+        cache.snapshot(None, "model", "ns", f"repo-{i}")
+    assert len(cache.repo_gens) == 0, (
+        "snapshot must not insert into repo_gens — that's the leak fixed in #81"
+    )
+
+
+def test_get_does_not_create_phantom_gens_entries():
+    """``get`` (cache miss) must not create entries either."""
+    cache = RepoSourceCache()
+    for i in range(1000):
+        cache.get(i, f"hash{i}", "model", "ns", f"repo-{i}")
+    assert len(cache.user_gens) == 0
+    assert len(cache.repo_gens) == 0
+
+
+def test_invalidate_repo_only_inserts_for_invalidated_keys():
+    """``invalidate_repo`` is the only legitimate writer to
+    ``repo_gens``; verify cardinality matches the number of
+    distinct repos invalidated."""
+    cache = RepoSourceCache()
+    cache.invalidate_repo("model", "ns", "r1")
+    cache.invalidate_repo("model", "ns", "r2")
+    cache.invalidate_repo("dataset", "ns", "r1")
+    assert len(cache.repo_gens) == 3
+
+
+def test_clear_user_only_inserts_for_cleared_users():
+    """``clear_user`` is the only legitimate writer to ``user_gens``."""
+    cache = RepoSourceCache()
+    cache.clear_user(1)
+    cache.clear_user(2)
+    cache.clear_user(None)  # anonymous bucket
+    assert len(cache.user_gens) == 3
 
 
 # ---------------------------------------------------------------------------
