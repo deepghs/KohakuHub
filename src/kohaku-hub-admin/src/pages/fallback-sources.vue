@@ -10,6 +10,11 @@ import {
   deleteFallbackSource,
   getFallbackCacheStats,
   clearFallbackCache,
+  invalidateFallbackRepoCache,
+  invalidateFallbackUserCacheById,
+  invalidateFallbackUserCacheByUsername,
+  listUsers,
+  listRepositories,
 } from "@/utils/api";
 import { ElMessage, ElMessageBox } from "element-plus";
 import dayjs from "dayjs";
@@ -33,6 +38,24 @@ const formData = ref({
   name: "",
   source_type: "huggingface",
   enabled: true,
+});
+
+// Per-repo eviction dialog (#79 admin tooling).
+const evictRepoDialogVisible = ref(false);
+const evictRepoForm = ref({
+  repo_type: "model",
+  namespace: "",
+  name: "",
+});
+
+// Per-user eviction dialog. ``mode`` toggles between username- and
+// user_id-keyed paths so an admin who only knows one of the two doesn't
+// have to leave the page to look up the other.
+const evictUserDialogVisible = ref(false);
+const evictUserForm = ref({
+  mode: "username", // "username" | "user_id"
+  username: "",
+  user_id: null,
 });
 
 function checkAuth() {
@@ -210,6 +233,245 @@ async function handleClearCache() {
   }
 }
 
+function openEvictRepoDialog() {
+  evictRepoForm.value = {
+    repo_type: "model",
+    namespace: "",
+    name: "",
+  };
+  evictRepoDialogVisible.value = true;
+}
+
+// Autocomplete suggestion fetchers (#79). Each is scoped to the right
+// admin lookup for the field it serves:
+//
+//  - namespace (evict-by-repo dialog) → ``listUsers(include_orgs=true)``
+//    because a repository's namespace is either a user **or** an
+//    organisation, and listUsers in that mode returns the union.
+//
+//  - repo name (evict-by-repo dialog, given a fixed namespace) →
+//    ``listRepositories(namespace, repo_type)`` for the
+//    namespace-scoped enumeration. The query string filters
+//    server-side via the existing ``search`` param.
+//
+//  - username (evict-by-user dialog, username mode) →
+//    ``listUsers(include_orgs=false)``. Per the post-#79 cache key
+//    shape ``(user_id_or_None, tokens_hash, repo_type, ns, name)``,
+//    user_id is the request originator — orgs never originate a
+//    request, so they have no cache bucket to evict and don't belong
+//    in these suggestions.
+//
+// All three return ``{value: string}[]`` per Element Plus's
+// ``el-autocomplete`` ``fetch-suggestions`` contract.
+async function fetchNamespaceSuggestions(query, cb) {
+  if (!checkAuth()) {
+    cb([]);
+    return;
+  }
+  try {
+    if (!query || query.length < 1) {
+      cb([]);
+      return;
+    }
+    const data = await listUsers(adminStore.token, {
+      search: query,
+      limit: 20,
+      include_orgs: true, // namespaces span both users and orgs
+    });
+    const items = Array.isArray(data) ? data : data?.users || data?.items || [];
+    cb(
+      items
+        .filter((u) => u.username)
+        .map((u) => ({ value: u.username })),
+    );
+  } catch (error) {
+    console.error("Failed to fetch namespace suggestions:", error);
+    cb([]);
+  }
+}
+
+async function fetchRepoNameSuggestions(query, cb) {
+  if (!checkAuth()) {
+    cb([]);
+    return;
+  }
+  try {
+    if (!query || query.length < 1) {
+      cb([]);
+      return;
+    }
+    // Namespace-scoped enumeration. Without a chosen namespace we
+    // can't bound the search to a single namespace, so fall back to
+    // a coarse filter — but this dialog asks the operator to pick
+    // namespace first, so the namespace-empty case is a UX hint to
+    // fill that field first.
+    const data = await listRepositories(adminStore.token, {
+      search: query,
+      repo_type: evictRepoForm.value.repo_type,
+      namespace: evictRepoForm.value.namespace || undefined,
+      limit: 20,
+    });
+    // Backend wraps under ``{repositories: [...]}`` (admin /repositories
+    // route shape); also tolerate ``{items: [...]}`` and a raw array
+    // for forward compatibility.
+    const items = Array.isArray(data)
+      ? data
+      : data?.repositories || data?.items || [];
+    cb(
+      items
+        .filter((repo) => repo.name)
+        .map((repo) => ({ value: repo.name })),
+    );
+  } catch (error) {
+    console.error("Failed to fetch repo name suggestions:", error);
+    cb([]);
+  }
+}
+
+async function fetchUsernameSuggestions(query, cb) {
+  if (!checkAuth()) {
+    cb([]);
+    return;
+  }
+  try {
+    if (!query || query.length < 1) {
+      cb([]);
+      return;
+    }
+    // ``include_orgs: false`` — fallback cache buckets are keyed by the
+    // real user_id of the request originator. Orgs never make requests
+    // themselves, so they have no bucket to evict and don't belong in
+    // these suggestions.
+    const data = await listUsers(adminStore.token, {
+      search: query,
+      limit: 20,
+      include_orgs: false,
+    });
+    const items = Array.isArray(data) ? data : data?.users || data?.items || [];
+    cb(
+      items
+        .filter((u) => u.username)
+        .map((u) => ({ value: u.username })),
+    );
+  } catch (error) {
+    console.error("Failed to fetch username suggestions:", error);
+    cb([]);
+  }
+}
+
+function openEvictUserDialog() {
+  evictUserForm.value = {
+    mode: "username",
+    username: "",
+    user_id: null,
+  };
+  evictUserDialogVisible.value = true;
+}
+
+async function handleEvictRepo() {
+  if (!checkAuth()) return;
+
+  const { repo_type, namespace, name } = evictRepoForm.value;
+  if (!repo_type || !namespace || !name) {
+    ElMessage.error("repo_type, namespace, and name are all required");
+    return;
+  }
+
+  loading.value = true;
+  try {
+    const result = await invalidateFallbackRepoCache(
+      adminStore.token,
+      repo_type,
+      namespace.trim(),
+      name.trim(),
+    );
+    ElMessage.success(
+      `Evicted ${result.evicted} cache entr${result.evicted === 1 ? "y" : "ies"} for ${repo_type}/${namespace}/${name}`,
+    );
+    evictRepoDialogVisible.value = false;
+    await loadCacheStats();
+  } catch (error) {
+    console.error("Failed to evict repo cache:", error);
+    ElMessage.error(
+      error.response?.data?.detail?.error || "Failed to evict repo cache",
+    );
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function handleEvictUser() {
+  if (!checkAuth()) return;
+
+  const { mode, username, user_id } = evictUserForm.value;
+
+  if (mode === "username") {
+    if (!username || !username.trim()) {
+      ElMessage.error("Username is required");
+      return;
+    }
+  } else {
+    if (user_id == null || Number.isNaN(Number(user_id)) || Number(user_id) <= 0) {
+      ElMessage.error("user_id must be a positive integer");
+      return;
+    }
+  }
+
+  // Strong confirm — per-user eviction crosses every repo this user has
+  // bound. See PR #81 review item #5–#12 noted comment for the
+  // confirm-on-broad-scope rule.
+  try {
+    const targetLabel =
+      mode === "username" ? `username "${username}"` : `user_id ${user_id}`;
+    await ElMessageBox.confirm(
+      `Evict every cached fallback binding for ${targetLabel}? This drops every repo binding the user has cached and forces a re-probe on their next request.`,
+      "Confirm User Cache Eviction",
+      {
+        confirmButtonText: "Evict",
+        cancelButtonText: "Cancel",
+        type: "warning",
+      },
+    );
+  } catch (error) {
+    if (error !== "cancel") {
+      console.error("Confirm dialog dismissed unexpectedly:", error);
+    }
+    return;
+  }
+
+  loading.value = true;
+  try {
+    let result;
+    if (mode === "username") {
+      result = await invalidateFallbackUserCacheByUsername(
+        adminStore.token,
+        username.trim(),
+      );
+    } else {
+      result = await invalidateFallbackUserCacheById(
+        adminStore.token,
+        Number(user_id),
+      );
+    }
+    const tail =
+      mode === "username"
+        ? `${username} (user_id=${result.user_id})`
+        : `user_id=${user_id}`;
+    ElMessage.success(
+      `Evicted ${result.evicted} cache entr${result.evicted === 1 ? "y" : "ies"} for ${tail}`,
+    );
+    evictUserDialogVisible.value = false;
+    await loadCacheStats();
+  } catch (error) {
+    console.error("Failed to evict user cache:", error);
+    ElMessage.error(
+      error.response?.data?.detail?.error || "Failed to evict user cache",
+    );
+  } finally {
+    loading.value = false;
+  }
+}
+
 function formatDate(dateStr) {
   return dayjs(dateStr).format("YYYY-MM-DD HH:mm:ss");
 }
@@ -222,13 +484,17 @@ onMounted(() => {
 
 <template>
   <AdminLayout>
-    <div class="fallback-sources-page">
-      <div class="page-header">
-        <h1>Fallback Sources</h1>
-        <p>
-          Manage external repository sources (HuggingFace, other KohakuHub
-          instances)
-        </p>
+    <div class="page-container">
+      <div class="flex justify-between items-center mb-6 gap-4 flex-wrap">
+        <div>
+          <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100">
+            Fallback Sources
+          </h1>
+          <p class="text-gray-500 dark:text-gray-400 text-sm mt-1">
+            Manage external repository sources (HuggingFace, other KohakuHub
+            instances).
+          </p>
+        </div>
       </div>
 
       <!-- Cache Stats Card -->
@@ -236,15 +502,37 @@ onMounted(() => {
         <template #header>
           <div class="card-header">
             <span>Cache Statistics</span>
-            <el-button
-              type="danger"
-              size="small"
-              @click="handleClearCache"
-              :loading="loading"
-            >
-              <i class="i-carbon-trash-can mr-1"></i>
-              Clear Cache
-            </el-button>
+            <div class="cache-actions">
+              <el-button
+                type="warning"
+                size="small"
+                @click="openEvictRepoDialog"
+                :loading="loading"
+                data-testid="evict-repo-button"
+              >
+                <i class="i-carbon-cube mr-1"></i>
+                Evict by Repo...
+              </el-button>
+              <el-button
+                type="warning"
+                size="small"
+                @click="openEvictUserDialog"
+                :loading="loading"
+                data-testid="evict-user-button"
+              >
+                <i class="i-carbon-user mr-1"></i>
+                Evict by User...
+              </el-button>
+              <el-button
+                type="danger"
+                size="small"
+                @click="handleClearCache"
+                :loading="loading"
+              >
+                <i class="i-carbon-trash-can mr-1"></i>
+                Clear Cache
+              </el-button>
+            </div>
           </div>
         </template>
         <div class="stats-grid">
@@ -454,13 +742,132 @@ onMounted(() => {
           </el-button>
         </template>
       </el-dialog>
+
+      <!-- Per-repo cache eviction dialog (#79) -->
+      <el-dialog
+        v-model="evictRepoDialogVisible"
+        title="Evict Fallback Cache by Repo"
+        width="540px"
+        data-testid="evict-repo-dialog"
+      >
+        <p class="dialog-help">
+          Drop every cached source binding for one repository, across all
+          users. Useful when you know an upstream repo's state changed and
+          you don't want to wait for the TTL.
+        </p>
+        <el-form :model="evictRepoForm" label-width="120px">
+          <el-form-item label="Repo type" required>
+            <el-select
+              v-model="evictRepoForm.repo_type"
+              style="width: 100%"
+              data-testid="evict-repo-type"
+            >
+              <el-option label="model" value="model" />
+              <el-option label="dataset" value="dataset" />
+              <el-option label="space" value="space" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="Namespace" required>
+            <el-autocomplete
+              v-model="evictRepoForm.namespace"
+              :fetch-suggestions="fetchNamespaceSuggestions"
+              placeholder="owner / org name"
+              clearable
+              style="width: 100%"
+              data-testid="evict-repo-namespace"
+            />
+          </el-form-item>
+          <el-form-item label="Name" required>
+            <el-autocomplete
+              v-model="evictRepoForm.name"
+              :fetch-suggestions="fetchRepoNameSuggestions"
+              placeholder="repo name"
+              clearable
+              style="width: 100%"
+              data-testid="evict-repo-name"
+            />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="evictRepoDialogVisible = false">Cancel</el-button>
+          <el-button
+            type="warning"
+            @click="handleEvictRepo"
+            :loading="loading"
+            data-testid="evict-repo-submit"
+          >
+            Evict
+          </el-button>
+        </template>
+      </el-dialog>
+
+      <!-- Per-user cache eviction dialog (#79) -->
+      <el-dialog
+        v-model="evictUserDialogVisible"
+        title="Evict Fallback Cache by User"
+        width="540px"
+        data-testid="evict-user-dialog"
+      >
+        <p class="dialog-help">
+          Drop every cached source binding belonging to one user (across
+          every repo they have a binding for). The next request from that
+          user re-probes the chain. Address by username (resolved
+          server-side) or numeric user_id (script-friendly).
+        </p>
+        <el-form :model="evictUserForm" label-width="120px">
+          <el-form-item label="Mode" required>
+            <el-radio-group
+              v-model="evictUserForm.mode"
+              data-testid="evict-user-mode"
+            >
+              <el-radio value="username">By username</el-radio>
+              <el-radio value="user_id">By user_id</el-radio>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item
+            v-if="evictUserForm.mode === 'username'"
+            label="Username"
+            required
+          >
+            <el-autocomplete
+              v-model="evictUserForm.username"
+              :fetch-suggestions="fetchUsernameSuggestions"
+              placeholder="e.g. mai_lin"
+              clearable
+              style="width: 100%"
+              data-testid="evict-user-username"
+            />
+          </el-form-item>
+          <el-form-item v-else label="User ID" required>
+            <el-input-number
+              v-model="evictUserForm.user_id"
+              :min="1"
+              style="width: 100%"
+              data-testid="evict-user-userid"
+            />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="evictUserDialogVisible = false">Cancel</el-button>
+          <el-button
+            type="warning"
+            @click="handleEvictUser"
+            :loading="loading"
+            data-testid="evict-user-submit"
+          >
+            Evict...
+          </el-button>
+        </template>
+      </el-dialog>
     </div>
   </AdminLayout>
 </template>
 
 <style scoped>
-.fallback-sources-page {
-  padding: 20px;
+.page-container {
+  padding: 24px;
+  max-width: 1280px;
+  margin: 0 auto;
 }
 
 .page-header {
@@ -486,6 +893,19 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.cache-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dialog-help {
+  margin: 0 0 16px 0;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .stats-grid {

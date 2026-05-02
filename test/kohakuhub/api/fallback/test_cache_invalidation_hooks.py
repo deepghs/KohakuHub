@@ -456,3 +456,74 @@ async def test_admin_invalidate_user_endpoint_500_on_internal_error(
     )
     assert response.status_code == 500
     assert "Failed to invalidate user cache" in response.json()["detail"]["error"]
+
+
+# ---------------------------------------------------------------------------
+# Username-based eviction endpoint (admin-frontend convenience path)
+# ---------------------------------------------------------------------------
+
+
+async def test_admin_invalidate_username_endpoint_success(
+    admin_client, backend_test_state
+):
+    cache = _get_cache(backend_test_state)
+    cache.clear()
+    owner_id = _get_owner_id(backend_test_state)
+
+    _seed(cache, user_id=owner_id, name="r1")
+    _seed(cache, user_id=owner_id, name="r2")
+    _seed(cache, user_id=owner_id + 9999, name="r1")  # different user, must survive
+
+    response = await admin_client.delete(
+        "/admin/api/fallback-sources/cache/username/owner"
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["success"] is True
+    assert body["evicted"] == 2
+    assert body["username"] == "owner"
+    assert body["user_id"] == owner_id
+
+    # owner buckets gone, other user's bucket survives.
+    assert cache.get(owner_id, "", "model", "owner", "r1") is None
+    assert cache.get(owner_id, "", "model", "owner", "r2") is None
+    assert cache.get(owner_id + 9999, "", "model", "owner", "r1") is not None
+
+
+async def test_admin_invalidate_username_endpoint_404_unknown_user(
+    admin_client,
+):
+    response = await admin_client.delete(
+        "/admin/api/fallback-sources/cache/username/no-such-user-zzz"
+    )
+    assert response.status_code == 404
+    assert "User not found" in response.json()["detail"]["error"]
+
+
+async def test_admin_invalidate_username_endpoint_requires_admin_token(client):
+    response = await client.delete(
+        "/admin/api/fallback-sources/cache/username/owner"
+    )
+    assert response.status_code in (401, 403)
+
+
+async def test_admin_invalidate_username_endpoint_500_on_internal_error(
+    admin_client, backend_test_state, monkeypatch
+):
+    """Inject a failure into ``clear_user`` to exercise the 500 handler
+    on the username-based path (separate from the user_id-based one)."""
+    cache = _get_cache(backend_test_state)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(cache, "clear_user", boom)
+
+    response = await admin_client.delete(
+        "/admin/api/fallback-sources/cache/username/owner"
+    )
+    assert response.status_code == 500
+    assert (
+        "Failed to invalidate user cache by username"
+        in response.json()["detail"]["error"]
+    )

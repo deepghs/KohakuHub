@@ -802,6 +802,64 @@ export async function clearFallbackCache(token) {
   return response.data;
 }
 
+/**
+ * Evict every cached binding for one repo across all user buckets.
+ * Bumps the repo's generation counter so any in-flight probe's
+ * ``safe_set`` is rejected. Use as a surgical alternative to the
+ * global ``clearFallbackCache`` when only one repo's cache is stale.
+ *
+ * @param {string} token - Admin token
+ * @param {("model"|"dataset"|"space")} repoType
+ * @param {string} namespace - Repository namespace (no slashes)
+ * @param {string} name - Repository name (no slashes)
+ * @returns {Promise<{success: boolean, evicted: number, repo_type: string, namespace: string, name: string}>}
+ */
+export async function invalidateFallbackRepoCache(
+  token,
+  repoType,
+  namespace,
+  name,
+) {
+  const client = createAdminClient(token);
+  const response = await client.delete(
+    `/fallback-sources/cache/repo/${encodeURIComponent(repoType)}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+  );
+  return response.data;
+}
+
+/**
+ * Evict every cached binding for one user across all repos, addressed
+ * by numeric ``user_id``. Bumps that user's generation counter.
+ *
+ * @param {string} token - Admin token
+ * @param {number} userId - User PK
+ * @returns {Promise<{success: boolean, evicted: number, user_id: number}>}
+ */
+export async function invalidateFallbackUserCacheById(token, userId) {
+  const client = createAdminClient(token);
+  const response = await client.delete(
+    `/fallback-sources/cache/user/${encodeURIComponent(userId)}`,
+  );
+  return response.data;
+}
+
+/**
+ * Evict every cached binding for one user across all repos, addressed
+ * by ``username``. Convenience wrapper that the backend resolves to
+ * ``user_id`` server-side.
+ *
+ * @param {string} token - Admin token
+ * @param {string} username - Username (case-sensitive)
+ * @returns {Promise<{success: boolean, evicted: number, user_id: number, username: string}>}
+ */
+export async function invalidateFallbackUserCacheByUsername(token, username) {
+  const client = createAdminClient(token);
+  const response = await client.delete(
+    `/fallback-sources/cache/username/${encodeURIComponent(username)}`,
+  );
+  return response.data;
+}
+
 // ===== Repository Management =====
 
 /**

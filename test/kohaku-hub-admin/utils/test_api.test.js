@@ -165,6 +165,14 @@ describe("admin API client", () => {
     await api.deleteFallbackSource("admin-token", 3);
     await api.getFallbackCacheStats("admin-token");
     await api.clearFallbackCache("admin-token");
+    await api.invalidateFallbackRepoCache(
+      "admin-token",
+      "model",
+      "mai_lin",
+      "lineart-caption-base",
+    );
+    await api.invalidateFallbackUserCacheById("admin-token", 42);
+    await api.invalidateFallbackUserCacheByUsername("admin-token", "mai_lin");
 
     await api.deleteRepositoryAdmin(
       "admin-token",
@@ -279,6 +287,15 @@ describe("admin API client", () => {
     expect(client.get).toHaveBeenCalledWith("/fallback-sources", {
       params: { namespace: "mai_lin", enabled: true },
     });
+    expect(client.delete).toHaveBeenCalledWith(
+      "/fallback-sources/cache/repo/model/mai_lin/lineart-caption-base",
+    );
+    expect(client.delete).toHaveBeenCalledWith(
+      "/fallback-sources/cache/user/42",
+    );
+    expect(client.delete).toHaveBeenCalledWith(
+      "/fallback-sources/cache/username/mai_lin",
+    );
     expect(client.delete).toHaveBeenCalledWith(
       "/storage/objects/models%2Fdemo%2Ffile.bin",
     );

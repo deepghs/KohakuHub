@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from kohakuhub.db import FallbackSource, db
+from kohakuhub.db import FallbackSource, User, db
 from kohakuhub.logger import get_logger
 from kohakuhub.api.admin.utils.auth import verify_admin_token
 from kohakuhub.api.fallback.cache import get_cache
@@ -487,4 +487,59 @@ async def invalidate_user_cache(
         logger.error(f"Failed to invalidate user cache: {e}")
         raise HTTPException(
             500, detail={"error": f"Failed to invalidate user cache: {str(e)}"}
+        )
+
+
+@router.delete("/fallback-sources/cache/username/{username}")
+async def invalidate_user_cache_by_username(
+    username: str,
+    _admin=Depends(verify_admin_token),
+):
+    """Evict cache for one user identified by username (UX-friendly path).
+
+    Convenience wrapper around ``DELETE .../cache/user/{user_id}``: looks
+    up the user by name and forwards to ``cache.clear_user(user.id)``.
+    The admin frontend uses this so operators don't have to hand-look up
+    a numeric user_id.
+
+    Args:
+        username: Username (case-sensitive, matches the User table).
+        _admin: Admin authentication dependency.
+
+    Returns:
+        ``{success, evicted, user_id, username}``.
+
+    Raises:
+        404 if no user with that username exists.
+    """
+    try:
+        user = User.get_or_none(User.username == username)
+        if user is None:
+            raise HTTPException(
+                404, detail={"error": f"User not found: {username}"}
+            )
+        cache = get_cache()
+        evicted = cache.clear_user(user.id)
+
+        logger.info(
+            f"Admin invalidated fallback cache for username={username} "
+            f"(user_id={user.id}, {evicted} entries)"
+        )
+
+        return {
+            "success": True,
+            "evicted": evicted,
+            "user_id": user.id,
+            "username": username,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to invalidate user cache by username: {e}")
+        raise HTTPException(
+            500,
+            detail={
+                "error": f"Failed to invalidate user cache by username: {str(e)}"
+            },
         )
