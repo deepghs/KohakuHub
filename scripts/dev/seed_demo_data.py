@@ -487,6 +487,90 @@ ORGANIZATIONS = ORGANIZATIONS + (
 )
 
 
+# PR #77 strict-consistency demo orgs. Each one's name is identical to a
+# real HuggingFace org/user, so any local repo created under it
+# collides on path with HF and exercises the namespace-priority +
+# X-Error-Code gating contracts. mai_lin owns each as super-admin to
+# keep the management surface simple — see ``build_pr77_demo_repo_seeds``
+# for the corresponding repos.
+PR77_DEMO_ORGS_MEMBERS: tuple[tuple[str, str], ...] = (
+    ("mai_lin", "super-admin"),
+)
+ORGANIZATIONS = ORGANIZATIONS + (
+    OrganizationSeed(
+        name="openai-community",
+        description=(
+            "PR #77 demo: locally collides with the real HuggingFace org of "
+            "the same name. Houses a structurally-different gpt2 repo to "
+            "exercise the namespace-priority + EntryNotFound short-circuit."
+        ),
+        bio=(
+            "Local-only demo org. Browse the gpt2 repo to see the README "
+            "explaining the strict-consistency contract this PR locks down."
+        ),
+        website="",
+        social_media={},
+        avatar_bg="#1f2937",
+        avatar_accent="#fbbf24",
+        members=PR77_DEMO_ORGS_MEMBERS,
+    ),
+    OrganizationSeed(
+        name="bigscience",
+        description=(
+            "PR #77 demo: locally collides with the HF bigscience org. "
+            "Houses a tiny bloom repo (sister case to openai-community/gpt2)."
+        ),
+        bio=(
+            "Local-only demo org for namespace-collision tests. The bloom "
+            "repo here is README + a small text note — enough to prove the "
+            "rule isn't tied to one specific repo path."
+        ),
+        website="",
+        social_media={},
+        avatar_bg="#7c2d12",
+        avatar_accent="#fed7aa",
+        members=PR77_DEMO_ORGS_MEMBERS,
+    ),
+    OrganizationSeed(
+        name="meta-llama",
+        description=(
+            "PR #77 demo: locally collides with the HF meta-llama org. "
+            "Llama-2-7b on HF is GATED; the local-namespace-ownership "
+            "contract holds even against gated upstreams."
+        ),
+        bio=(
+            "Local-only demo org. The Llama-2-7b repo here demonstrates "
+            "that strict consistency holds even when the same path on HF "
+            "is gated — the gated 401 never reaches the client when local "
+            "owns the namespace."
+        ),
+        website="",
+        social_media={},
+        avatar_bg="#312e81",
+        avatar_accent="#a5b4fc",
+        members=PR77_DEMO_ORGS_MEMBERS,
+    ),
+    OrganizationSeed(
+        name="narugo1992-pr77-demo",
+        description=(
+            "PR #77 demo: pure-fallback path. Repos referenced from the "
+            "`guide` README don't exist locally; this org just hosts the "
+            "guide itself."
+        ),
+        bio=(
+            "Pure-fallback walk-through: this README documents how the "
+            "fallback chain serves HF-only repos (success, 404, gated) "
+            "when local has no collision."
+        ),
+        website="",
+        social_media={},
+        avatar_bg="#0f766e",
+        avatar_accent="#ccfbf1",
+        members=PR77_DEMO_ORGS_MEMBERS,
+    ),
+)
+
+
 SAFEBOORU_IMAGE_ASSETS: tuple[RemoteAsset, ...] = (
     RemoteAsset(
         cache_name="safebooru-canal-reflections.png",
@@ -3714,6 +3798,460 @@ def build_tree_expand_stress_seeds() -> tuple[RepoSeed, ...]:
     )
 
 
+def build_pr77_demo_repo_seeds() -> tuple[RepoSeed, ...]:
+    """Four local-only repos whose ``(namespace, name)`` collides with
+    real HuggingFace repos but whose content is intentionally
+    structurally different. Each repo's ``README.md`` is the
+    verification guide for the contract that repo demonstrates;
+    visit them in the SPA at ``/{namespace}/{name}`` after seeding.
+    See PR #77 for the design rationale.
+    """
+    gpt2_readme = text_bytes(
+        """
+        # PR #77 demo: openai-community/gpt2 (LOCAL)
+
+        This is a **local-only** repository at `openai-community/gpt2`.
+        The same path on HuggingFace is the famous GPT-2 with weights,
+        config, tokenizer, etc. This local repo holds **only this README** —
+        no model weights, no `config.json`, no tokenizer.
+
+        ## What this demonstrates
+
+        The dev backend is configured with a single fallback source
+        pointing at `https://huggingface.co`. PR #77's strict-consistency
+        rule: **the local namespace owns its name**. Even when the
+        requested file exists on HF, a local repo at the same
+        `(namespace, name)` is the only place the response can come from.
+
+        ## One-shot verification command
+
+        Asserts every contract below in one go:
+
+        ```bash
+        PYTHONPATH=src python scripts/dev/seed_pr77_demo.py
+        ```
+
+        Output ends with `OK — every PR #77 demo contract holds end-to-end`
+        when the contracts are intact.
+
+        ## Wire-level checks (curl, copy-pasteable)
+
+        ### Missing-file short-circuit (the headline contract)
+
+        ```bash
+        curl -i http://127.0.0.1:48888/openai-community/gpt2/resolve/main/config.json
+        ```
+
+        Expected response:
+
+        ```
+        HTTP/1.1 404 Not Found
+        X-Error-Code: EntryNotFound
+        X-Error-Message: Entry 'config.json' not found in repository 'openai-community/gpt2' at revision 'main'
+        ```
+
+        Critical: **no** `X-Source` / `X-Source-Count` headers — the
+        fallback chain did not run. Compare with `?fallback=false`:
+
+        ```bash
+        curl -i 'http://127.0.0.1:48888/openai-community/gpt2/resolve/main/config.json?fallback=false'
+        ```
+
+        Headers should be byte-identical (modulo `Date` / `X-Request-Id`).
+
+        ### Missing-revision short-circuit
+
+        ```bash
+        curl -i http://127.0.0.1:48888/openai-community/gpt2/resolve/no-such-branch/README.md
+        ```
+
+        Expected: `404 + X-Error-Code: EntryNotFound` (or
+        `RevisionNotFound` depending on the local handler version),
+        no `X-Source-Count`.
+
+        ### Local-success wins on the README
+
+        ```bash
+        curl -sL http://127.0.0.1:48888/openai-community/gpt2/resolve/main/README.md | head -1
+        ```
+
+        Expected: `# PR #77 demo: openai-community/gpt2 (LOCAL)` —
+        NOT HuggingFace's GPT-2 README.
+
+        ## Python equivalents (huggingface_hub)
+
+        ```python
+        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub.errors import (
+            EntryNotFoundError, RevisionNotFoundError,
+        )
+
+        api = HfApi(endpoint="http://127.0.0.1:48888", token="<your-khub-token>")
+
+        # (a) local data wins
+        assert api.list_repo_files("openai-community/gpt2") == ["README.md"]
+
+        # (b) missing file -> EntryNotFoundError (NOT silent HF download)
+        try:
+            hf_hub_download(
+                "openai-community/gpt2", "config.json",
+                endpoint="http://127.0.0.1:48888",
+                token="<your-khub-token>",
+            )
+            raise AssertionError("FAIL: cross-source mixing")
+        except EntryNotFoundError:
+            pass
+
+        # (c) missing revision -> RevisionNotFoundError, no fallback
+        try:
+            hf_hub_download(
+                "openai-community/gpt2", "README.md",
+                revision="bogus-branch",
+                endpoint="http://127.0.0.1:48888",
+                token="<your-khub-token>",
+            )
+        except (RevisionNotFoundError, EntryNotFoundError):
+            pass
+        ```
+
+        ## Pre-fix counterfactual
+
+        Pre-#77 the chain would have walked to HF, served HF's GPT-2
+        config.json bytes for what the client thinks is *this* local
+        repo — two distinct repos collapsed into one `repo_id`. The
+        contracts above are the wire-level discriminator between the
+        fixed and the buggy behavior.
+        """
+    )
+
+    bloom_readme = text_bytes(
+        """
+        # PR #77 demo: bigscience/bloom (LOCAL)
+
+        Local-only repo at `bigscience/bloom`. HF has the real BLOOM 176B
+        at the same path. Sister case to `openai-community/gpt2` — same
+        contract, different namespace, proves the rule isn't tied to one
+        repo path.
+
+        ## One-shot verification
+
+        ```bash
+        PYTHONPATH=src python scripts/dev/seed_pr77_demo.py
+        ```
+
+        Output includes `bigscience/bloom — sister case, different namespace`
+        with two ✓ lines.
+
+        ## Wire-level (curl)
+
+        ```bash
+        curl -i http://127.0.0.1:48888/bigscience/bloom/resolve/main/config.json
+        ```
+
+        Expected:
+
+        ```
+        HTTP/1.1 404 Not Found
+        X-Error-Code: EntryNotFound
+        X-Error-Message: Entry 'config.json' not found in repository 'bigscience/bloom' at revision 'main'
+        ```
+
+        No `X-Source-Count` — local short-circuit, HF's BLOOM never asked.
+
+        ## Python equivalent
+
+        ```python
+        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError
+
+        api = HfApi(endpoint="http://127.0.0.1:48888", token="<your-khub-token>")
+        assert sorted(api.list_repo_files("bigscience/bloom")) == ["README.md", "demo-note.txt"]
+
+        try:
+            hf_hub_download(
+                "bigscience/bloom", "config.json",
+                endpoint="http://127.0.0.1:48888",
+                token="<your-khub-token>",
+            )
+            raise AssertionError("FAIL: cross-source mixing")
+        except EntryNotFoundError:
+            pass
+        ```
+        """
+    )
+
+    bloom_demo_note = text_bytes(
+        """
+        This file proves the local repo has non-trivial content.
+
+        The PR #77 contract: a request for any of the *real* HF BLOOM
+        files (config.json, tokenizer.json, model shards, etc.) against
+        this khub MUST raise EntryNotFoundError, NOT silently download
+        HF's bytes.
+        """
+    )
+
+    llama_readme = text_bytes(
+        """
+        # PR #77 demo: meta-llama/Llama-2-7b (LOCAL, with gated HF sibling)
+
+        Local-only repo at `meta-llama/Llama-2-7b`. The same path on HF
+        is **gated** — anonymous callers get `401 + X-Error-Code: GatedRepo`.
+        This local repo holds only this README.
+
+        ## What this demonstrates
+
+        The strict-consistency contract holds against a *gated* upstream:
+        local namespace ownership is absolute. The gated HF response
+        never reaches the client - not as content, not as a misleading
+        `GatedRepoError`, not as anything.
+
+        ## One-shot verification
+
+        ```bash
+        PYTHONPATH=src python scripts/dev/seed_pr77_demo.py
+        ```
+
+        Output includes a `meta-llama/Llama-2-7b — gated upstream` block
+        with two ✓ lines (the EntryNotFound assertion + a wire-level
+        header check).
+
+        ## Wire-level (curl) — the headline contract
+
+        Local has the namespace, HF gates the same path. Strict
+        consistency requires `EntryNotFound`, not `GatedRepo`.
+
+        ```bash
+        curl -i http://127.0.0.1:48888/meta-llama/Llama-2-7b/resolve/main/config.json
+        ```
+
+        Expected:
+
+        ```
+        HTTP/1.1 404 Not Found
+        X-Error-Code: EntryNotFound
+        X-Error-Message: Entry 'config.json' not found in repository 'meta-llama/Llama-2-7b' at revision 'main'
+        ```
+
+        Critical: **no** `X-Source-Count`, **no** `GatedRepo` header.
+        HF's gated 401 was never seen.
+
+        ### Counter-example — gated HF repo without local collision
+
+        ```bash
+        curl -i http://127.0.0.1:48888/meta-llama/Llama-2-70b/resolve/main/config.json
+        ```
+
+        Expected (note the SAME backend, only difference is whether
+        local owns the namespace):
+
+        ```
+        HTTP/1.1 401 Unauthorized
+        X-Error-Code: GatedRepo
+        X-Source-Count: 1
+        X-Error-Message: Upstream source requires authentication ...
+        ```
+
+        Same upstream gating, opposite outcomes — decided entirely by
+        whether the local namespace owns the path.
+
+        ## Python equivalent
+
+        ```python
+        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError, GatedRepoError
+
+        api = HfApi(endpoint="http://127.0.0.1:48888", token="<your-khub-token>")
+        assert api.list_repo_files("meta-llama/Llama-2-7b") == ["README.md"]
+
+        try:
+            hf_hub_download(
+                "meta-llama/Llama-2-7b", "config.json",
+                endpoint="http://127.0.0.1:48888",
+                token="<your-khub-token>",
+            )
+            raise AssertionError("FAIL: chain ran past local")
+        except EntryNotFoundError:
+            pass  # local short-circuit
+        except GatedRepoError:
+            raise AssertionError("FAIL: HF's gated 401 reached the client")
+        ```
+        """
+    )
+
+    guide_readme = text_bytes(
+        """
+        # PR #77 demo: pure fallback (no local collision)
+
+        Guide repo — no namespace collision with HF. Exists locally only
+        to host these instructions. The interesting cases below are
+        repos that this khub does NOT have locally; the goal is to show
+        what `huggingface_hub` calls produce when the chain has to do
+        the work.
+
+        ## One-shot verification
+
+        ```bash
+        PYTHONPATH=src python scripts/dev/seed_pr77_demo.py
+        ```
+
+        Output includes a `narugo1992-pr77-demo — pure fallback` block
+        with three ✓ lines (success / RepoNotFound / GatedRepo).
+
+        ## Wire-level (curl)
+
+        ### HF-only success: chain serves via HuggingFace
+
+        ```bash
+        curl -i http://127.0.0.1:48888/google-bert/bert-base-uncased/resolve/main/config.json
+        ```
+
+        Expected (note the `X-Source*` headers — the chain DID run):
+
+        ```
+        HTTP/1.1 307 Temporary Redirect
+        Location: https://huggingface.co/...
+        X-Source: HuggingFace
+        X-Source-URL: https://huggingface.co
+        X-Source-Status: 307
+        ```
+
+        ### Genuinely missing path: aggregate
+
+        ```bash
+        curl -i http://127.0.0.1:48888/narugo1992-pr77-demo/this-doesnt-exist-anywhere/resolve/main/x
+        ```
+
+        Expected:
+
+        ```
+        HTTP/1.1 404 Not Found
+        X-Error-Code: RepoNotFound
+        X-Source-Count: 1
+        ```
+
+        ### Gated upstream without local collision
+
+        ```bash
+        curl -i http://127.0.0.1:48888/meta-llama/Llama-2-70b/resolve/main/config.json
+        ```
+
+        Expected:
+
+        ```
+        HTTP/1.1 401 Unauthorized
+        X-Error-Code: GatedRepo
+        X-Source-Count: 1
+        ```
+
+        For the *contrasting* case (local collision + HF gated, where
+        the gated signal is suppressed in favor of local
+        EntryNotFound), see `meta-llama/Llama-2-7b` on this same khub.
+
+        ## Python equivalents
+
+        ```python
+        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub.errors import (
+            RepositoryNotFoundError, GatedRepoError,
+        )
+
+        api = HfApi(endpoint="http://127.0.0.1:48888", token="<your-khub-token>")
+
+        # HF-only success
+        info = api.model_info("google-bert/bert-base-uncased")
+        assert info.id == "google-bert/bert-base-uncased"
+
+        # Genuinely missing
+        try:
+            api.model_info("narugo1992-pr77-demo/this-doesnt-exist-anywhere-77777")
+            raise AssertionError("FAIL: succeeded")
+        except RepositoryNotFoundError:
+            pass
+
+        # Gated, no local collision
+        try:
+            hf_hub_download(
+                "meta-llama/Llama-2-70b", "config.json",
+                endpoint="http://127.0.0.1:48888",
+                token="<your-khub-token>",
+            )
+        except GatedRepoError:
+            pass  # or LocalEntryNotFoundError on hf_hub_download wrapper
+        ```
+
+        ## Cross-reference
+
+        - Local-namespace-priority + EntryNotFound/RevisionNotFound short-circuit:
+          `openai-community/gpt2`, `bigscience/bloom`, `meta-llama/Llama-2-7b`.
+        - All chain-level decisions are exhaustively unit-tested in
+          `test/kohakuhub/api/fallback/test_chain_enumeration.py` (4368 cases).
+        """
+    )
+
+    return (
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="model",
+            namespace="openai-community",
+            name="gpt2",
+            private=False,
+            commits=(
+                CommitSeed(
+                    summary="PR #77 demo: namespace-priority + EntryNotFound short-circuit",
+                    description="Local-only repo to prove the local namespace owns the name.",
+                    files=(("README.md", gpt2_readme),),
+                ),
+            ),
+        ),
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="model",
+            namespace="bigscience",
+            name="bloom",
+            private=False,
+            commits=(
+                CommitSeed(
+                    summary="PR #77 demo: chain short-circuit on EntryNotFound (different namespace)",
+                    description="Sister of openai-community/gpt2 — proves the rule isn't path-tied.",
+                    files=(
+                        ("README.md", bloom_readme),
+                        ("demo-note.txt", bloom_demo_note),
+                    ),
+                ),
+            ),
+        ),
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="model",
+            namespace="meta-llama",
+            name="Llama-2-7b",
+            private=False,
+            commits=(
+                CommitSeed(
+                    summary="PR #77 demo: strict consistency vs. gated upstream",
+                    description="HF's same-path repo is gated; local namespace ownership still wins.",
+                    files=(("README.md", llama_readme),),
+                ),
+            ),
+        ),
+        RepoSeed(
+            actor="mai_lin",
+            repo_type="model",
+            namespace="narugo1992-pr77-demo",
+            name="guide",
+            private=False,
+            commits=(
+                CommitSeed(
+                    summary="PR #77 demo: pure-fallback path walk-through",
+                    description="No namespace collision; documents how HF-only repos work via fallback.",
+                    files=(("README.md", guide_readme),),
+                ),
+            ),
+        ),
+    )
+
+
 REPO_SEEDS = (
     build_repo_seeds()
     + build_open_media_core_repo_seeds()
@@ -3721,6 +4259,7 @@ REPO_SEEDS = (
     + build_open_media_showcase_repo_seeds()
     + build_big_indexed_tar_pagination_seeds()
     + build_tree_expand_stress_seeds()
+    + build_pr77_demo_repo_seeds()
 )
 
 LIKES: tuple[tuple[str, str, str, str], ...] = (
