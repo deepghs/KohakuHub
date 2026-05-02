@@ -858,9 +858,38 @@ function decisionTagType(decision) {
   }
 }
 
-onMounted(() => {
-  loadSources();
-  loadCacheStats();
+// First-visit auto-load:
+//   When the operator lands on this page for the first time within
+//   their admin session, seed the draft area from the live config so
+//   they can edit + simulate immediately. Subsequent navigations
+//   away and back must NOT reload — that would clobber any pending
+//   edits. The flag is scoped to ``sessionStorage`` (tab-level) and
+//   cleared on admin logout (see admin.store) so re-login gets a
+//   fresh auto-seed.
+const _AUTO_LOAD_FLAG_KEY = "khub_admin_chain_tester_draft_loaded_once";
+
+onMounted(async () => {
+  await loadSources();
+  await loadCacheStats();
+  let alreadyLoaded = false;
+  try {
+    alreadyLoaded =
+      sessionStorage.getItem(_AUTO_LOAD_FLAG_KEY) === "true";
+  } catch (_e) {
+    // SessionStorage may be blocked (private browsing, embedded
+    // contexts) — fall through to "not loaded" so we still get the
+    // helpful auto-seed on first paint. Worst case is a duplicate
+    // load on tab switch, which is harmless (deep-copy of live
+    // config, ``draftDirty`` resets).
+  }
+  if (!alreadyLoaded && draftSources.value.length === 0) {
+    loadDraftFromSystem();
+    try {
+      sessionStorage.setItem(_AUTO_LOAD_FLAG_KEY, "true");
+    } catch (_e) {
+      // see above
+    }
+  }
 });
 </script>
 
@@ -957,36 +986,6 @@ onMounted(() => {
                 Draft modified
               </el-tag>
             </span>
-            <div class="cache-actions">
-              <el-button
-                size="small"
-                @click="loadDraftFromSystem"
-                :loading="loading"
-                data-testid="load-from-system-btn"
-              >
-                <i class="i-carbon-download mr-1"></i>
-                Load from System
-              </el-button>
-              <el-button
-                type="primary"
-                size="small"
-                :disabled="!draftDirty || draftSources.length === 0"
-                @click="pushDraftToSystem"
-                :loading="loading"
-                data-testid="push-to-system-btn"
-              >
-                <i class="i-carbon-upload mr-1"></i>
-                Push to System
-              </el-button>
-              <el-button
-                size="small"
-                :disabled="!draftDirty && draftSources.length === 0"
-                @click="discardDraft"
-                data-testid="discard-draft-btn"
-              >
-                Discard Draft
-              </el-button>
-            </div>
           </div>
         </template>
 
@@ -1219,6 +1218,38 @@ onMounted(() => {
                   >
                     <i class="i-carbon-add mr-1"></i>
                     Add Draft Source
+                  </el-button>
+                </div>
+                <!-- Draft lifecycle actions, scoped to the system-state
+                     column so they live next to what they operate on. -->
+                <div class="draft-lifecycle-row">
+                  <el-button
+                    size="small"
+                    @click="loadDraftFromSystem"
+                    :loading="loading"
+                    data-testid="load-from-system-btn"
+                  >
+                    <i class="i-carbon-download mr-1"></i>
+                    Load from System
+                  </el-button>
+                  <el-button
+                    type="primary"
+                    size="small"
+                    :disabled="!draftDirty || draftSources.length === 0"
+                    @click="pushDraftToSystem"
+                    :loading="loading"
+                    data-testid="push-to-system-btn"
+                  >
+                    <i class="i-carbon-upload mr-1"></i>
+                    Push to System
+                  </el-button>
+                  <el-button
+                    size="small"
+                    :disabled="!draftDirty && draftSources.length === 0"
+                    @click="discardDraft"
+                    data-testid="discard-draft-btn"
+                  >
+                    Discard Draft
                   </el-button>
                 </div>
               </div>
@@ -2161,6 +2192,20 @@ onMounted(() => {
 
 .draft-add-row {
   margin-bottom: 12px;
+}
+
+/* Draft lifecycle actions (Load / Push / Discard) — moved out of the
+   Chain Tester card header into the simulate tab's system-state
+   column so they sit next to the draft they operate on. Spacing
+   mirrors ``.draft-add-row`` so the column reads cleanly. */
+.draft-lifecycle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  margin-bottom: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--el-border-color-lighter, #ebeef5);
 }
 
 .header-tokens {

@@ -245,6 +245,16 @@ describe("admin fallback-sources page", () => {
     messageBoxConfirmSpy.mockReset();
     messageSuccessSpy.mockReset();
     messageErrorSpy.mockReset();
+    // Clear the per-tab session-storage flag the chain tester uses
+    // to gate "first visit auto-load from system". Without this,
+    // the first test that mounts the page sets the flag and every
+    // subsequent test skips auto-load — making "first visit" tests
+    // order-dependent.
+    try {
+      sessionStorage.removeItem("khub_admin_chain_tester_draft_loaded_once");
+    } catch (_e) {
+      // jsdom always has sessionStorage; the catch is for safety.
+    }
 
     if (!elementPlusModule) {
       elementPlusModule = await vi.importActual("element-plus");
@@ -282,6 +292,42 @@ describe("admin fallback-sources page", () => {
     // stats render
     expect(wrapper.text()).toContain("42"); // size
     expect(wrapper.text()).toContain("10000"); // maxsize
+  });
+
+  it("auto-loads draft from system on first visit and sets the session flag", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF, SOURCE_MIRROR]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    sessionStorage.removeItem("khub_admin_chain_tester_draft_loaded_once");
+
+    const wrapper = mountPage();
+    await flushPromises();
+
+    // Two draft rows seeded automatically — operator can edit + run
+    // simulate immediately on first paint without clicking Load.
+    expect(wrapper.find('[data-testid="draft-row-0"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="draft-row-1"]').exists()).toBe(true);
+    // Session flag is set so a re-mount within the same admin session
+    // does NOT clobber pending edits.
+    expect(
+      sessionStorage.getItem("khub_admin_chain_tester_draft_loaded_once"),
+    ).toBe("true");
+  });
+
+  it("does NOT auto-load when the session flag is already set", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF, SOURCE_MIRROR]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    sessionStorage.setItem(
+      "khub_admin_chain_tester_draft_loaded_once",
+      "true",
+    );
+
+    const wrapper = mountPage();
+    await flushPromises();
+
+    // Live config is still loaded, but the draft area stays empty
+    // (the operator's pending edits — or empty draft they intentionally
+    // discarded — must survive a tab switch).
+    expect(wrapper.find('[data-testid="draft-row-0"]').exists()).toBe(false);
   });
 
   it("redirects to /login when admin token is missing", async () => {

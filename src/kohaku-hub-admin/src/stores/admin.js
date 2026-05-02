@@ -37,6 +37,14 @@ export const useAdminStore = defineStore("admin", () => {
   function logout() {
     token.value = "";
     isAuthenticated.value = false;
+    // Drop session-scoped UI flags so the next login gets a fresh
+    // first-visit experience (e.g. the chain tester's auto-load
+    // from system on first navigation — see fallback-sources.vue).
+    try {
+      sessionStorage.removeItem("khub_admin_chain_tester_draft_loaded_once");
+    } catch (_e) {
+      // sessionStorage blocked — nothing to clean up.
+    }
   }
 
   return {
