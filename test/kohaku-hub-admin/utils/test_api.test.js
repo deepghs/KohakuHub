@@ -173,6 +173,31 @@ describe("admin API client", () => {
     );
     await api.invalidateFallbackUserCacheById("admin-token", 42);
     await api.invalidateFallbackUserCacheByUsername("admin-token", "mai_lin");
+    await api.bulkReplaceFallbackSources("admin-token", [
+      {
+        namespace: "",
+        url: "https://hf.example",
+        token: null,
+        priority: 10,
+        name: "HF",
+        source_type: "huggingface",
+        enabled: true,
+      },
+    ]);
+    await api.testFallbackChainSimulate("admin-token", {
+      op: "info",
+      repo_type: "model",
+      namespace: "owner",
+      name: "demo",
+      sources: [{ url: "https://hf.example", source_type: "huggingface" }],
+    });
+    await api.testFallbackChainReal("admin-token", {
+      op: "info",
+      repo_type: "model",
+      namespace: "owner",
+      name: "demo",
+      as_username: "mai_lin",
+    });
 
     await api.deleteRepositoryAdmin(
       "admin-token",
@@ -295,6 +320,26 @@ describe("admin API client", () => {
     );
     expect(client.delete).toHaveBeenCalledWith(
       "/fallback-sources/cache/username/mai_lin",
+    );
+    expect(client.put).toHaveBeenCalledWith(
+      "/fallback/sources-bulk-replace",
+      expect.objectContaining({
+        sources: expect.any(Array),
+      }),
+    );
+    expect(client.post).toHaveBeenCalledWith(
+      "/fallback/test/simulate",
+      expect.objectContaining({
+        op: "info",
+        sources: expect.any(Array),
+      }),
+    );
+    expect(client.post).toHaveBeenCalledWith(
+      "/fallback/test/real",
+      expect.objectContaining({
+        op: "info",
+        as_username: "mai_lin",
+      }),
     );
     expect(client.delete).toHaveBeenCalledWith(
       "/storage/objects/models%2Fdemo%2Ffile.bin",

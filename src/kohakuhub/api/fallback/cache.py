@@ -62,8 +62,16 @@ class RepoSourceCache:
     events landing while a probe is in flight; see ``safe_set``.
     """
 
-    def __init__(self, ttl_seconds: int = 300, maxsize: int = 10000):
+    def __init__(self, ttl_seconds: int = 30, maxsize: int = 10000):
         """Initialize cache.
+
+        Default TTL is 30s — short enough that a transient bound-source
+        outage self-heals within a half-minute, low enough to keep the
+        bound-source consistency window bounded, but still long enough
+        to amortise chain-probe cost across a typical hf_hub session
+        (which fires 1–10 calls within seconds). Override via
+        ``KOHAKU_HUB_FALLBACK_CACHE_TTL`` / ``cfg.fallback.cache_ttl_seconds``
+        if a deployment prefers a different self-heal window.
 
         Args:
             ttl_seconds: TTL for cache entries.

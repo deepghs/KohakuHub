@@ -8,9 +8,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from kohakuhub.db import FallbackSource, User, db
+from kohakuhub.db_operations import (
+    get_user_by_username,
+    get_user_external_tokens,
+)
 from kohakuhub.logger import get_logger
 from kohakuhub.api.admin.utils.auth import verify_admin_token
 from kohakuhub.api.fallback.cache import get_cache
+from kohakuhub.api.fallback.config import get_enabled_sources
+from kohakuhub.api.fallback.core import SUPPORTED_OPS, probe_chain
 
 logger = get_logger("ADMIN_FALLBACK")
 router = APIRouter()
@@ -542,4 +548,324 @@ async def invalidate_user_cache_by_username(
             detail={
                 "error": f"Failed to invalidate user cache by username: {str(e)}"
             },
+        )
+
+
+# ===========================================================================
+# Bulk-replace + chain debug endpoints (#78)
+# ===========================================================================
+#
+# These power the admin chain-tester UI in src/kohaku-hub-admin/src/pages/
+# fallback-sources.vue. Three endpoints:
+#
+# - PUT /admin/api/fallback-sources/bulk-replace : atomic transactional
+#   replace of every FallbackSource row. Drives the tester's
+#   "Push to system" button after the operator has staged a draft.
+#
+# - POST /admin/api/fallback/test/simulate : run probe_chain with an
+#   ad-hoc source list + per-source token overrides, no cache writes,
+#   no lock. Drives the tester's "Run probe" button while the operator
+#   is editing a draft.
+#
+# - POST /admin/api/fallback/test/real : run probe_chain with the
+#   currently-configured source list resolved server-side, optionally
+#   impersonating a user_id (so per-user UserExternalToken rows enter
+#   the chain). Useful for "what does my live system actually do for
+#   user X" replays.
+
+
+class _DebugProbeSource(BaseModel):
+    """Source dict accepted by the simulate endpoint."""
+
+    name: str = ""  # display only, defaults to URL if empty
+    url: str
+    source_type: str = "huggingface"
+    token: Optional[str] = None
+    priority: int = 100
+
+
+class _DebugSimulateRequest(BaseModel):
+    """POST body for ``/admin/api/fallback/test/simulate``."""
+
+    op: str  # "resolve" | "info" | "tree" | "paths_info"
+    repo_type: str
+    namespace: str
+    name: str
+    revision: str = "main"
+    file_path: str = ""
+    paths: Optional[list[str]] = None
+    sources: list[_DebugProbeSource]
+    # Per-source URL overrides applied on top of the source list's
+    # ``token`` field — admin uses this when modelling "user X passes
+    # this token via Authorization: Bearer ...|url,token|..." without
+    # editing the source row.
+    user_tokens: dict[str, str] = {}
+
+
+class _DebugRealRequest(BaseModel):
+    """POST body for ``/admin/api/fallback/test/real``."""
+
+    op: str
+    repo_type: str
+    namespace: str
+    name: str
+    revision: str = "main"
+    file_path: str = ""
+    paths: Optional[list[str]] = None
+    # Identity to impersonate when resolving the chain. Anonymous if both
+    # ``as_username`` and ``as_user_id`` are absent. ``as_username`` wins
+    # if both supplied.
+    as_username: Optional[str] = None
+    as_user_id: Optional[int] = None
+    # Authorization-header-style external token overrides, mirrors the
+    # ``Bearer token|url,token|...`` parser shape but pre-decoded.
+    header_tokens: dict[str, str] = {}
+
+
+class _DebugBulkReplaceRequest(BaseModel):
+    """POST body for ``/admin/api/fallback-sources/bulk-replace``."""
+
+    sources: list[FallbackSourceCreate]
+
+
+def _apply_user_tokens(
+    sources: list[dict], user_tokens: dict[str, str]
+) -> list[dict]:
+    """Overlay per-URL token overrides onto a source list.
+
+    Returns a new list of source dicts with ``token`` swapped where
+    ``user_tokens[url]`` is set. Mirrors the merge shape used by
+    ``get_enabled_sources`` so debug results match production
+    behaviour given identical inputs.
+    """
+    if not user_tokens:
+        return [dict(s) for s in sources]
+    out = []
+    for src in sources:
+        merged = dict(src)
+        if src.get("url") in user_tokens:
+            merged["token"] = user_tokens[src["url"]]
+            merged["token_source"] = "user"
+        out.append(merged)
+    return out
+
+
+@router.put("/fallback/sources-bulk-replace")
+async def bulk_replace_fallback_sources(
+    payload: _DebugBulkReplaceRequest,
+    _admin=Depends(verify_admin_token),
+):
+    """Atomically replace every fallback source.
+
+    The chain-tester's "Push to system" button calls this after the
+    operator has finished editing a draft. All current rows are
+    deleted and the new list is inserted in one DB transaction; if any
+    row fails validation the entire change rolls back.
+
+    Triggers ``cache.clear()`` on success — same convention as the
+    single-source create / update / delete endpoints — so
+    ``global_gen`` is bumped and any in-flight probe's ``safe_set`` is
+    rejected.
+
+    Returns:
+        ``{success, replaced: int, before: int, after: int}`` — the
+        counts before / after the swap.
+    """
+    # Validate every source_type up front so a bad row can be reported
+    # without the partial-write window.
+    for src in payload.sources:
+        if src.source_type not in ("huggingface", "kohakuhub"):
+            raise HTTPException(
+                400,
+                detail={
+                    "error": (
+                        f"Invalid source_type: {src.source_type}. "
+                        f"Must be 'huggingface' or 'kohakuhub'."
+                    ),
+                },
+            )
+
+    try:
+        before = FallbackSource.select().count()
+        with db.atomic():
+            FallbackSource.delete().execute()
+            now = datetime.now(tz=timezone.utc)
+            for src in payload.sources:
+                FallbackSource.create(
+                    namespace=src.namespace,
+                    url=src.url.rstrip("/"),
+                    token=src.token,
+                    priority=src.priority,
+                    name=src.name,
+                    source_type=src.source_type,
+                    enabled=src.enabled,
+                    created_at=now,
+                    updated_at=now,
+                )
+        after = FallbackSource.select().count()
+
+        get_cache().clear()
+
+        logger.info(
+            f"Bulk-replaced fallback sources: before={before}, after={after}"
+        )
+        return {
+            "success": True,
+            "replaced": after,
+            "before": before,
+            "after": after,
+        }
+    except Exception as e:
+        logger.error(f"Bulk-replace failed: {e}")
+        raise HTTPException(
+            500, detail={"error": f"Bulk-replace failed: {str(e)}"}
+        )
+
+
+def _validate_op(op: str) -> None:
+    if op not in SUPPORTED_OPS:
+        raise HTTPException(
+            400,
+            detail={
+                "error": (
+                    f"Unsupported op: {op!r}. "
+                    f"Expected one of {list(SUPPORTED_OPS)}."
+                )
+            },
+        )
+
+
+@router.post("/fallback/test/simulate")
+async def fallback_chain_test_simulate(
+    payload: _DebugSimulateRequest,
+    _admin=Depends(verify_admin_token),
+):
+    """Run a probe against an operator-supplied source list.
+
+    Pure read — never writes the production cache, never holds the
+    binding lock. Returns a structured ``ProbeReport`` so the admin
+    UI can render a per-source timeline.
+
+    Used by the tester's "Run probe" button. The operator drafts a
+    source list (often by calling ``/fallback-sources/bulk-replace``
+    last week and then editing the staged copy in the UI) plus a
+    ``user_tokens`` overlay (Authorization-header-style per-URL
+    overrides), and this endpoint reports what the chain would do
+    with that exact input.
+    """
+    _validate_op(payload.op)
+
+    sources = [s.dict() for s in payload.sources]
+    sources = _apply_user_tokens(sources, payload.user_tokens or {})
+
+    try:
+        report = await probe_chain(
+            op=payload.op,
+            repo_type=payload.repo_type,
+            namespace=payload.namespace,
+            name=payload.name,
+            sources=sources,
+            revision=payload.revision,
+            file_path=payload.file_path,
+            paths=payload.paths,
+        )
+        return report.to_dict()
+    except ValueError as e:
+        raise HTTPException(400, detail={"error": str(e)})
+    except Exception as e:
+        logger.error(f"simulate probe failed: {e}")
+        raise HTTPException(
+            500, detail={"error": f"Simulate probe failed: {str(e)}"}
+        )
+
+
+def _resolve_impersonated_user_tokens(
+    as_username: Optional[str], as_user_id: Optional[int]
+) -> dict[str, str]:
+    """Look up the ``UserExternalToken`` rows for the impersonated user.
+
+    Returns ``{url: decrypted_token}``. Empty dict for anonymous (both
+    ``as_username`` and ``as_user_id`` absent) or unknown users.
+    """
+    user = None
+    if as_username:
+        user = get_user_by_username(as_username)
+    elif as_user_id is not None:
+        user = User.get_or_none(User.id == as_user_id)
+    if user is None:
+        return {}
+    out: dict[str, str] = {}
+    for row in get_user_external_tokens(user):
+        out[row["url"]] = row["token"]
+    return out
+
+
+@router.post("/fallback/test/real")
+async def fallback_chain_test_real(
+    payload: _DebugRealRequest,
+    _admin=Depends(verify_admin_token),
+):
+    """Replay the live chain probe for an impersonated identity.
+
+    Resolves the source list server-side via ``get_enabled_sources``
+    (so it reflects the *current* admin config, not whatever the
+    tester is staging in its draft area), overlays per-user
+    ``UserExternalToken`` rows for the impersonated identity, then
+    overlays the ``header_tokens`` from the request body (which
+    models a client passing ``Authorization: Bearer ...|url,token|...``
+    overrides on a single request).
+
+    Pure read — does not write the cache, does not take the binding
+    lock. Returns a ``ProbeReport`` identical in shape to
+    ``/fallback/test/simulate``.
+    """
+    _validate_op(payload.op)
+
+    # Layer 1: per-user persistent tokens.
+    db_tokens = _resolve_impersonated_user_tokens(
+        payload.as_username, payload.as_user_id
+    )
+    # Layer 2: header-style ad-hoc overrides — header wins per the
+    # production ``get_merged_external_tokens`` precedence.
+    user_tokens = {**db_tokens, **(payload.header_tokens or {})}
+
+    try:
+        sources = get_enabled_sources(
+            namespace=payload.namespace, user_tokens=user_tokens
+        )
+    except Exception as e:
+        logger.error(f"real probe: get_enabled_sources failed: {e}")
+        raise HTTPException(
+            500, detail={"error": f"get_enabled_sources failed: {str(e)}"}
+        )
+
+    if not sources:
+        # Empty chain — return an explicit no-op report rather than
+        # an HTTP error, so the UI can render "no sources configured".
+        from kohakuhub.api.fallback.core import ProbeReport
+        return ProbeReport(
+            op=payload.op,
+            repo_id=f"{payload.namespace}/{payload.name}",
+            revision=payload.revision if payload.op != "info" else None,
+            file_path=payload.file_path or None,
+        ).to_dict()
+
+    try:
+        report = await probe_chain(
+            op=payload.op,
+            repo_type=payload.repo_type,
+            namespace=payload.namespace,
+            name=payload.name,
+            sources=sources,
+            revision=payload.revision,
+            file_path=payload.file_path,
+            paths=payload.paths,
+        )
+        return report.to_dict()
+    except ValueError as e:
+        raise HTTPException(400, detail={"error": str(e)})
+    except Exception as e:
+        logger.error(f"real probe failed: {e}")
+        raise HTTPException(
+            500, detail={"error": f"Real probe failed: {str(e)}"}
         )

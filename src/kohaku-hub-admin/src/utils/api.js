@@ -860,6 +860,88 @@ export async function invalidateFallbackUserCacheByUsername(token, username) {
   return response.data;
 }
 
+/**
+ * Atomically replace the entire ``FallbackSource`` table with the given
+ * draft. Powers the chain-tester's "Push to system" button after the
+ * operator has staged a multi-edit batch.
+ *
+ * On success, the server clears the fallback cache (bumping
+ * ``global_gen``) so any in-flight probe's safe_set is rejected.
+ *
+ * @param {string} token - Admin token
+ * @param {Array<Object>} sources - The complete draft list. Each entry
+ *   has ``namespace``, ``url``, optional ``token``, ``priority``,
+ *   ``name``, ``source_type``, ``enabled``.
+ * @returns {Promise<{success: boolean, replaced: number, before: number, after: number}>}
+ */
+export async function bulkReplaceFallbackSources(token, sources) {
+  const client = createAdminClient(token);
+  const response = await client.put(
+    "/fallback/sources-bulk-replace",
+    { sources },
+  );
+  return response.data;
+}
+
+/**
+ * Run a chain probe with an operator-supplied source list + per-source
+ * token overlay. Pure read — does not write the production cache or
+ * take the binding lock. Returns a structured ``ProbeReport`` so the
+ * UI can render a per-source timeline.
+ *
+ * @param {string} token - Admin token
+ * @param {Object} payload - Probe parameters.
+ * @param {("resolve"|"info"|"tree"|"paths_info")} payload.op
+ * @param {("model"|"dataset"|"space")} payload.repo_type
+ * @param {string} payload.namespace
+ * @param {string} payload.name
+ * @param {string} [payload.revision]
+ * @param {string} [payload.file_path]
+ * @param {Array<string>} [payload.paths]
+ * @param {Array<Object>} payload.sources - Sources to probe (with optional ``token``).
+ * @param {Object<string,string>} [payload.user_tokens] - Per-URL token overrides.
+ * @returns {Promise<Object>} ProbeReport (see core.py for shape).
+ */
+export async function testFallbackChainSimulate(token, payload) {
+  const client = createAdminClient(token);
+  const response = await client.post(
+    "/fallback/test/simulate",
+    payload,
+  );
+  return response.data;
+}
+
+/**
+ * Run a chain probe against the live system config, optionally
+ * impersonating an authenticated user (so per-user
+ * ``UserExternalToken`` rows enter the chain). Pure read.
+ *
+ * @param {string} token - Admin token
+ * @param {Object} payload
+ * @param {("resolve"|"info"|"tree"|"paths_info")} payload.op
+ * @param {("model"|"dataset"|"space")} payload.repo_type
+ * @param {string} payload.namespace
+ * @param {string} payload.name
+ * @param {string} [payload.revision]
+ * @param {string} [payload.file_path]
+ * @param {Array<string>} [payload.paths]
+ * @param {string} [payload.as_username] - Username to impersonate. Wins
+ *   over ``as_user_id`` if both supplied. Anonymous if both absent.
+ * @param {number} [payload.as_user_id] - User PK to impersonate.
+ * @param {Object<string,string>} [payload.header_tokens] -
+ *   Authorization-header-style per-URL overrides (model the
+ *   ``Bearer xxx|url,token|...`` shape, pre-decoded).
+ * @returns {Promise<Object>} ProbeReport.
+ */
+export async function testFallbackChainReal(token, payload) {
+  const client = createAdminClient(token);
+  const response = await client.post(
+    "/fallback/test/real",
+    payload,
+  );
+  return response.data;
+}
+
 // ===== Repository Management =====
 
 /**

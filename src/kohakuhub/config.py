@@ -70,7 +70,7 @@ class FallbackConfig(BaseModel):
     """Fallback source configuration."""
 
     enabled: bool = True  # Enable fallback system
-    cache_ttl_seconds: int = 300  # Cache TTL for repo→source mappings (5 minutes)
+    cache_ttl_seconds: int = 30  # Cache TTL for repo→source mappings (default 30s post-#78)
     timeout_seconds: int = 10  # HTTP request timeout for external sources
     max_concurrent_requests: int = 5  # Max concurrent requests to external sources
     require_auth: bool = False  # Require authenticated user for fallback access
