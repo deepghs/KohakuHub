@@ -235,6 +235,7 @@ def with_repo_fallback(operation: OperationType):
                             path,
                             user_tokens=user_tokens,
                             method=method,
+                            user=user,
                         )
 
                     case "tree":
@@ -255,11 +256,13 @@ def with_repo_fallback(operation: OperationType):
                             limit=limit,
                             cursor=cursor,
                             user_tokens=user_tokens,
+                            user=user,
                         )
 
                     case "info" | "revision":
                         result = await try_fallback_info(
-                            repo_type, namespace, name, user_tokens=user_tokens
+                            repo_type, namespace, name,
+                            user_tokens=user_tokens, user=user,
                         )
 
                     case "paths_info":
@@ -275,6 +278,7 @@ def with_repo_fallback(operation: OperationType):
                             paths,
                             expand=expand,
                             user_tokens=user_tokens,
+                            user=user,
                         )
 
                     case _:

@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from kohakuhub.config import cfg
 from kohakuhub.logger import get_logger
-from kohakuhub.api.fallback.cache import get_cache
+from kohakuhub.api.fallback.cache import compute_tokens_hash, get_cache
 from kohakuhub.api.fallback.client import FallbackClient
 from kohakuhub.api.fallback.config import get_enabled_sources
 from kohakuhub.api.fallback.utils import (
@@ -24,6 +24,13 @@ from kohakuhub.api.fallback.utils import (
     should_retry_source,
     strip_xet_response_headers,
 )
+
+
+def _resolve_user_id(user) -> Optional[int]:
+    """Extract a stable user_id key from a (possibly None) User object."""
+    if user is None:
+        return None
+    return getattr(user, "id", None)
 
 
 def _propagate_upstream_response(
@@ -101,6 +108,8 @@ async def _run_cached_then_chain(
     repo_type: str,
     namespace: str,
     name: str,
+    user_id: Optional[int],
+    tokens_hash: str,
     sources: list[dict],
     cache,
     attempts: list[dict],
@@ -112,39 +121,52 @@ async def _run_cached_then_chain(
     Strict-consistency rules (the user-facing guarantee for #77):
 
     1. **TTL-window stickiness.** Within the cache TTL window, every
-       call for a given ``(repo_type, namespace, name)`` is routed to
-       the same source. If that source's response classifies as
-       ``TRY_NEXT_SOURCE`` (5xx, transient auth, etc.), we surface the
-       error to the caller **without invalidating the cache**.
-       Rationale: invalidating + rebinding to a sibling source under
-       transient bound-source failure produces cross-source mixing
-       across calls — exactly the inconsistency #77 fixes. The client
-       can retry; retries within TTL hit the same source. (Operator
-       remediation: explicit ``cache.invalidate`` via the admin API
-       when rebinding is desired.)
+       call for a given ``(user_id, tokens_hash, repo_type, namespace,
+       name)`` is routed to the same source. If that source's response
+       classifies as ``TRY_NEXT_SOURCE`` (5xx, transient auth, etc.),
+       we surface the error to the caller **without invalidating the
+       cache**. Rationale: invalidating + rebinding to a sibling
+       source under transient bound-source failure produces
+       cross-source mixing across calls — exactly the inconsistency
+       #77 fixes. The client can retry; retries within TTL hit the
+       same source.
 
     2. **Concurrent-binding lock.** When the cache misses and the
        chain probe is needed, concurrent callers serialize on a
        per-repo ``asyncio.Lock``. The first holder writes the cache;
        subsequent holders re-check the cache after acquiring the lock
-       and use the now-bound source. Eliminates the race where two
-       concurrent first-binders can bind to different sources due to
-       per-source latency variation.
+       and use the now-bound source.
 
     3. **Orphaned-cache invalidation only.** The single case that
        *does* invalidate the cache is when the cached source URL is
        no longer in the active ``sources`` list (admin removed it
        from config). That isn't a transient failure — it's a
-       configuration change — and the only correct behavior is to
-       re-bind via the (new) chain.
+       configuration change.
 
     4. **Deterministic chain order.** Sources are configured in a
-       priority-ordered list (``get_enabled_sources``); the chain
-       walks them in order and the first ``BIND_*`` outcome wins.
-       So under "same auth + same external state", even after TTL
-       expiry, the next chain probe binds the same source.
+       priority-ordered list; the chain walks them in order and the
+       first ``BIND_*`` outcome wins.
+
+    Strict-freshness extension (#79):
+
+    5. **Per-(user, tokens_hash) keying.** Two requests with different
+       effective per-source tokens (DB or header-passed) cannot share
+       a binding. ``user_id`` and ``tokens_hash`` are part of the
+       cache key.
+
+    6. **Generation-counter race protection.** A snapshot of
+       ``(global_gen, user_gens[uid], repo_gens[(rt, ns, name)])`` is
+       captured before each probe attempt. ``safe_set`` (in the
+       attempt callbacks) rejects the cache write if any of the three
+       counters has been bumped during the probe — meaning an
+       admin/user/repo invalidation event landed concurrently and the
+       binding we are about to write may already be stale.
     """
-    cached_entry = cache.get(repo_type, namespace, name)
+    # Pre-lock cache hit fast-path: avoid taking the binding lock when
+    # the entry is already bound. Snapshot generations BEFORE any
+    # upstream I/O so safe_set in attempt_fn sees a consistent baseline.
+    gens = cache.snapshot(user_id, repo_type, namespace, name)
+    cached_entry = cache.get(user_id, tokens_hash, repo_type, namespace, name)
     if cached_entry and cached_entry.get("exists"):
         cached_url = cached_entry["source_url"]
         cached_source = next((s for s in sources if s["url"] == cached_url), None)
@@ -153,7 +175,7 @@ async def _run_cached_then_chain(
                 f"Cache hit: probing {cached_source['name']} only for "
                 f"{repo_type}/{namespace}/{name}"
             )
-            result = await attempt_fn(cached_source)
+            result = await attempt_fn(cached_source, gens)
             if result is not None:
                 return result
             # Strict-consistency rule #1: bound source's TRY_NEXT
@@ -170,28 +192,36 @@ async def _run_cached_then_chain(
         else:
             # Strict-consistency rule #3: orphaned cache (admin
             # removed the source from config) must invalidate so the
-            # chain can find a new home for this repo_id.
+            # chain can find a new home for this repo_id. Per-entry
+            # delete (no gen bump) — admin source mutation already
+            # bumped global_gen via cache.clear().
             logger.debug(
                 f"Cache hit on orphan source url={cached_url} "
                 f"(no longer in active config); invalidating + rebinding"
             )
-            cache.invalidate(repo_type, namespace, name)
+            cache.invalidate(
+                user_id, tokens_hash, repo_type, namespace, name
+            )
 
     # Strict-consistency rule #2: concurrent-binding lock.
     binding_lock = _binding_lock(repo_type, namespace, name)
     async with binding_lock:
+        # Re-snapshot under the lock so the chain probe + safe_set
+        # see a fresh baseline (generations may have changed while
+        # we were waiting on the lock).
+        gens = cache.snapshot(user_id, repo_type, namespace, name)
         # Re-check the cache after lock acquisition: another waiter may
-        # have already bound this repo while we were queued. If they
-        # did, fall back to the cache-hit fast-path (which also applies
-        # the "bound-source failure does not invalidate" rule).
-        cached_entry = cache.get(repo_type, namespace, name)
+        # have already bound this repo while we were queued.
+        cached_entry = cache.get(
+            user_id, tokens_hash, repo_type, namespace, name
+        )
         if cached_entry and cached_entry.get("exists"):
             cached_url = cached_entry["source_url"]
             cached_source = next(
                 (s for s in sources if s["url"] == cached_url), None
             )
             if cached_source:
-                result = await attempt_fn(cached_source)
+                result = await attempt_fn(cached_source, gens)
                 if result is not None:
                     return result
                 return build_aggregate_failure_response(
@@ -201,16 +231,15 @@ async def _run_cached_then_chain(
             # config — extremely rare (admin reconfig race between
             # the binder's ``cache.set`` and the waiter's post-lock
             # cache-recheck); treat as orphan and proceed to a
-            # fresh chain. Practically unreachable from a unit test
-            # because reproducing it requires an admin to remove a
-            # source from config in the asyncio yield window inside
-            # the binding lock.
-            cache.invalidate(repo_type, namespace, name)  # pragma: no cover
+            # fresh chain.
+            cache.invalidate(  # pragma: no cover
+                user_id, tokens_hash, repo_type, namespace, name
+            )
 
         # Fresh chain probe: deterministic priority order, first
         # BIND wins.
         for source in sources:
-            result = await attempt_fn(source)
+            result = await attempt_fn(source, gens)
             if result is not None:
                 return result
 
@@ -232,6 +261,7 @@ async def try_fallback_resolve(
     path: str,
     user_tokens: dict[str, str] | None = None,
     method: str = "GET",
+    user=None,
 ) -> Optional[Response]:
     """Try to resolve file from fallback sources.
 
@@ -243,6 +273,9 @@ async def try_fallback_resolve(
         path: File path in repository
         user_tokens: User-provided external tokens (overrides admin tokens)
         method: HTTP method ("GET" or "HEAD")
+        user: Authenticated user (or None for anonymous). Threaded
+            through to the cache key as ``user_id`` for strict
+            per-user binding isolation (#79).
 
     Returns:
         Response (redirect for GET, response with headers for HEAD) or None if not found
@@ -254,6 +287,9 @@ async def try_fallback_resolve(
         logger.debug(f"No fallback sources configured for {namespace}")
         return None
 
+    user_id = _resolve_user_id(user)
+    tokens_hash = compute_tokens_hash(user_tokens)
+
     # Construct KohakuHub path
     kohaku_path = f"/{repo_type}s/{namespace}/{name}/resolve/{revision}/{path}"
 
@@ -264,20 +300,25 @@ async def try_fallback_resolve(
     # remediation (token, retry, move on).
     attempts: list[dict] = []
 
-    async def _attempt(source):
+    async def _attempt(source, gens):
         return await _resolve_one_source(
             source,
             repo_type,
             namespace,
             name,
+            user_id,
+            tokens_hash,
             kohaku_path,
             method,
             attempts,
             cache,
+            gens,
         )
 
     return await _run_cached_then_chain(
-        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        repo_type, namespace, name,
+        user_id, tokens_hash,
+        sources, cache, attempts, _attempt,
         # `resolve` is per-file. All-404 → EntryNotFound (default scope
         # for the aggregate). The aggregate's own status-priority logic
         # promotes that to RepoNotFound if any attempt was a bare-401
@@ -291,10 +332,13 @@ async def _resolve_one_source(
     repo_type: str,
     namespace: str,
     name: str,
+    user_id: Optional[int],
+    tokens_hash: str,
     kohaku_path: str,
     method: str,
     attempts: list[dict],
     cache,
+    gens: tuple[int, int, int],
 ) -> Optional[Response]:
     """Run a resolve probe (HEAD, then GET if method=GET) against one source.
 
@@ -333,13 +377,21 @@ async def _resolve_one_source(
 
     # BIND_AND_RESPOND or BIND_AND_PROPAGATE: this source has the repo.
     # Update cache so subsequent requests skip the chain probe.
-    cache.set(
+    # ``safe_set`` rejects the write if any of the three generation
+    # counters has been bumped since the snapshot at probe entry —
+    # admin source mutation, this user's token rotation, or this
+    # repo's local CRUD (create/delete/move/visibility) all bump
+    # their respective counters and force a re-probe on the next call.
+    cache.safe_set(
+        user_id,
+        tokens_hash,
         repo_type,
         namespace,
         name,
         source["url"],
         source["name"],
         source["source_type"],
+        gens_at_start=gens,
         exists=True,
     )
 
@@ -519,6 +571,7 @@ async def try_fallback_info(
     namespace: str,
     name: str,
     user_tokens: dict[str, str] | None = None,
+    user=None,
 ) -> Optional[dict]:
     """Try to get repository info from fallback sources.
 
@@ -527,6 +580,7 @@ async def try_fallback_info(
         namespace: Repository namespace
         name: Repository name
         user_tokens: User-provided external tokens (overrides admin tokens)
+        user: Authenticated user (or None) for per-user cache isolation.
 
     Returns:
         Repository info dict or None if not found
@@ -537,11 +591,14 @@ async def try_fallback_info(
     if not sources:
         return None
 
+    user_id = _resolve_user_id(user)
+    tokens_hash = compute_tokens_hash(user_tokens)
+
     # Construct API path
     kohaku_path = f"/api/{repo_type}s/{namespace}/{name}"
     attempts: list[dict] = []
 
-    async def _attempt(source):
+    async def _attempt(source, gens):
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -568,9 +625,11 @@ async def try_fallback_info(
             return None
 
         # BIND — write cache for repo-grain reuse.
-        cache.set(
+        cache.safe_set(
+            user_id, tokens_hash,
             repo_type, namespace, name,
             source["url"], source["name"], source["source_type"],
+            gens_at_start=gens,
             exists=True,
         )
 
@@ -597,7 +656,9 @@ async def try_fallback_info(
         return data
 
     return await _run_cached_then_chain(
-        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        repo_type, namespace, name,
+        user_id, tokens_hash,
+        sources, cache, attempts, _attempt,
         aggregate_scope="repo",
     )
 
@@ -613,6 +674,7 @@ async def try_fallback_tree(
     limit: int | None = None,
     cursor: str | None = None,
     user_tokens: dict[str, str] | None = None,
+    user=None,
 ) -> Optional[Response]:
     """Try to get repository tree from fallback sources.
 
@@ -623,6 +685,7 @@ async def try_fallback_tree(
         revision: Branch or commit
         path: Path within repository
         user_tokens: User-provided external tokens (overrides admin tokens)
+        user: Authenticated user (or None) for per-user cache isolation.
 
     Returns:
         JSON response or None if not found
@@ -632,6 +695,9 @@ async def try_fallback_tree(
 
     if not sources:
         return None
+
+    user_id = _resolve_user_id(user)
+    tokens_hash = compute_tokens_hash(user_tokens)
 
     # Construct API path (strip leading slash from path to avoid double slash)
     clean_path = path.lstrip("/") if path else ""
@@ -644,7 +710,7 @@ async def try_fallback_tree(
     if cursor:
         params["cursor"] = cursor
 
-    async def _attempt(source):
+    async def _attempt(source, gens):
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -670,9 +736,11 @@ async def try_fallback_tree(
             attempts.append(build_fallback_attempt(source, response=response))
             return None
 
-        cache.set(
+        cache.safe_set(
+            user_id, tokens_hash,
             repo_type, namespace, name,
             source["url"], source["name"], source["source_type"],
+            gens_at_start=gens,
             exists=True,
         )
 
@@ -704,7 +772,9 @@ async def try_fallback_tree(
         )
 
     return await _run_cached_then_chain(
-        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        repo_type, namespace, name,
+        user_id, tokens_hash,
+        sources, cache, attempts, _attempt,
         # Tree is a repo-level operation: scope="repo" so all-404 maps
         # to RepoNotFound (matches HF for a missing repo).
         aggregate_scope="repo",
@@ -719,6 +789,7 @@ async def try_fallback_paths_info(
     paths: list[str],
     expand: bool = False,
     user_tokens: dict[str, str] | None = None,
+    user=None,
 ) -> Optional[list]:
     """Try to get paths info from fallback sources.
 
@@ -729,6 +800,7 @@ async def try_fallback_paths_info(
         revision: Branch or commit
         paths: List of paths to query
         user_tokens: User-provided external tokens (overrides admin tokens)
+        user: Authenticated user (or None) for per-user cache isolation.
 
     Returns:
         List of path info objects or None if not found
@@ -739,11 +811,14 @@ async def try_fallback_paths_info(
     if not sources:
         return None
 
+    user_id = _resolve_user_id(user)
+    tokens_hash = compute_tokens_hash(user_tokens)
+
     # Construct API path
     kohaku_path = f"/api/{repo_type}s/{namespace}/{name}/paths-info/{revision}"
     attempts: list[dict] = []
 
-    async def _attempt(source):
+    async def _attempt(source, gens):
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -772,9 +847,11 @@ async def try_fallback_paths_info(
             attempts.append(build_fallback_attempt(source, response=response))
             return None
 
-        cache.set(
+        cache.safe_set(
+            user_id, tokens_hash,
             repo_type, namespace, name,
             source["url"], source["name"], source["source_type"],
+            gens_at_start=gens,
             exists=True,
         )
 
@@ -794,7 +871,9 @@ async def try_fallback_paths_info(
         return response.json()
 
     return await _run_cached_then_chain(
-        repo_type, namespace, name, sources, cache, attempts, _attempt,
+        repo_type, namespace, name,
+        user_id, tokens_hash,
+        sources, cache, attempts, _attempt,
         # paths-info is per-file (answers "does file X exist at
         # revision R"), so all-404 stays scope="file" → EntryNotFound.
         aggregate_scope="file",

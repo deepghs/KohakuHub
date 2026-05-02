@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fallback cache: strict-freshness contract** ([#79](https://github.com/deepghs/KohakuHub/issues/79)).
+  Cache key now includes `user_id` and a `tokens_hash` derived from the
+  user's effective external tokens. Two users (or one user with
+  different per-request `Authorization: Bearer ...|url,token|...` external
+  tokens) can no longer share a binding. Three monotonic generation
+  counters (`global_gen`, `user_gens[uid]`, `repo_gens[(rt, ns, name)]`)
+  drive a `safe_set` race-protection check that rejects cache writes
+  whose pre-probe snapshot disagrees with the post-probe state — closing
+  the admin-mutation / token-rotation / repo-CRUD races where a probe
+  in flight could otherwise pin a stale binding after an invalidation.
+- **Fallback cache: invalidation hooks** ([#79](https://github.com/deepghs/KohakuHub/issues/79)).
+  `cache.invalidate_repo(repo_type, ns, name)` and
+  `cache.clear_user(user_id)` provide the two new eviction primitives;
+  hooked into local repo create/delete/move/visibility-toggle, user
+  external-token POST/DELETE/PUT bulk, and admin source create (the
+  last one parallels the existing UPDATE/DELETE that already evicted).
+- **Admin endpoints: per-repo and per-user fallback cache eviction**
+  ([#79](https://github.com/deepghs/KohakuHub/issues/79)). New
+  `DELETE /admin/api/fallback-sources/cache/repo/{repo_type}/{namespace}/{name}`
+  and `DELETE /admin/api/fallback-sources/cache/user/{user_id}` for
+  operational hygiene.
 - **Fallback: repo-grain binding.** Within a single bind window every read
   against one `repo_id` goes to exactly one source. Eliminates cross-source
   mixing where the SPA showed source A's metadata while `resolve` served
@@ -51,7 +72,3 @@ Planned follow-up work surfaced during the [#77](https://github.com/deepghs/Koha
   fallback cache TTL (`KOHAKU_HUB_FALLBACK_CACHE_TTL`) from `300` to `60`,
   decouple chain-probe logic into a pure `core.probe_chain` function, and
   add admin endpoints + frontend panel for real / simulated chain testing.
-- [#79](https://github.com/deepghs/KohakuHub/issues/79) — include
-  `user_id` in the fallback cache key so two users with different
-  effective source visibility cannot mix bindings; invalidate cache on
-  user-token rotation.

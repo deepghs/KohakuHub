@@ -94,7 +94,11 @@ async def test_with_repo_fallback_uses_resolve_operation_after_http_404(monkeypa
     assert resolve_calls == [
         (
             ("dataset", "owner", "demo", "main", "config.json"),
-            {"user_tokens": {"https://hf.local": "token"}, "method": "HEAD"},
+            {
+                "user_tokens": {"https://hf.local": "token"},
+                "method": "HEAD",
+                "user": "owner-user",
+            },
         )
     ]
 
@@ -200,6 +204,7 @@ async def test_with_repo_fallback_forwards_tree_and_paths_info_expand_parameters
                 "limit": 25,
                 "cursor": "page-1",
                 "user_tokens": {"https://hf.local": "token"},
+                "user": "owner-user",
             },
         )
     ]
@@ -223,6 +228,7 @@ async def test_with_repo_fallback_forwards_tree_and_paths_info_expand_parameters
             {
                 "expand": True,
                 "user_tokens": {"https://hf.local": "token"},
+                "user": "owner-user",
             },
         )
     ]

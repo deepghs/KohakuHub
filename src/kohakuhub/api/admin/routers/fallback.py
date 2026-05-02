@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from kohakuhub.db import FallbackSource, db
+from kohakuhub.db import FallbackSource, User, db
 from kohakuhub.logger import get_logger
 from kohakuhub.api.admin.utils.auth import verify_admin_token
 from kohakuhub.api.fallback.cache import get_cache
@@ -91,6 +91,14 @@ async def create_fallback_source(
             created_at=datetime.now(tz=timezone.utc),
             updated_at=datetime.now(tz=timezone.utc),
         )
+
+        # Strict-freshness invalidation (#79): a new source can change
+        # which source wins for any given repo (e.g. higher-priority
+        # source supersedes a previously-bound lower-priority one).
+        # Match the existing UPDATE/DELETE paths that already
+        # ``cache.clear()``.
+        cache = get_cache()
+        cache.clear()
 
         logger.info(f"Created fallback source: {source.name} ({source.url})")
 
@@ -387,3 +395,151 @@ async def clear_cache(_admin=Depends(verify_admin_token)):
     except Exception as e:
         logger.error(f"Failed to clear cache: {e}")
         raise HTTPException(500, detail={"error": f"Failed to clear cache: {str(e)}"})
+
+
+@router.delete("/fallback-sources/cache/repo/{repo_type}/{namespace}/{name}")
+async def invalidate_repo_cache(
+    repo_type: str,
+    namespace: str,
+    name: str,
+    _admin=Depends(verify_admin_token),
+):
+    """Evict every cached binding for one repo across all user buckets.
+
+    Bumps ``repo_gens[(repo_type, namespace, name)]`` so any fallback
+    probe currently in flight for this repo will have its ``safe_set``
+    rejected. Use for operational hygiene — e.g. when you know a repo's
+    upstream state changed and want every user's next request to
+    re-probe immediately.
+
+    Args:
+        repo_type: "model", "dataset", or "space"
+        namespace: Repository namespace
+        name: Repository name
+        _admin: Admin authentication dependency
+
+    Returns:
+        Eviction count.
+    """
+    try:
+        cache = get_cache()
+        evicted = cache.invalidate_repo(repo_type, namespace, name)
+
+        logger.info(
+            f"Admin invalidated fallback cache for "
+            f"{repo_type}/{namespace}/{name} ({evicted} entries)"
+        )
+
+        return {
+            "success": True,
+            "evicted": evicted,
+            "repo_type": repo_type,
+            "namespace": namespace,
+            "name": name,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to invalidate repo cache: {e}")
+        raise HTTPException(
+            500, detail={"error": f"Failed to invalidate repo cache: {str(e)}"}
+        )
+
+
+@router.delete("/fallback-sources/cache/user/{user_id}")
+async def invalidate_user_cache(
+    user_id: int,
+    _admin=Depends(verify_admin_token),
+):
+    """Evict every cached binding for one user across all repos.
+
+    Bumps ``user_gens[user_id]`` so any fallback probe currently in
+    flight for this user will have its ``safe_set`` rejected. Use for
+    operational hygiene — e.g. when a user's external token has been
+    rotated externally and the user_id-keyed cache needs to drop.
+
+    Args:
+        user_id: User PK (use ``0`` or negative integers for special
+            buckets if needed; the anonymous bucket is keyed by ``None``
+            internally and is not addressable through this endpoint —
+            use ``DELETE /admin/api/fallback-sources/cache/clear``
+            instead to wipe the anonymous bucket).
+        _admin: Admin authentication dependency
+
+    Returns:
+        Eviction count.
+    """
+    try:
+        cache = get_cache()
+        evicted = cache.clear_user(user_id)
+
+        logger.info(
+            f"Admin invalidated fallback cache for user_id={user_id} "
+            f"({evicted} entries)"
+        )
+
+        return {
+            "success": True,
+            "evicted": evicted,
+            "user_id": user_id,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to invalidate user cache: {e}")
+        raise HTTPException(
+            500, detail={"error": f"Failed to invalidate user cache: {str(e)}"}
+        )
+
+
+@router.delete("/fallback-sources/cache/username/{username}")
+async def invalidate_user_cache_by_username(
+    username: str,
+    _admin=Depends(verify_admin_token),
+):
+    """Evict cache for one user identified by username (UX-friendly path).
+
+    Convenience wrapper around ``DELETE .../cache/user/{user_id}``: looks
+    up the user by name and forwards to ``cache.clear_user(user.id)``.
+    The admin frontend uses this so operators don't have to hand-look up
+    a numeric user_id.
+
+    Args:
+        username: Username (case-sensitive, matches the User table).
+        _admin: Admin authentication dependency.
+
+    Returns:
+        ``{success, evicted, user_id, username}``.
+
+    Raises:
+        404 if no user with that username exists.
+    """
+    try:
+        user = User.get_or_none(User.username == username)
+        if user is None:
+            raise HTTPException(
+                404, detail={"error": f"User not found: {username}"}
+            )
+        cache = get_cache()
+        evicted = cache.clear_user(user.id)
+
+        logger.info(
+            f"Admin invalidated fallback cache for username={username} "
+            f"(user_id={user.id}, {evicted} entries)"
+        )
+
+        return {
+            "success": True,
+            "evicted": evicted,
+            "user_id": user.id,
+            "username": username,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to invalidate user cache by username: {e}")
+        raise HTTPException(
+            500,
+            detail={
+                "error": f"Failed to invalidate user cache by username: {str(e)}"
+            },
+        )
