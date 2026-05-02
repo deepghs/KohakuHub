@@ -1,6 +1,7 @@
 """Fallback operations for different endpoint types."""
 
 import asyncio
+import time
 from collections import defaultdict
 from typing import Optional
 from urllib.parse import urljoin
@@ -13,6 +14,7 @@ from kohakuhub.logger import get_logger
 from kohakuhub.api.fallback.cache import compute_tokens_hash, get_cache
 from kohakuhub.api.fallback.client import FallbackClient
 from kohakuhub.api.fallback.config import get_enabled_sources
+from kohakuhub.api.fallback.trace import record_source_hop
 from kohakuhub.api.fallback.utils import (
     add_source_headers,
     build_fallback_attempt,
@@ -348,6 +350,7 @@ async def _resolve_one_source(
         ``None`` if the source falls through (TRY_NEXT_SOURCE) — the
         attempt has already been appended to ``attempts``.
     """
+    head_t0 = time.monotonic()
     try:
         client = FallbackClient(
             source_url=source["url"],
@@ -356,15 +359,42 @@ async def _resolve_one_source(
         )
         response = await client.head(kohaku_path, repo_type)
     except httpx.TimeoutException as e:
+        head_dt_ms = int((time.monotonic() - head_t0) * 1000)
         logger.warning(f"Fallback source {source['name']} HEAD timed out")
         attempts.append(build_fallback_attempt(source, timeout=e))
+        record_source_hop(
+            source,
+            method="HEAD",
+            upstream_path=kohaku_path,
+            duration_ms=head_dt_ms,
+            transport_decision="TIMEOUT",
+            error=str(e) or "request timed out",
+        )
         return None
     except Exception as e:
+        head_dt_ms = int((time.monotonic() - head_t0) * 1000)
         logger.warning(f"Fallback source {source['name']} HEAD failed: {e}")
         attempts.append(build_fallback_attempt(source, network=e))
+        record_source_hop(
+            source,
+            method="HEAD",
+            upstream_path=kohaku_path,
+            duration_ms=head_dt_ms,
+            transport_decision="NETWORK_ERROR",
+            error=str(e) or type(e).__name__,
+        )
         return None
 
+    head_dt_ms = int((time.monotonic() - head_t0) * 1000)
     decision = classify_upstream(response)
+    record_source_hop(
+        source,
+        method="HEAD",
+        upstream_path=kohaku_path,
+        response=response,
+        decision=decision,
+        duration_ms=head_dt_ms,
+    )
 
     if decision is FallbackDecision.TRY_NEXT_SOURCE:
         logger.warning(
@@ -422,13 +452,23 @@ async def _resolve_one_source(
     # the user gets. Falling through to another source here is the
     # cross-source mixing bug #75 fixes (HEAD-200 at A, GET-502 at A,
     # then sneak over to B's same-named-but-different repo).
+    get_t0 = time.monotonic()
     try:
         get_response = await client.get(
             kohaku_path, repo_type, follow_redirects=True
         )
     except httpx.TimeoutException as e:
+        get_dt_ms = int((time.monotonic() - get_t0) * 1000)
         logger.warning(
             f"GET timed out at bound source {source['name']} after HEAD bind: {e}"
+        )
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            duration_ms=get_dt_ms,
+            transport_decision="TIMEOUT",
+            error=str(e) or "request timed out",
         )
         # Bound, no upstream response to forward. Synthesize a 502 from
         # this single attempt; the aggregate-failure helper already
@@ -437,12 +477,31 @@ async def _resolve_one_source(
             [build_fallback_attempt(source, timeout=e)]
         )
     except Exception as e:
+        get_dt_ms = int((time.monotonic() - get_t0) * 1000)
         logger.warning(
             f"GET failed at bound source {source['name']} after HEAD bind: {e}"
+        )
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            duration_ms=get_dt_ms,
+            transport_decision="NETWORK_ERROR",
+            error=str(e) or type(e).__name__,
         )
         return build_aggregate_failure_response(
             [build_fallback_attempt(source, network=e)]
         )
+
+    get_dt_ms = int((time.monotonic() - get_t0) * 1000)
+    record_source_hop(
+        source,
+        method="GET",
+        upstream_path=kohaku_path,
+        response=get_response,
+        decision=classify_upstream(get_response),
+        duration_ms=get_dt_ms,
+    )
 
     if get_response.status_code == 200:
         # Proxy the content with original headers, stripping the
@@ -599,6 +658,7 @@ async def try_fallback_info(
     attempts: list[dict] = []
 
     async def _attempt(source, gens):
+        t0 = time.monotonic()
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -607,15 +667,42 @@ async def try_fallback_info(
             )
             response = await client.get(kohaku_path, repo_type)
         except httpx.TimeoutException as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback info timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="TIMEOUT",
+                error=str(e) or "request timed out",
+            )
             return None
         except Exception as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback info failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="NETWORK_ERROR",
+                error=str(e) or type(e).__name__,
+            )
             return None
 
+        dt_ms = int((time.monotonic() - t0) * 1000)
         decision = classify_upstream(response)
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            response=response,
+            decision=decision,
+            duration_ms=dt_ms,
+        )
         if decision is FallbackDecision.TRY_NEXT_SOURCE:
             logger.warning(
                 f"Fallback info {source['name']}: HTTP {response.status_code} "
@@ -711,6 +798,7 @@ async def try_fallback_tree(
         params["cursor"] = cursor
 
     async def _attempt(source, gens):
+        t0 = time.monotonic()
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -719,15 +807,42 @@ async def try_fallback_tree(
             )
             response = await client.get(kohaku_path, repo_type, params=params)
         except httpx.TimeoutException as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback tree timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="TIMEOUT",
+                error=str(e) or "request timed out",
+            )
             return None
         except Exception as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback tree failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="NETWORK_ERROR",
+                error=str(e) or type(e).__name__,
+            )
             return None
 
+        dt_ms = int((time.monotonic() - t0) * 1000)
         decision = classify_upstream(response)
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            response=response,
+            decision=decision,
+            duration_ms=dt_ms,
+        )
         if decision is FallbackDecision.TRY_NEXT_SOURCE:
             logger.warning(
                 f"Fallback tree {source['name']}: HTTP {response.status_code} "
@@ -819,6 +934,7 @@ async def try_fallback_paths_info(
     attempts: list[dict] = []
 
     async def _attempt(source, gens):
+        t0 = time.monotonic()
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -829,15 +945,42 @@ async def try_fallback_paths_info(
                 kohaku_path, repo_type, data={"paths": paths, "expand": expand}
             )
         except httpx.TimeoutException as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback paths-info timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
+            record_source_hop(
+                source,
+                method="POST",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="TIMEOUT",
+                error=str(e) or "request timed out",
+            )
             return None
         except Exception as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback paths-info failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
+            record_source_hop(
+                source,
+                method="POST",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="NETWORK_ERROR",
+                error=str(e) or type(e).__name__,
+            )
             return None
 
+        dt_ms = int((time.monotonic() - t0) * 1000)
         decision = classify_upstream(response)
+        record_source_hop(
+            source,
+            method="POST",
+            upstream_path=kohaku_path,
+            response=response,
+            decision=decision,
+            duration_ms=dt_ms,
+        )
         if decision is FallbackDecision.TRY_NEXT_SOURCE:
             logger.warning(
                 f"Fallback paths-info {source['name']}: HTTP "

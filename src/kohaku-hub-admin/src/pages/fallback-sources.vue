@@ -16,8 +16,7 @@ import {
   listUsers,
   listRepositories,
   bulkReplaceFallbackSources,
-  testFallbackChainSimulate,
-  testFallbackChainReal,
+  runFallbackProbe,
 } from "@/utils/api";
 import { ElMessage, ElMessageBox } from "element-plus";
 import dayjs from "dayjs";
@@ -660,14 +659,22 @@ async function pushDraftToSystem() {
   }
 }
 
-// User-state simulation.
-const userSim = ref({
-  mode: "anonymous", // "anonymous" | "username" | "user_id"
-  username: "",
-  user_id: null,
-});
-// Authorization-header-style overrides — list of {url, token} so the
-// row order is stable and the form can render iteratively.
+// User-state — Authorization header builder.
+//
+// The chain tester sends a real production request from the browser
+// (axios → KohakuHub → fallback chain) and reads ``X-Chain-Trace`` off
+// the response, so the only "user state" knob it needs is what
+// Authorization header to attach. Two pieces:
+//
+// - ``khubToken``: the personal-access-token portion (the ``Bearer xxx``
+//   prefix). Empty ⇒ anonymous from KohakuHub's perspective.
+// - ``headerTokens``: per-URL fallback-source tokens, encoded into the
+//   ``|<url>,<token>|...`` segments after the bearer token. Mirrors
+//   the production parser at ``api/auth/external_token_parser.py``.
+//
+// Combined into one ``Authorization`` header string — see
+// ``_buildAuthorizationHeader``. Empty everywhere ⇒ no header sent.
+const khubToken = ref("");
 const headerTokens = ref([]);
 
 function addHeaderToken() {
@@ -677,37 +684,28 @@ function removeHeaderToken(index) {
   headerTokens.value.splice(index, 1);
 }
 
-function _headerTokensToObj() {
-  const out = {};
+function _buildAuthorizationHeader() {
+  const segments = [];
   for (const row of headerTokens.value) {
-    if (row.url && row.token) out[row.url] = row.token;
+    if (row.url && row.token) {
+      // ``url,token`` entries inside ``|...|`` are the wire shape parsed
+      // by ``parse_external_tokens`` on the backend.
+      segments.push(`${row.url},${row.token}`);
+    }
   }
-  return out;
+  const t = (khubToken.value || "").trim();
+  if (!t && segments.length === 0) return null;
+  // Construct the full header. If only external tokens are supplied
+  // we still need the ``Bearer `` prefix so the auth middleware
+  // doesn't reject the shape; the empty bearer slot is parsed as
+  // "anonymous khub identity, but consult external tokens".
+  return `Bearer ${t}${segments.length > 0 ? "|" + segments.join("|") : ""}`;
 }
 
 // Probe runner.
 const probeRunning = ref(false);
 const probeReport = ref(null);
 const probeError = ref(null);
-
-function _buildBaseProbePayload() {
-  const paths =
-    probeForm.value.op === "paths_info" && probeForm.value.paths_csv
-      ? probeForm.value.paths_csv
-          .split(",")
-          .map((p) => p.trim())
-          .filter(Boolean)
-      : null;
-  return {
-    op: probeForm.value.op,
-    repo_type: probeForm.value.repo_type,
-    namespace: probeForm.value.namespace,
-    name: probeForm.value.name,
-    revision: probeForm.value.revision || "main",
-    file_path: probeForm.value.file_path || "",
-    paths,
-  };
-}
 
 function _validateProbeTarget() {
   if (!probeForm.value.namespace || !probeForm.value.name) {
@@ -717,67 +715,33 @@ function _validateProbeTarget() {
   return true;
 }
 
-async function runProbeSimulate() {
-  if (!checkAuth()) return;
-  if (!_validateProbeTarget()) return;
-  if (draftSources.value.length === 0) {
-    ElMessage.warning(
-      "Draft is empty — load from system first or add at least one draft source",
-    );
-    return;
-  }
-  probeRunning.value = true;
-  probeError.value = null;
-  try {
-    const payload = {
-      ..._buildBaseProbePayload(),
-      sources: draftSources.value.map((s) => ({
-        name: s.name || s.url,
-        url: s.url,
-        source_type: s.source_type,
-        token: s.token || null,
-        priority: Number(s.priority) || 100,
-      })),
-      user_tokens: _headerTokensToObj(),
-    };
-    probeReport.value = await testFallbackChainSimulate(
-      adminStore.token,
-      payload,
-    );
-  } catch (error) {
-    console.error("simulate probe failed:", error);
-    probeError.value =
-      error.response?.data?.detail?.error || "Simulate probe failed";
-    probeReport.value = null;
-  } finally {
-    probeRunning.value = false;
-  }
-}
-
-async function runProbeReal() {
+async function runRealRequest() {
   if (!checkAuth()) return;
   if (!_validateProbeTarget()) return;
   probeRunning.value = true;
   probeError.value = null;
   try {
-    const payload = {
-      ..._buildBaseProbePayload(),
-      header_tokens: _headerTokensToObj(),
-    };
-    if (userSim.value.mode === "username" && userSim.value.username) {
-      payload.as_username = userSim.value.username.trim();
-    } else if (
-      userSim.value.mode === "user_id" &&
-      userSim.value.user_id != null &&
-      Number(userSim.value.user_id) > 0
-    ) {
-      payload.as_user_id = Number(userSim.value.user_id);
-    }
-    probeReport.value = await testFallbackChainReal(adminStore.token, payload);
+    const paths =
+      probeForm.value.op === "paths_info" && probeForm.value.paths_csv
+        ? probeForm.value.paths_csv
+            .split(",")
+            .map((p) => p.trim())
+            .filter(Boolean)
+        : null;
+    probeReport.value = await runFallbackProbe({
+      op: probeForm.value.op,
+      repo_type: probeForm.value.repo_type,
+      namespace: probeForm.value.namespace,
+      name: probeForm.value.name,
+      revision: probeForm.value.revision || "main",
+      file_path: probeForm.value.file_path || "",
+      paths,
+      authorization: _buildAuthorizationHeader(),
+    });
   } catch (error) {
-    console.error("real probe failed:", error);
+    console.error("real request failed:", error);
     probeError.value =
-      error.response?.data?.detail?.error || "Real probe failed";
+      error.response?.data?.detail?.error || error.message || "Probe failed";
     probeReport.value = null;
   } finally {
     probeRunning.value = false;
@@ -786,12 +750,16 @@ async function runProbeReal() {
 
 function decisionTagType(decision) {
   switch (decision) {
+    case "LOCAL_HIT":
     case "BIND_AND_RESPOND":
       return "success";
+    case "LOCAL_FILTERED":
     case "BIND_AND_PROPAGATE":
       return "warning";
+    case "LOCAL_MISS":
     case "TRY_NEXT_SOURCE":
       return "info";
+    case "LOCAL_OTHER_ERROR":
     case "TIMEOUT":
     case "NETWORK_ERROR":
       return "danger";
@@ -1130,43 +1098,36 @@ onMounted(() => {
           </el-button>
         </div>
 
-        <!-- User state simulation -->
-        <h3 class="tester-section-title">User state — simulation</h3>
-        <el-form
-          :model="userSim"
-          label-width="120px"
-          class="tester-form"
-        >
-          <el-form-item label="Identity">
-            <el-radio-group v-model="userSim.mode" data-testid="user-sim-mode">
-              <el-radio value="anonymous">Anonymous</el-radio>
-              <el-radio value="username">By username</el-radio>
-              <el-radio value="user_id">By user_id</el-radio>
-            </el-radio-group>
-          </el-form-item>
-          <el-form-item v-if="userSim.mode === 'username'" label="Username">
+        <!-- User state — Authorization header builder -->
+        <h3 class="tester-section-title">User state — Authorization header</h3>
+        <p class="tester-section-hint">
+          The probe sends a real request to this KohakuHub instance and
+          reads
+          <code>X-Chain-Trace</code>
+          off the response to render the timeline below. The token
+          fields here are wired into a single
+          <code>Authorization</code>
+          header in the
+          <code>Bearer khub_xxx|url1,token1|...</code>
+          shape — leave everything blank to send anonymously.
+        </p>
+        <el-form label-width="160px" class="tester-form">
+          <el-form-item label="KohakuHub token">
             <el-input
-              v-model="userSim.username"
-              placeholder="e.g. mai_lin"
-              data-testid="user-sim-username"
-            />
-          </el-form-item>
-          <el-form-item v-if="userSim.mode === 'user_id'" label="User ID">
-            <el-input-number
-              v-model="userSim.user_id"
-              :min="1"
-              style="width: 100%"
-              data-testid="user-sim-userid"
+              v-model="khubToken"
+              type="password"
+              placeholder="khub_xxx (optional)"
+              show-password
+              data-testid="probe-khub-token"
             />
           </el-form-item>
         </el-form>
         <h4 class="tester-subsection-title">
-          Authorization-header overrides
+          External-source tokens
           <span class="tester-section-hint">
-            (per-URL token overrides applied on top of the system source list,
-            mirrors the
-            <code>Bearer xxx|url,token|...</code>
-            client format)
+            (per-URL fallback-source tokens, encoded into the
+            <code>|url,token|...</code>
+            segments of the Authorization header)
           </span>
         </h4>
         <div
@@ -1218,25 +1179,25 @@ onMounted(() => {
         </div>
 
         <!-- Run + results -->
-        <h3 class="tester-section-title">Run probe</h3>
+        <h3 class="tester-section-title">Run real request</h3>
+        <p class="tester-section-hint">
+          Sends a real HTTP request straight to this KohakuHub
+          instance — same handler chain a production
+          <code>huggingface_hub</code>
+          client would hit. The chain (local hop first, then any
+          fallback hops walked) is reconstructed from the
+          <code>X-Chain-Trace</code>
+          response header.
+        </p>
         <div class="run-buttons">
           <el-button
-            type="warning"
-            @click="runProbeSimulate"
-            :loading="probeRunning"
-            data-testid="run-simulate-btn"
-          >
-            <i class="i-carbon-play mr-1"></i>
-            Run with draft (Simulate)
-          </el-button>
-          <el-button
             type="primary"
-            @click="runProbeReal"
+            @click="runRealRequest"
             :loading="probeRunning"
             data-testid="run-real-btn"
           >
             <i class="i-carbon-play-filled mr-1"></i>
-            Run with live config (Real)
+            Run real request
           </el-button>
         </div>
 

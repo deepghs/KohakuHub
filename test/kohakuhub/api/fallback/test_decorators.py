@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from types import SimpleNamespace
 
 from fastapi import HTTPException
@@ -9,6 +11,35 @@ from fastapi.responses import JSONResponse, Response
 import pytest
 
 import kohakuhub.api.fallback.decorators as fallback_decorators
+
+
+def _decode_body(result):
+    """Return the JSON-decoded body of a ``JSONResponse``-wrapped result.
+
+    The decorator now wraps dict / list returns in a ``JSONResponse`` so
+    it can attach the ``X-Chain-Trace`` header (#78). Tests that used
+    to compare ``result == {...}`` decode the wrapper's rendered body
+    here and compare against that.
+    """
+    if isinstance(result, Response):
+        return json.loads(bytes(result.body))
+    return result
+
+
+def _decode_trace_header(response: Response) -> list[dict]:
+    """Decode ``X-Chain-Trace`` from a Response into the hop list."""
+    header = response.headers.get("x-chain-trace") or response.headers.get(
+        "X-Chain-Trace"
+    )
+    if not header:
+        return []
+    try:
+        decoded = base64.b64decode(header).decode("utf-8")
+        envelope = json.loads(decoded)
+        hops = envelope.get("hops")
+        return hops if isinstance(hops, list) else []
+    except Exception:
+        return []
 
 
 def _request(
@@ -89,7 +120,12 @@ async def test_with_repo_fallback_uses_resolve_operation_after_http_404(monkeypa
         user="owner-user",
     )
 
-    assert result == {"resolved": True}
+    assert _decode_body(result) == {"resolved": True}
+    # The decorator now also injects X-Chain-Trace with at least the
+    # local hop (LOCAL_MISS, since we raised 404) — see the dedicated
+    # trace-emission tests below for full coverage.
+    hops = _decode_trace_header(result)
+    assert any(h.get("decision") == "LOCAL_MISS" for h in hops)
     assert merged_inputs == [("owner-user", {"https://hf.local": "header-token"})]
     assert resolve_calls == [
         (
@@ -194,7 +230,7 @@ async def test_with_repo_fallback_forwards_tree_and_paths_info_expand_parameters
         request=tree_request,
         user="owner-user",
     )
-    assert tree_result == {"tree": True}
+    assert _decode_body(tree_result) == {"tree": True}
     assert forwarded_tree_calls == [
         (
             ("model", "owner", "demo", "main", "docs"),
@@ -221,7 +257,7 @@ async def test_with_repo_fallback_forwards_tree_and_paths_info_expand_parameters
         request=paths_info_request,
         user="owner-user",
     )
-    assert paths_info_result == [{"path": "README.md"}]
+    assert _decode_body(paths_info_result) == [{"path": "README.md"}]
     assert forwarded_paths_info_calls == [
         (
             ("model", "owner", "demo", "main", ["README.md", "docs"]),
@@ -637,3 +673,236 @@ async def test_with_user_fallback_unknown_local_namespace_falls_through(monkeypa
     result = await handler(username="nobody", request=_request("/api/users/nobody/profile"))
     assert len(fallback_calls) == 1
     assert result["_source"] == "HF"
+
+
+# ===========================================================================
+# X-Chain-Trace emission contract (#78 redesign)
+#
+# The chain tester sends a real production request from the browser and
+# reads the chain off ``X-Chain-Trace``. The decorator is the single
+# place that bootstraps the trace and records the local hop, so these
+# tests pin down the per-decision shapes:
+#
+# - LOCAL_HIT (Response 2xx)   : success path, Response → header attached
+# - LOCAL_HIT (dict return)     : success path, dict → JSONResponse wrap + header
+# - LOCAL_FILTERED (404 +Entry) : local repo exists, entry missing — no fallback
+# - LOCAL_MISS  (404 +RepoMiss) : fallback ran; both local + fallback hops recorded
+# - LOCAL_OTHER_ERROR (5xx)     : non-404 surfaces unchanged with trace attached
+# - HTTPException 4xx (non-404) : re-raised with X-Chain-Trace in headers
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_trace_local_hit_response_attaches_header(monkeypatch):
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        # Plain 2xx Response — the LOCAL_HIT path through the decorator.
+        return Response(status_code=200, content=b'{"ok":true}', media_type="application/json")
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        request=_request("/api/models/owner/demo"),
+    )
+    hops = _decode_trace_header(result)
+    assert len(hops) == 1
+    h = hops[0]
+    assert h["kind"] == "local"
+    assert h["source_name"] == "local"
+    assert h["decision"] == "LOCAL_HIT"
+    assert h["status_code"] == 200
+    assert isinstance(h["duration_ms"], int)
+
+
+@pytest.mark.asyncio
+async def test_trace_local_hit_dict_return_is_wrapped(monkeypatch):
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return {"id": "owner/demo", "private": False}
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        request=_request("/api/models/owner/demo"),
+    )
+    # Dict was wrapped in JSONResponse so we can attach the trace header
+    # — but the body content is byte-identical to what FastAPI's auto
+    # conversion would emit (both go through ``jsonable_encoder``).
+    assert isinstance(result, JSONResponse)
+    assert _decode_body(result) == {"id": "owner/demo", "private": False}
+    hops = _decode_trace_header(result)
+    assert [h["decision"] for h in hops] == ["LOCAL_HIT"]
+
+
+@pytest.mark.asyncio
+async def test_trace_local_filtered_records_entry_not_found(monkeypatch):
+    """Local 404 + EntryNotFound → LOCAL_FILTERED hop, no fallback hop."""
+
+    async def fail(*_a, **_k):
+        raise AssertionError("fallback chain must NOT run on EntryNotFound")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_resolve", fail)
+
+    @fallback_decorators.with_repo_fallback("resolve")
+    async def handler(
+        repo_type, namespace, name, revision, path,
+        request=None, fallback: bool = True, user=None,
+    ):
+        return Response(
+            status_code=404,
+            headers={"X-Error-Code": "EntryNotFound", "X-Error-Message": "missing entry"},
+        )
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        revision="main", path="foo",
+        request=_request("/owner/demo/resolve/main/foo"),
+    )
+    hops = _decode_trace_header(result)
+    assert len(hops) == 1
+    assert hops[0]["decision"] == "LOCAL_FILTERED"
+    assert hops[0]["x_error_code"] == "EntryNotFound"
+    # Same Response object reference preserved (header injection mutates in place).
+    assert result.status_code == 404
+    assert result.headers["X-Error-Code"] == "EntryNotFound"
+
+
+@pytest.mark.asyncio
+async def test_trace_local_miss_then_fallback_emits_both_hops(monkeypatch):
+    """Local 404 RepoNotFound → fallback runs. We expect a LOCAL_MISS hop
+    captured by the decorator and at least one fallback hop captured by
+    the operations layer when the chain probes a source."""
+    # We reach into the decorator's ``start_trace.__globals__`` to grab
+    # the *exact* trace-module instance the OLD ``fallback_decorators``
+    # (the one bound at this test file's import) is wired against. After
+    # a previous test triggered the conftest's ``clear_backend_modules``
+    # reload, ``sys.modules`` will hold a *new* trace module whose
+    # ``_chain_trace`` ContextVar is a different object from the old one
+    # the OLD decorator uses. Picking the function dictionary off the
+    # OLD ``start_trace`` keeps the read + write paths on the same
+    # ContextVar instance, otherwise ``record_source_hop`` would no-op
+    # against an unset variable.
+    trace_module_globals = fallback_decorators.start_trace.__globals__
+    record_source_hop_live = trace_module_globals["record_source_hop"]
+
+    async def fake_resolve(*args, **kwargs):
+        record_source_hop_live(
+            {"name": "HF", "url": "https://hf.example", "source_type": "huggingface"},
+            method="HEAD",
+            upstream_path="/models/owner/demo/resolve/main/foo",
+            response=None,
+            decision=None,
+            duration_ms=42,
+            transport_decision="BIND_AND_RESPOND",
+            error=None,
+        )
+        return Response(status_code=200, content=b"hf-bytes")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_resolve", fake_resolve)
+    monkeypatch.setattr(fallback_decorators, "get_merged_external_tokens", lambda u, h: {})
+
+    @fallback_decorators.with_repo_fallback("resolve")
+    async def handler(
+        repo_type, namespace, name, revision, path,
+        request=None, fallback: bool = True, user=None,
+    ):
+        return Response(
+            status_code=404,
+            headers={"X-Error-Code": "RepoNotFound"},
+        )
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        revision="main", path="foo",
+        request=_request("/owner/demo/resolve/main/foo"),
+    )
+    hops = _decode_trace_header(result)
+    decisions = [h["decision"] for h in hops]
+    assert "LOCAL_MISS" in decisions
+    # The fallback hop sits after the local hop and inherits the
+    # transport_decision we passed.
+    assert hops[0]["kind"] == "local"
+    assert any(h["kind"] == "fallback" for h in hops)
+
+
+@pytest.mark.asyncio
+async def test_trace_local_other_error_attaches_header_and_surfaces_response(monkeypatch):
+    """A 5xx Response from local should NOT trigger fallback and must
+    still carry X-Chain-Trace (decision=LOCAL_OTHER_ERROR)."""
+
+    async def fail(*_a, **_k):
+        raise AssertionError("fallback must NOT run on non-404")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_info", fail)
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return Response(status_code=503, content=b"backend down")
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        request=_request("/api/models/owner/demo"),
+    )
+    assert result.status_code == 503
+    hops = _decode_trace_header(result)
+    assert [h["decision"] for h in hops] == ["LOCAL_OTHER_ERROR"]
+
+
+@pytest.mark.asyncio
+async def test_trace_local_other_error_httpexception_carries_header(monkeypatch):
+    """Same as above but for HTTPException(non-404) — re-raised with
+    X-Chain-Trace in the exception headers so the chain tester can read
+    it from the error response too."""
+
+    async def fail(*_a, **_k):
+        raise AssertionError("fallback must NOT run on non-404 HTTPException")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_info", fail)
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        raise HTTPException(status_code=500, detail="boom")
+
+    with pytest.raises(HTTPException) as exc:
+        await handler(
+            repo_type="model", namespace="owner", name="demo",
+            request=_request("/api/models/owner/demo"),
+        )
+    assert exc.value.status_code == 500
+    headers = exc.value.headers or {}
+    trace_header = headers.get("X-Chain-Trace") or headers.get("x-chain-trace")
+    assert trace_header, "X-Chain-Trace must ride on the HTTPException headers"
+    decoded = base64.b64decode(trace_header).decode("utf-8")
+    hops = json.loads(decoded)["hops"]
+    assert hops[0]["decision"] == "LOCAL_OTHER_ERROR"
+    assert hops[0]["status_code"] == 500
+
+
+@pytest.mark.asyncio
+async def test_trace_fallback_miss_carries_local_and_attaches_to_404(monkeypatch):
+    """Local 404 RepoNotFound + fallback returns None ⇒ original local
+    404 is surfaced, with X-Chain-Trace recording the LOCAL_MISS hop."""
+
+    async def fake_tree(*args, **kwargs):
+        return None  # chain exhausted, nothing bound
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_tree", fake_tree)
+    monkeypatch.setattr(fallback_decorators, "get_merged_external_tokens", lambda u, h: {})
+
+    original = JSONResponse(
+        status_code=404,
+        content={"detail": "missing"},
+        headers={"X-Error-Code": "RepoNotFound"},
+    )
+
+    @fallback_decorators.with_repo_fallback("tree")
+    async def handler(namespace, name, revision, path="", request=None, user=None):
+        return original
+
+    result = await handler(
+        namespace="owner", name="demo", revision="main",
+        request=_request("/api/models/owner/demo/tree/main"),
+    )
+    # Decorator surfaces the original 404 Response object (same id);
+    # header injection mutates in place so X-Chain-Trace is attached.
+    assert result is original
+    hops = _decode_trace_header(result)
+    assert hops[0]["decision"] == "LOCAL_MISS"

@@ -184,20 +184,6 @@ describe("admin API client", () => {
         enabled: true,
       },
     ]);
-    await api.testFallbackChainSimulate("admin-token", {
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
-      sources: [{ url: "https://hf.example", source_type: "huggingface" }],
-    });
-    await api.testFallbackChainReal("admin-token", {
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
-      as_username: "mai_lin",
-    });
 
     await api.deleteRepositoryAdmin(
       "admin-token",
@@ -327,20 +313,6 @@ describe("admin API client", () => {
         sources: expect.any(Array),
       }),
     );
-    expect(client.post).toHaveBeenCalledWith(
-      "/fallback/test/simulate",
-      expect.objectContaining({
-        op: "info",
-        sources: expect.any(Array),
-      }),
-    );
-    expect(client.post).toHaveBeenCalledWith(
-      "/fallback/test/real",
-      expect.objectContaining({
-        op: "info",
-        as_username: "mai_lin",
-      }),
-    );
     expect(client.delete).toHaveBeenCalledWith(
       "/storage/objects/models%2Fdemo%2Ffile.bin",
     );
@@ -381,6 +353,220 @@ describe("admin API client", () => {
         headers: { "X-Admin-Token": "admin-token" },
       },
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // Chain-tester helpers (#78 redesign):
+  //   - decodeChainTraceHeader: tolerant base64-JSON decoder
+  //   - buildProbeRequestTarget: URL + method per op
+  //   - runFallbackProbe: real-request driver, parses X-Chain-Trace
+  // ---------------------------------------------------------------------
+
+  it("decodeChainTraceHeader decodes valid headers and tolerates broken input", async () => {
+    const api = await loadModule();
+    const hops = [
+      { kind: "local", source_name: "local", decision: "LOCAL_HIT" },
+      { kind: "fallback", source_name: "HF", decision: "BIND_AND_RESPOND" },
+    ];
+    const encoded = btoa(JSON.stringify({ version: 1, hops }));
+    expect(api.decodeChainTraceHeader(encoded)).toEqual(hops);
+
+    // Tolerant fallthroughs.
+    expect(api.decodeChainTraceHeader(null)).toEqual([]);
+    expect(api.decodeChainTraceHeader(undefined)).toEqual([]);
+    expect(api.decodeChainTraceHeader("")).toEqual([]);
+    expect(api.decodeChainTraceHeader("not-base64")).toEqual([]);
+    // Valid base64, invalid JSON.
+    expect(api.decodeChainTraceHeader(btoa("{not json"))).toEqual([]);
+    // Valid JSON without hops.
+    expect(
+      api.decodeChainTraceHeader(btoa(JSON.stringify({ version: 1 }))),
+    ).toEqual([]);
+  });
+
+  it("buildProbeRequestTarget assembles the URL + method for each op", async () => {
+    const api = await loadModule();
+    const base = { repo_type: "model", namespace: "owner", name: "demo" };
+
+    expect(api.buildProbeRequestTarget({ op: "info", ...base })).toEqual({
+      url: "/api/models/owner/demo",
+      method: "get",
+    });
+    expect(
+      api.buildProbeRequestTarget({ op: "tree", revision: "main", file_path: "", ...base }),
+    ).toEqual({
+      url: "/api/models/owner/demo/tree/main",
+      method: "get",
+    });
+    expect(
+      api.buildProbeRequestTarget({
+        op: "tree",
+        revision: "dev",
+        file_path: "subdir/leaf",
+        ...base,
+      }),
+    ).toEqual({
+      url: "/api/models/owner/demo/tree/dev/subdir/leaf",
+      method: "get",
+    });
+    expect(
+      api.buildProbeRequestTarget({
+        op: "resolve",
+        revision: "main",
+        file_path: "config.json",
+        ...base,
+      }),
+    ).toEqual({
+      url: "/models/owner/demo/resolve/main/config.json",
+      method: "head",
+    });
+    expect(
+      api.buildProbeRequestTarget({ op: "paths_info", revision: "main", ...base }),
+    ).toEqual({
+      url: "/api/models/owner/demo/paths-info/main",
+      method: "post",
+    });
+    // Bad op throws.
+    expect(() =>
+      api.buildProbeRequestTarget({ op: "totally-bogus", ...base }),
+    ).toThrow(/Unknown probe op/);
+  });
+
+  it("runFallbackProbe sends the real request, decodes X-Chain-Trace, and assembles a report", async () => {
+    const api = await loadModule();
+
+    const hops = [
+      {
+        kind: "local",
+        source_name: "local",
+        source_url: null,
+        source_type: null,
+        method: "GET",
+        upstream_path: "/api/models/owner/demo",
+        status_code: 200,
+        x_error_code: null,
+        x_error_message: null,
+        decision: "LOCAL_HIT",
+        duration_ms: 12,
+        error: null,
+      },
+    ];
+    const encoded = btoa(JSON.stringify({ version: 1, hops }));
+
+    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-chain-trace": encoded,
+      },
+      data: { id: "owner/demo", private: false },
+    });
+
+    const report = await api.runFallbackProbe({
+      op: "info",
+      repo_type: "model",
+      namespace: "owner",
+      name: "demo",
+      revision: "main",
+      authorization: "Bearer khub_xxx|https://hf.example,hf_yyy",
+    });
+
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+    const call = requestSpy.mock.calls[0][0];
+    expect(call.url).toBe("/api/models/owner/demo");
+    expect(call.method).toBe("get");
+    expect(call.headers.Authorization).toBe(
+      "Bearer khub_xxx|https://hf.example,hf_yyy",
+    );
+    expect(call.validateStatus(404)).toBe(true);  // accepts all statuses
+
+    expect(report.final_outcome).toBe("LOCAL_HIT");
+    expect(report.bound_source).toEqual({ name: "local", url: null });
+    expect(report.attempts).toHaveLength(1);
+    expect(report.attempts[0].decision).toBe("LOCAL_HIT");
+    expect(report.attempts[0].kind).toBe("local");
+    expect(report.final_response.status_code).toBe(200);
+    expect(report.final_response.body_preview).toContain('"id": "owner/demo"');
+    // Curated headers — only the relevant set is preserved.
+    expect(report.final_response.headers["content-type"]).toBe(
+      "application/json",
+    );
+  });
+
+  it("runFallbackProbe with no Authorization sends no Authorization header", async () => {
+    const api = await loadModule();
+    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {},
+    });
+    await api.runFallbackProbe({
+      op: "info",
+      repo_type: "model",
+      namespace: "owner",
+      name: "demo",
+    });
+    const call = requestSpy.mock.calls[0][0];
+    expect(call.headers.Authorization).toBeUndefined();
+  });
+
+  it("runFallbackProbe synthesizes a NETWORK_ERROR report when the request throws", async () => {
+    const api = await loadModule();
+    vi.spyOn(axios, "request").mockRejectedValue(new Error("connection refused"));
+
+    const report = await api.runFallbackProbe({
+      op: "info",
+      repo_type: "model",
+      namespace: "owner",
+      name: "demo",
+    });
+
+    expect(report.final_outcome).toBe("ERROR");
+    expect(report.bound_source).toBeNull();
+    expect(report.attempts).toHaveLength(1);
+    expect(report.attempts[0].decision).toBe("NETWORK_ERROR");
+    expect(report.attempts[0].error).toBe("connection refused");
+    expect(report.final_response).toBeNull();
+  });
+
+  it("runFallbackProbe missing X-Chain-Trace yields an empty timeline (CHAIN_EXHAUSTED)", async () => {
+    const api = await loadModule();
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      headers: { "content-type": "text/plain" },
+      data: "hello",
+    });
+    const report = await api.runFallbackProbe({
+      op: "info",
+      repo_type: "model",
+      namespace: "owner",
+      name: "demo",
+    });
+    expect(report.attempts).toEqual([]);
+    expect(report.final_outcome).toBe("CHAIN_EXHAUSTED");
+    expect(report.final_response.status_code).toBe(200);
+    expect(report.final_response.body_preview).toBe("hello");
+  });
+
+  it("runFallbackProbe paths_info packs paths into the request body", async () => {
+    const api = await loadModule();
+    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: [],
+    });
+    await api.runFallbackProbe({
+      op: "paths_info",
+      repo_type: "dataset",
+      namespace: "owner",
+      name: "demo",
+      revision: "main",
+      paths: ["README.md", "config.json"],
+    });
+    const call = requestSpy.mock.calls[0][0];
+    expect(call.method).toBe("post");
+    expect(call.url).toBe("/api/datasets/owner/demo/paths-info/main");
+    expect(call.data).toEqual({ paths: ["README.md", "config.json"] });
   });
 
   it("verifies admin tokens and formats quota sizes safely", async () => {

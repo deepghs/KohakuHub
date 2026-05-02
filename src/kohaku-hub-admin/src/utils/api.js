@@ -884,62 +884,287 @@ export async function bulkReplaceFallbackSources(token, sources) {
 }
 
 /**
- * Run a chain probe with an operator-supplied source list + per-source
- * token overlay. Pure read — does not write the production cache or
- * take the binding lock. Returns a structured ``ProbeReport`` so the
- * UI can render a per-source timeline.
+ * Decode an ``X-Chain-Trace`` response header (base64-encoded JSON
+ * envelope ``{"version": 1, "hops": [...]}``) into the hop array.
  *
- * @param {string} token - Admin token
- * @param {Object} payload - Probe parameters.
- * @param {("resolve"|"info"|"tree"|"paths_info")} payload.op
- * @param {("model"|"dataset"|"space")} payload.repo_type
- * @param {string} payload.namespace
- * @param {string} payload.name
- * @param {string} [payload.revision]
- * @param {string} [payload.file_path]
- * @param {Array<string>} [payload.paths]
- * @param {Array<Object>} payload.sources - Sources to probe (with optional ``token``).
- * @param {Object<string,string>} [payload.user_tokens] - Per-URL token overrides.
- * @returns {Promise<Object>} ProbeReport (see core.py for shape).
+ * Tolerates malformed input by returning ``[]`` so the caller never has
+ * to catch — useful because ``X-Chain-Trace`` is only set by routes
+ * decorated with ``with_repo_fallback`` and an off-path response (e.g.
+ * a 401 from ``get_optional_user`` before the decorator runs) won't
+ * carry the header.
+ *
+ * @param {string|undefined|null} headerValue
+ * @returns {Array<Object>} Array of hop dicts (see ``trace.py``).
  */
-export async function testFallbackChainSimulate(token, payload) {
-  const client = createAdminClient(token);
-  const response = await client.post(
-    "/fallback/test/simulate",
-    payload,
-  );
-  return response.data;
+export function decodeChainTraceHeader(headerValue) {
+  if (!headerValue) return [];
+  try {
+    const decoded = atob(headerValue);
+    const parsed = JSON.parse(decoded);
+    if (parsed && Array.isArray(parsed.hops)) return parsed.hops;
+  } catch (_e) {
+    // Defensive: malformed header → empty trace, render shows
+    // "no chain data available" rather than blowing up the UI.
+  }
+  return [];
+}
+
+const _PROBE_RELEVANT_HEADERS = new Set([
+  "content-type",
+  "etag",
+  "location",
+  "x-error-code",
+  "x-error-message",
+  "x-linked-etag",
+  "x-linked-size",
+  "x-repo-commit",
+  "x-source",
+  "x-source-url",
+  "x-source-status",
+  "x-source-count",
+  "x-chain-trace",
+  "www-authenticate",
+]);
+
+function _curatedHeaders(rawHeaders) {
+  // axios normalizes header keys to lowercase in browsers (XHR
+  // ``getAllResponseHeaders`` returns lowercase). We filter to the
+  // curated set used elsewhere in the chain tester so the timeline
+  // doesn't drown in date/server/keep-alive noise.
+  const out = {};
+  if (!rawHeaders) return out;
+  for (const [k, v] of Object.entries(rawHeaders)) {
+    if (_PROBE_RELEVANT_HEADERS.has(k.toLowerCase())) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function _bodyPreview(data) {
+  // Browser-side body preview, capped at 4096 chars to mirror the
+  // backend ``_BODY_PREVIEW_LIMIT``. Stringify objects (axios already
+  // parses JSON responses) and pass strings through verbatim.
+  if (data == null) return "";
+  let text;
+  if (typeof data === "string") {
+    text = data;
+  } else {
+    try {
+      text = JSON.stringify(data, null, 2);
+    } catch (_e) {
+      text = String(data);
+    }
+  }
+  return text.length > 4096 ? text.slice(0, 4096) : text;
 }
 
 /**
- * Run a chain probe against the live system config, optionally
- * impersonating an authenticated user (so per-user
- * ``UserExternalToken`` rows enter the chain). Pure read.
+ * Build the URL + HTTP method for a given chain-tester operation.
  *
- * @param {string} token - Admin token
- * @param {Object} payload
- * @param {("resolve"|"info"|"tree"|"paths_info")} payload.op
- * @param {("model"|"dataset"|"space")} payload.repo_type
- * @param {string} payload.namespace
- * @param {string} payload.name
- * @param {string} [payload.revision]
- * @param {string} [payload.file_path]
- * @param {Array<string>} [payload.paths]
- * @param {string} [payload.as_username] - Username to impersonate. Wins
- *   over ``as_user_id`` if both supplied. Anonymous if both absent.
- * @param {number} [payload.as_user_id] - User PK to impersonate.
- * @param {Object<string,string>} [payload.header_tokens] -
- *   Authorization-header-style per-URL overrides (model the
- *   ``Bearer xxx|url,token|...`` shape, pre-decoded).
+ * Mirrors the routes defined in ``src/kohakuhub/main.py`` /
+ * ``api/files.py`` / ``api/repo/routers/info.py`` /
+ * ``api/repo/routers/tree.py`` so a real request from this helper goes
+ * through the exact handler chain a production hf_hub client would.
+ *
+ * @param {Object} target
+ * @param {string} target.op - "info" | "tree" | "resolve" | "paths_info"
+ * @param {string} target.repo_type
+ * @param {string} target.namespace
+ * @param {string} target.name
+ * @param {string} [target.revision]
+ * @param {string} [target.file_path]
+ * @returns {{url: string, method: "get"|"head"|"post"}}
+ */
+export function buildProbeRequestTarget({
+  op,
+  repo_type,
+  namespace,
+  name,
+  revision,
+  file_path,
+}) {
+  const ns = encodeURIComponent(namespace);
+  const nm = encodeURIComponent(name);
+  const rev = encodeURIComponent(revision || "main");
+  // file_path is the raw repo-internal path; encode segments
+  // individually so slashes survive (matches HF's resolve URL shape).
+  const path = (file_path || "")
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+  switch (op) {
+    case "info":
+      return { url: `/api/${repo_type}s/${ns}/${nm}`, method: "get" };
+    case "tree":
+      return {
+        url: `/api/${repo_type}s/${ns}/${nm}/tree/${rev}${path ? "/" + path : ""}`,
+        method: "get",
+      };
+    case "resolve":
+      return {
+        url: `/${repo_type}s/${ns}/${nm}/resolve/${rev}/${path}`,
+        method: "head",
+      };
+    case "paths_info":
+      return {
+        url: `/api/${repo_type}s/${ns}/${nm}/paths-info/${rev}`,
+        method: "post",
+      };
+    default:
+      throw new Error(`Unknown probe op: ${op}`);
+  }
+}
+
+/**
+ * Send a real request to the local KohakuHub instance — exactly the
+ * shape a production hf_hub client would issue — then read the
+ * ``X-Chain-Trace`` response header to reconstruct the per-hop timeline
+ * (local hop first, then any fallback hops the request walked through).
+ *
+ * Returns a ``ProbeReport``-shaped object so the existing tester UI
+ * can render it without changes:
+ *
+ * - ``attempts`` — one entry per hop in the trace (kind="local" first,
+ *   then "fallback"). Mirrors the backend ``ProbeAttempt`` schema for
+ *   the keys the timeline UI reads.
+ * - ``final_outcome`` — the decision of the bound hop, or
+ *   ``CHAIN_EXHAUSTED``.
+ * - ``bound_source`` — ``{name, url}`` of the hop that bound (or
+ *   ``null`` if exhausted).
+ * - ``final_response`` — ``{status_code, headers, body_preview}`` of
+ *   the actual axios response, so the UI shows what the production
+ *   caller would receive.
+ *
+ * @param {Object} req
+ * @param {("info"|"tree"|"resolve"|"paths_info")} req.op
+ * @param {("model"|"dataset"|"space")} req.repo_type
+ * @param {string} req.namespace
+ * @param {string} req.name
+ * @param {string} [req.revision]
+ * @param {string} [req.file_path]
+ * @param {Array<string>} [req.paths]
+ * @param {string} [req.authorization] - Full ``Authorization`` header
+ *   value, e.g. ``"Bearer khub_xxx|https://huggingface.co,hf_yyy|..."``.
+ *   Omitted ⇒ anonymous request. Caller is responsible for assembling
+ *   the ``|url,token|...`` external-token segments.
  * @returns {Promise<Object>} ProbeReport.
  */
-export async function testFallbackChainReal(token, payload) {
-  const client = createAdminClient(token);
-  const response = await client.post(
-    "/fallback/test/real",
-    payload,
-  );
-  return response.data;
+export async function runFallbackProbe(req) {
+  const target = buildProbeRequestTarget(req);
+  const headers = {};
+  if (req.authorization) headers["Authorization"] = req.authorization;
+  // Probe runs through the production handler chain, which means a
+  // real cache write may happen on bind. That's intentional — the
+  // tester surfaces "what would my prod call do" and the user can
+  // invalidate via the eviction panel afterwards if they need to.
+
+  const t0 = performance.now();
+  let response;
+  let networkError = null;
+  try {
+    response = await axios.request({
+      url: target.url,
+      method: target.method,
+      headers,
+      // POST paths-info needs a body; other methods don't.
+      data: target.method === "post" ? { paths: req.paths || [] } : undefined,
+      // Surface 4xx/5xx as resolved promises so we can read the trace
+      // header and the error body together. Network errors / aborts
+      // still throw and we catch below.
+      validateStatus: () => true,
+    });
+  } catch (e) {
+    networkError = e;
+  }
+  const total_ms = Math.round(performance.now() - t0);
+
+  if (networkError || !response) {
+    // No response — synthesize a single-attempt error report so the
+    // timeline still has something to render.
+    return {
+      final_outcome: "ERROR",
+      bound_source: null,
+      duration_ms: total_ms,
+      attempts: [
+        {
+          kind: "local",
+          decision: "NETWORK_ERROR",
+          source_name: "local",
+          source_url: null,
+          source_type: null,
+          method: target.method.toUpperCase(),
+          upstream_path: target.url,
+          status_code: null,
+          x_error_code: null,
+          x_error_message: null,
+          duration_ms: total_ms,
+          error: networkError ? networkError.message : "no response",
+        },
+      ],
+      final_response: null,
+      request: { url: target.url, method: target.method.toUpperCase() },
+    };
+  }
+
+  const traceHeader =
+    response.headers["x-chain-trace"] ||
+    response.headers["X-Chain-Trace"] ||
+    null;
+  const hops = decodeChainTraceHeader(traceHeader);
+
+  const attempts = hops.map((h) => ({
+    kind: h.kind || "fallback",
+    decision: h.decision,
+    source_name: h.source_name || "(unknown)",
+    source_url: h.source_url || null,
+    source_type: h.source_type || null,
+    method: h.method || target.method.toUpperCase(),
+    upstream_path: h.upstream_path || null,
+    status_code: h.status_code,
+    x_error_code: h.x_error_code,
+    x_error_message: h.x_error_message,
+    duration_ms: h.duration_ms,
+    error: h.error || null,
+    response_headers: null,
+    response_body_preview: null,
+  }));
+
+  // Walk hops in order to find the binding decision. The first hop
+  // with a binding outcome (LOCAL_HIT/LOCAL_FILTERED/LOCAL_OTHER_ERROR
+  // /BIND_AND_RESPOND/BIND_AND_PROPAGATE) wins; otherwise the chain
+  // exhausted.
+  let final_outcome = "CHAIN_EXHAUSTED";
+  let bound_source = null;
+  for (const a of attempts) {
+    const d = a.decision;
+    if (
+      d === "LOCAL_HIT" ||
+      d === "LOCAL_FILTERED" ||
+      d === "LOCAL_OTHER_ERROR" ||
+      d === "BIND_AND_RESPOND" ||
+      d === "BIND_AND_PROPAGATE"
+    ) {
+      final_outcome = d;
+      bound_source = { name: a.source_name, url: a.source_url };
+      break;
+    }
+  }
+
+  const final_response = {
+    status_code: response.status,
+    headers: _curatedHeaders(response.headers),
+    body_preview: _bodyPreview(response.data),
+  };
+
+  return {
+    final_outcome,
+    bound_source,
+    duration_ms: total_ms,
+    attempts,
+    final_response,
+    request: { url: target.url, method: target.method.toUpperCase() },
+  };
 }
 
 // ===== Repository Management =====
