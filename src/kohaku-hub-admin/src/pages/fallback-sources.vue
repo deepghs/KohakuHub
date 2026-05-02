@@ -331,6 +331,42 @@ async function fetchRepoNameSuggestions(query, cb) {
   }
 }
 
+async function fetchProbeRepoNameSuggestions(query, cb) {
+  // Mirror of ``fetchRepoNameSuggestions`` but scoped to ``probeForm``
+  // (the chain-tester probe target form) instead of ``evictRepoForm``.
+  // Two parallel fetchers exist because the two forms have different
+  // ``repo_type`` / ``namespace`` Vue refs and conflating them would
+  // tie the eviction dialog's autocomplete to whatever the probe form
+  // happens to have selected.
+  if (!checkAuth()) {
+    cb([]);
+    return;
+  }
+  try {
+    if (!query || query.length < 1) {
+      cb([]);
+      return;
+    }
+    const data = await listRepositories(adminStore.token, {
+      search: query,
+      repo_type: probeForm.value.repo_type,
+      namespace: probeForm.value.namespace || undefined,
+      limit: 20,
+    });
+    const items = Array.isArray(data)
+      ? data
+      : data?.repositories || data?.items || [];
+    cb(
+      items
+        .filter((repo) => repo.name)
+        .map((repo) => ({ value: repo.name })),
+    );
+  } catch (error) {
+    console.error("Failed to fetch probe repo name suggestions:", error);
+    cb([]);
+  }
+}
+
 async function fetchUsernameSuggestions(query, cb) {
   if (!checkAuth()) {
     cb([]);
@@ -937,16 +973,22 @@ onMounted(() => {
               </el-select>
             </el-form-item>
             <el-form-item label="Namespace" required>
-              <el-input
+              <el-autocomplete
                 v-model="probeForm.namespace"
+                :fetch-suggestions="fetchNamespaceSuggestions"
                 placeholder="owner / org"
+                clearable
+                style="width: 100%"
                 data-testid="probe-namespace"
               />
             </el-form-item>
             <el-form-item label="Name" required>
-              <el-input
+              <el-autocomplete
                 v-model="probeForm.name"
+                :fetch-suggestions="fetchProbeRepoNameSuggestions"
                 placeholder="repo name"
+                clearable
+                style="width: 100%"
                 data-testid="probe-name"
               />
             </el-form-item>

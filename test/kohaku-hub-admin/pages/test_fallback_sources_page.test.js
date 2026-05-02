@@ -2147,6 +2147,130 @@ describe("admin fallback-sources page", () => {
     expect(wrapper.text()).toContain("FUTURE_UNKNOWN_DECISION");
   });
 
+  // -----------------------------------------------------------------
+  // Chain Tester probe-target autocomplete (#78 follow-up)
+  // -----------------------------------------------------------------
+
+  it("probe namespace input fetches suggestions via listUsers(include_orgs=true)", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.listUsers.mockResolvedValue({
+      users: [{ username: "openai-community" }, { username: "openai" }],
+    });
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper
+      .get('[data-testid="probe-namespace"] input')
+      .setValue("openai");
+    await flushPromises();
+
+    expect(mocks.api.listUsers).toHaveBeenCalledWith(
+      "admin-token",
+      expect.objectContaining({
+        search: "openai",
+        limit: 20,
+        include_orgs: true,
+      }),
+    );
+    expect(
+      globalThis.window.__lastAutocompleteSuggestions.map((s) => s.value),
+    ).toEqual(["openai-community", "openai"]);
+  });
+
+  it("probe name input fetches suggestions via listRepositories scoped to probeForm namespace + repo_type", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.listRepositories.mockResolvedValue({
+      repositories: [
+        { namespace: "openai-community", name: "gpt2", repo_type: "model" },
+        { namespace: "openai-community", name: "gpt2-medium", repo_type: "model" },
+      ],
+    });
+    const wrapper = mountPage();
+    await flushPromises();
+    // Set namespace via the probe-namespace autocomplete first.
+    await wrapper
+      .get('[data-testid="probe-namespace"] input')
+      .setValue("openai-community");
+    await flushPromises();
+    mocks.api.listRepositories.mockClear();
+    mocks.api.listRepositories.mockResolvedValue({
+      repositories: [
+        { namespace: "openai-community", name: "gpt2", repo_type: "model" },
+        { namespace: "openai-community", name: "gpt2-medium", repo_type: "model" },
+      ],
+    });
+    await wrapper.get('[data-testid="probe-name"] input').setValue("gpt2");
+    await flushPromises();
+    expect(mocks.api.listRepositories).toHaveBeenCalledWith(
+      "admin-token",
+      expect.objectContaining({
+        search: "gpt2",
+        repo_type: "model",
+        namespace: "openai-community",
+        limit: 20,
+      }),
+    );
+    expect(
+      globalThis.window.__lastAutocompleteSuggestions.map((s) => s.value),
+    ).toEqual(["gpt2", "gpt2-medium"]);
+  });
+
+  it("probe name fetcher returns [] for empty query", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    const wrapper = mountPage();
+    await flushPromises();
+    globalThis.window.__lastAutocompleteSuggestions = ["unset"];
+    await wrapper.get('[data-testid="probe-name"] input').setValue("");
+    await flushPromises();
+    expect(mocks.api.listRepositories).not.toHaveBeenCalled();
+    expect(globalThis.window.__lastAutocompleteSuggestions).toEqual([]);
+  });
+
+  it("probe name fetcher swallows API errors", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.listRepositories.mockRejectedValue(new Error("boom"));
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const wrapper = mountPage();
+    await flushPromises();
+    globalThis.window.__lastAutocompleteSuggestions = ["unset"];
+    await wrapper.get('[data-testid="probe-name"] input').setValue("g");
+    await flushPromises();
+    expect(globalThis.window.__lastAutocompleteSuggestions).toEqual([]);
+    consoleSpy.mockRestore();
+  });
+
+  it("probe name fetcher honors checkAuth", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    const wrapper = mountPage();
+    await flushPromises();
+    mocks.adminStore.token = null;
+    globalThis.window.__lastAutocompleteSuggestions = ["unset"];
+    await wrapper.get('[data-testid="probe-name"] input').setValue("g");
+    await flushPromises();
+    expect(globalThis.window.__lastAutocompleteSuggestions).toEqual([]);
+    expect(mocks.router.push).toHaveBeenCalledWith("/login");
+    expect(mocks.api.listRepositories).not.toHaveBeenCalled();
+  });
+
+  it("probe name fetcher accepts raw array response shape", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+    mocks.api.listRepositories.mockResolvedValue([
+      { namespace: "x", name: "raw-array-repo" },
+    ]);
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="probe-name"] input').setValue("raw");
+    await flushPromises();
+    expect(
+      globalThis.window.__lastAutocompleteSuggestions.map((s) => s.value),
+    ).toEqual(["raw-array-repo"]);
+  });
+
   it("Header tokens with empty url or token are filtered out of payload", async () => {
     mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
     mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
