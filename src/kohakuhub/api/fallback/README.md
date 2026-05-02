@@ -129,15 +129,21 @@ final response is a 404 with `X-Error-Code: RepoNotFound`.
 
 | Property | Value |
 |---|---|
-| Key | `f"fallback:repo:{repo_type}:{namespace}/{name}"` |
+| Key | `f"fallback:repo:u={user_id\|anon}:t={tokens_hash\|}:{repo_type}:{namespace}/{name}"` |
 | Value | `{source_url, source_name, source_type, exists, checked_at}` |
 | TTL | `cfg.fallback.cache_ttl_seconds` (env: `KOHAKU_HUB_FALLBACK_CACHE_TTL`, default `300`) |
 | Eviction | TTL + LRU at `maxsize` |
 
+`tokens_hash` is `sha256_hex(canonical_json(sorted(merged_tokens.items())))[:16]`,
+or empty when no per-user tokens are present. This isolates two requests
+that authenticate as the same user but pass different external tokens
+via `Authorization: Bearer ...|url,token|...`.
+
 Lifecycle:
 
 - **Write**: only on `BIND_AND_RESPOND` / `BIND_AND_PROPAGATE` from a
-  fresh chain probe.
+  fresh chain probe, and only via `safe_set` (see "Generation
+  counters" below).
 - **No write on chain exhaustion**: an aggregate-failure response leaves
   the next caller free to re-probe.
 - **No write from cache hits**: a cache hit serves directly without
@@ -147,28 +153,62 @@ Lifecycle:
   or rebind. The error surfaces to the client. Self-heal is bounded by
   the TTL.
 
-### Operator invalidation
+### Generation counters (race protection, #79)
+
+Three monotonic counters guard against the "an invalidation event lands
+mid-probe and the probe writes a now-stale binding after the
+invalidation" race:
+
+| Counter | Bumped by | Reset on |
+|---|---|---|
+| `global_gen` | `cache.clear()` (admin source mutations) | never |
+| `user_gens[user_id]` | `cache.clear_user(user_id)` (user external-token mutations) | never |
+| `repo_gens[(rt, ns, name)]` | `cache.invalidate_repo(rt, ns, name)` (local repo CRUD, admin per-repo eviction) | never |
+
+`_run_cached_then_chain` snapshots all three before doing upstream I/O
+and passes the snapshot to `safe_set`; `safe_set` rejects the cache
+write if any of the three has been bumped during the probe window.
+Rejection means the response still flows to the caller (it was already
+constructed) but the cache stays empty for that bucket, so the next
+call re-probes with the post-mutation configuration.
+
+### Invalidation matrix
+
+Every event that can change the binding outcome triggers an
+invalidation. Inputs that are boot-time-only (env / TOML) are handled
+by the natural process-restart cycle; runtime-mutable inputs hook into
+the cache as follows:
+
+| Event | Hook location | Cache op | Generation bumped |
+|---|---|---|---|
+| Admin POST/PATCH/DELETE on `FallbackSource` | `api/admin/routers/fallback.py` | `cache.clear()` | `global_gen` |
+| User POST `/api/users/{u}/external-tokens` | `api/auth/external_tokens.py` | `cache.clear_user(user.id)` | `user_gens[uid]` |
+| User DELETE `/api/users/{u}/external-tokens/{url}` | same | `cache.clear_user(user.id)` | `user_gens[uid]` |
+| User PUT `/api/users/{u}/external-tokens/bulk` | same | `cache.clear_user(user.id)` | `user_gens[uid]` |
+| Local POST `/api/repos/create` | `api/repo/routers/crud.py` | `cache.invalidate_repo(rt, ns, name)` | `repo_gens[(rt,ns,n)]` |
+| Local DELETE `/api/repos/delete` | same | `cache.invalidate_repo(rt, ns, name)` | `repo_gens[(rt,ns,n)]` |
+| Local POST `/api/repos/move` (rename / transfer) | same | `cache.invalidate_repo(old)` + `cache.invalidate_repo(new)` | both `repo_gens` entries |
+| Local PUT settings, `private` field changed | `api/settings.py` | `cache.invalidate_repo(rt, ns, name)` | `repo_gens[(rt,ns,n)]` |
+| Local POST `/api/repos/squash` | n/a — `full_id` unchanged | n/a | n/a |
+| Header-token change | per-request | n/a — encoded in cache key via `tokens_hash` | n/a |
+
+### Operator invalidation endpoints
 
 | Endpoint | Effect |
 |---|---|
-| `DELETE /admin/api/fallback-sources/cache/clear` | Wipe the entire cache. |
-| Admin source create / update / delete | Implicitly clears the cache (any source-list change can invalidate prior bindings). |
-
-A per-repo invalidate endpoint is tracked in
-[#78](https://github.com/deepghs/KohakuHub/issues/78).
+| `DELETE /admin/api/fallback-sources/cache/clear` | Wipe entire cache; bumps `global_gen`. |
+| `DELETE /admin/api/fallback-sources/cache/repo/{repo_type}/{namespace}/{name}` | Evict every (user, tokens_hash, repo) bucket for one repo; bumps that repo's gen. |
+| `DELETE /admin/api/fallback-sources/cache/user/{user_id}` | Evict every (tokens_hash, repo) bucket for one user; bumps that user's gen. |
 
 ### Planned changes
-
-The current TTL default and key shape are points of active work:
 
 - [#78](https://github.com/deepghs/KohakuHub/issues/78) lowers the
   default TTL to `60` (self-heal window 1 minute instead of 5),
   decouples chain probing into a pure `core.probe_chain` function, and
   adds admin tooling for chain inspection and what-if simulation.
-- [#79](https://github.com/deepghs/KohakuHub/issues/79) adds `user_id`
-  to the cache key so two users with different effective source
-  visibility cannot share a binding, and invalidates the cache on
-  per-user token rotation.
+- Multi-worker shared cache (so admin clear in one fork is visible to
+  siblings) is a separate follow-up — the current implementation is
+  per-process in-memory.
 
 ## Configuration
 

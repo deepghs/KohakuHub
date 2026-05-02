@@ -38,24 +38,108 @@ def _content_response(
 
 
 class DummyCache:
-    """Simple cache spy."""
+    """Simple cache spy compatible with the post-#79 RepoSourceCache surface.
+
+    The internal ``set_calls`` / ``invalidate_calls`` recordings shape
+    args as ``(repo_type, namespace, name, ...)`` — the new
+    ``(user_id, tokens_hash)`` prefix is dropped from positional args
+    and exposed via ``kwargs`` instead so that existing assertions
+    (``set_calls[i][0][:3]`` and similar) keep working unchanged.
+    """
 
     def __init__(self, cached: dict | None = None):
         self.cached = cached
         self.set_calls: list[tuple[tuple, dict]] = []
         self.invalidate_calls: list[tuple] = []
+        self.snapshot_calls: list[tuple] = []
+        # Static gens snapshot — DummyCache pretends nothing ever
+        # invalidates so safe_set always succeeds.
+        self._gens: tuple[int, int, int] = (0, 0, 0)
 
-    def get(self, *args):
+    def get(self, user_id=None, tokens_hash=None, *args):
+        # New signature ``get(user_id, tokens_hash, repo_type, ns, name)``.
+        # Older two-positional-arg tests still work because Python
+        # tolerates extra positional args via ``*args``.
         return self.cached
 
-    def set(self, *args, **kwargs):
-        self.set_calls.append((args, kwargs))
+    def set(
+        self,
+        user_id=None,
+        tokens_hash=None,
+        repo_type=None,
+        namespace=None,
+        name=None,
+        source_url=None,
+        source_name=None,
+        source_type=None,
+        exists=True,
+    ):
+        self.set_calls.append(
+            (
+                (repo_type, namespace, name, source_url, source_name, source_type),
+                {
+                    "exists": exists,
+                    "user_id": user_id,
+                    "tokens_hash": tokens_hash,
+                },
+            )
+        )
 
-    def invalidate(self, *args):
-        # Cache-authoritative semantics (#75): a stale-cache hit
+    def safe_set(
+        self,
+        user_id=None,
+        tokens_hash=None,
+        repo_type=None,
+        namespace=None,
+        name=None,
+        source_url=None,
+        source_name=None,
+        source_type=None,
+        gens_at_start=None,
+        exists=True,
+    ) -> bool:
+        self.set_calls.append(
+            (
+                (repo_type, namespace, name, source_url, source_name, source_type),
+                {
+                    "exists": exists,
+                    "user_id": user_id,
+                    "tokens_hash": tokens_hash,
+                    "gens_at_start": gens_at_start,
+                },
+            )
+        )
+        return True
+
+    def snapshot(self, user_id, repo_type, namespace, name):
+        self.snapshot_calls.append((user_id, repo_type, namespace, name))
+        return self._gens
+
+    def invalidate(
+        self,
+        user_id=None,
+        tokens_hash=None,
+        repo_type=None,
+        namespace=None,
+        name=None,
+    ):
+        # Cache-authoritative semantics (#75/#79): a stale-cache hit
         # invalidates the entry before falling through to the full
         # chain. Tests that simulate stale-cache need this hook.
-        self.invalidate_calls.append(args)
+        self.invalidate_calls.append((repo_type, namespace, name))
+        self.cached = None
+
+    def invalidate_repo(self, repo_type, namespace, name) -> int:
+        self.invalidate_calls.append((repo_type, namespace, name))
+        self.cached = None
+        return 1
+
+    def clear_user(self, user_id) -> int:
+        self.invalidate_calls.append(("__user__", user_id, None))
+        return 0
+
+    def clear(self) -> None:
+        self.invalidate_calls.append(("__global__", None, None))
         self.cached = None
 
 

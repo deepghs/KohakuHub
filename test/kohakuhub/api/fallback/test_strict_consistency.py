@@ -113,6 +113,20 @@ class _RequestLog:
 REQUEST_LOG = _RequestLog()
 
 
+def _owner_cache_key() -> tuple[int, str]:
+    """Return (user_id, tokens_hash) matching authed owner-token requests.
+
+    Strict-consistency tests in this module authenticate as ``owner``
+    via ``hf_api_token``; cache lookups/seeds must use the same
+    ``(user_id, tokens_hash)`` so that direct-cache state and live
+    request state share a bucket. Owner has no external tokens
+    configured in these tests, so ``tokens_hash`` is empty.
+    """
+    from kohakuhub.db import User
+
+    return User.get(User.username == "owner").id, ""
+
+
 @pytest.fixture(scope="module")
 def scenario_mock_url():
     """Single scenario mock for all consistency tests in this module.
@@ -248,7 +262,9 @@ def test_bound_source_5xx_does_not_rebind_to_sibling(
     # Read it back from cfg.
     import kohakuhub.config as cfg_mod
     src = cfg_mod.cfg.fallback.sources[0]
+    uid, th = _owner_cache_key()
     cache.set(
+        uid, th,
         "model", "owner", "scenario-repo",
         src["url"], src["name"], src["source_type"],
         exists=True,
@@ -264,7 +280,7 @@ def test_bound_source_5xx_does_not_rebind_to_sibling(
 
     # Critical: cache is still bound to the same source after the
     # bound-source failure. Confirm by reading the cache directly.
-    cached = cache.get("model", "owner", "scenario-repo")
+    cached = cache.get(uid, th, "model", "owner", "scenario-repo")
     assert cached is not None
     assert cached.get("source_url") == src["url"]
     assert cached.get("exists") is True
@@ -289,7 +305,9 @@ def test_bound_source_failure_does_not_walk_to_sibling_even_when_sibling_works(
     import kohakuhub.config as cfg_mod
     src_a = cfg_mod.cfg.fallback.sources[0]
     cache = get_cache()
+    uid, th = _owner_cache_key()
     cache.set(
+        uid, th,
         "model", "owner", "scenario-repo",
         src_a["url"], src_a["name"], src_a["source_type"],
         exists=True,
@@ -463,17 +481,18 @@ def test_ttl_expiry_under_fixed_external_state_rebinds_same_source(
     api.model_info("owner/scenario-repo")
     from kohakuhub.api.fallback.cache import get_cache
     cache = get_cache()
-    first_cached = cache.get("model", "owner", "scenario-repo")
+    uid, th = _owner_cache_key()
+    first_cached = cache.get(uid, th, "model", "owner", "scenario-repo")
     assert first_cached is not None
     assert first_cached["source_url"] == src_a_url
 
     # Simulate TTL expiry by clearing the cache.
-    cache.invalidate("model", "owner", "scenario-repo")
+    cache.invalidate(uid, th, "model", "owner", "scenario-repo")
 
     # Second binding (must pick same source under unchanged
     # external state).
     api.model_info("owner/scenario-repo")
-    second_cached = cache.get("model", "owner", "scenario-repo")
+    second_cached = cache.get(uid, th, "model", "owner", "scenario-repo")
     assert second_cached is not None
     assert second_cached["source_url"] == first_cached["source_url"]
 
@@ -528,13 +547,14 @@ def test_multi_op_session_all_route_to_same_source(
 
     from kohakuhub.api.fallback.cache import get_cache
     cache = get_cache()
-    bound_url_after_info = cache.get("model", "owner", "scenario-repo")["source_url"]
+    uid, th = _owner_cache_key()
+    bound_url_after_info = cache.get(uid, th, "model", "owner", "scenario-repo")["source_url"]
     assert bound_url_after_info == src_a["url"]
 
     # Op 2: list_repo_files.
     files = api.list_repo_files("owner/scenario-repo")
     assert "config.json" in files
-    bound_url_after_tree = cache.get("model", "owner", "scenario-repo")["source_url"]
+    bound_url_after_tree = cache.get(uid, th, "model", "owner", "scenario-repo")["source_url"]
     assert bound_url_after_tree == src_a["url"]
 
     # Op 3: hf_hub_download — actual file download.
@@ -546,7 +566,7 @@ def test_multi_op_session_all_route_to_same_source(
         cache_dir=str(tmp_path),
     )
     assert Path(path).read_bytes() == OK_BODY
-    bound_url_after_dl = cache.get("model", "owner", "scenario-repo")["source_url"]
+    bound_url_after_dl = cache.get(uid, th, "model", "owner", "scenario-repo")["source_url"]
     assert bound_url_after_dl == src_a["url"]
 
     # Op 4: get_paths_info.
@@ -554,7 +574,7 @@ def test_multi_op_session_all_route_to_same_source(
     if method is not None:
         result = method(repo_id="owner/scenario-repo", paths=["config.json"])
         assert len(list(result)) >= 1
-        bound_url_after_pi = cache.get("model", "owner", "scenario-repo")["source_url"]
+        bound_url_after_pi = cache.get(uid, th, "model", "owner", "scenario-repo")["source_url"]
         assert bound_url_after_pi == src_a["url"]
 
 
@@ -571,7 +591,8 @@ def test_snapshot_download_pattern_stays_on_one_source(
     files = api.list_repo_files("owner/scenario-repo")
     from kohakuhub.api.fallback.cache import get_cache
     cache = get_cache()
-    initial_bind = cache.get("model", "owner", "scenario-repo")["source_url"]
+    uid, th = _owner_cache_key()
+    initial_bind = cache.get(uid, th, "model", "owner", "scenario-repo")["source_url"]
 
     # Download every file; bound source must not move.
     for name in files:
@@ -582,7 +603,7 @@ def test_snapshot_download_pattern_stays_on_one_source(
             token=hf_api_token,
             cache_dir=str(tmp_path),
         )
-        current_bind = cache.get("model", "owner", "scenario-repo")["source_url"]
+        current_bind = cache.get(uid, th, "model", "owner", "scenario-repo")["source_url"]
         assert current_bind == initial_bind
 
 
@@ -612,12 +633,152 @@ def test_two_independent_client_sessions_bind_same_source(
 
     from kohakuhub.api.fallback.cache import get_cache
     cache = get_cache()
-    bound = cache.get("model", "owner", "scenario-repo")
+    uid, th = _owner_cache_key()
+    bound = cache.get(uid, th, "model", "owner", "scenario-repo")
     assert bound["source_url"] == expected_url
 
     # Wipe cache to force a fresh bind for client #2 — same external
     # state, must rebind same source.
-    cache.invalidate("model", "owner", "scenario-repo")
+    cache.invalidate(uid, th, "model", "owner", "scenario-repo")
     api2.model_info("owner/scenario-repo")
-    bound2 = cache.get("model", "owner", "scenario-repo")
+    bound2 = cache.get(uid, th, "model", "owner", "scenario-repo")
     assert bound2["source_url"] == expected_url
+
+
+# ===========================================================================
+# Guarantee 7 (#79): Per-user cache isolation end-to-end via hf_hub.
+# ===========================================================================
+
+
+def test_two_users_via_hf_hub_get_independent_cache_buckets(
+    live_server_url, consistency_env, app,
+):
+    """Same khub, same repo, two distinct authenticated users via the
+    real ``huggingface_hub`` library. Each must land in a separate
+    cache bucket (#79 strict-freshness contract). Verified by direct
+    cache inspection: after both users call ``model_info``, two
+    bindings exist, keyed by their respective user_id.
+    """
+    import asyncio
+
+    import httpx
+    from kohakuhub.db import User
+
+    from test.kohakuhub.support.bootstrap import DEFAULT_PASSWORD
+
+    configure, _reset = consistency_env
+    configure("200_ok")  # single source, both users will bind to it
+
+    async def _get_token(username: str) -> str:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            follow_redirects=False,
+        ) as ac:
+            login = await ac.post(
+                "/api/auth/login",
+                json={"username": username, "password": DEFAULT_PASSWORD},
+            )
+            login.raise_for_status()
+            tok = await ac.post(
+                "/api/auth/tokens/create",
+                json={"name": f"hf-api-compat-{username}"},
+            )
+            tok.raise_for_status()
+            return tok.json()["token"]
+
+    owner_token = asyncio.run(_get_token("owner"))
+    member_token = asyncio.run(_get_token("member"))
+    owner_id = User.get(User.username == "owner").id
+    member_id = User.get(User.username == "member").id
+
+    # Each user calls model_info — both should bind successfully.
+    api_owner = HfApi(endpoint=live_server_url, token=owner_token)
+    api_member = HfApi(endpoint=live_server_url, token=member_token)
+    api_owner.model_info("owner/scenario-repo")
+    api_member.model_info("owner/scenario-repo")
+
+    from kohakuhub.api.fallback.cache import get_cache
+    cache = get_cache()
+
+    # Two independent cache buckets — strict-freshness contract.
+    owner_bound = cache.get(owner_id, "", "model", "owner", "scenario-repo")
+    member_bound = cache.get(member_id, "", "model", "owner", "scenario-repo")
+    assert owner_bound is not None, "owner's cache bucket missing"
+    assert member_bound is not None, "member's cache bucket missing"
+    # Both bound to the same (priority-1) source, but in separate buckets.
+    assert owner_bound["source_url"] == member_bound["source_url"]
+
+    # Sanity: anonymous bucket is empty (we authenticated both calls).
+    assert cache.get(None, "", "model", "owner", "scenario-repo") is None
+
+
+def test_external_token_rotation_via_hf_hub_evicts_user_cache(
+    live_server_url, consistency_env, app,
+):
+    """A user posts a new external token; cache for that user is
+    evicted synchronously with the mutation. The hf_hub call after
+    the rotation re-probes (cache miss), end-to-end verifying the
+    POST /external-tokens → clear_user hook (#79).
+    """
+    import asyncio
+
+    import httpx
+    from kohakuhub.db import User
+
+    from test.kohakuhub.support.bootstrap import DEFAULT_PASSWORD
+
+    configure, _reset = consistency_env
+    configure("200_ok")
+
+    async def _login_and_token(username: str):
+        transport = httpx.ASGITransport(app=app)
+        ac = httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            follow_redirects=False,
+        )
+        login = await ac.post(
+            "/api/auth/login",
+            json={"username": username, "password": DEFAULT_PASSWORD},
+        )
+        login.raise_for_status()
+        tok = await ac.post(
+            "/api/auth/tokens/create",
+            json={"name": f"hf-api-compat-{username}"},
+        )
+        tok.raise_for_status()
+        return ac, tok.json()["token"]
+
+    async def _post_token_and_close(ac):
+        try:
+            response = await ac.post(
+                "/api/users/owner/external-tokens",
+                json={
+                    "url": "https://hf-rotation-test.example",
+                    "token": "hf_rotation_value",
+                },
+            )
+            response.raise_for_status()
+        finally:
+            await ac.aclose()
+
+    ac_owner, token = asyncio.run(_login_and_token("owner"))
+    owner_id = User.get(User.username == "owner").id
+
+    # Bind: cache populated for owner.
+    api = HfApi(endpoint=live_server_url, token=token)
+    api.model_info("owner/scenario-repo")
+
+    from kohakuhub.api.fallback.cache import get_cache
+    cache = get_cache()
+    assert cache.get(owner_id, "", "model", "owner", "scenario-repo") is not None
+    initial_user_gen = cache.user_gens[owner_id]
+
+    # Rotate token → cache evicted.
+    asyncio.run(_post_token_and_close(ac_owner))
+
+    # The cache entry for owner with empty tokens_hash is gone.
+    assert cache.get(owner_id, "", "model", "owner", "scenario-repo") is None
+    assert cache.user_gens[owner_id] == initial_user_gen + 1
