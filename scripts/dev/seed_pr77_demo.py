@@ -232,6 +232,115 @@ silently download HF's bytes.
         ],
     },
     {
+        "org": "meta-llama",
+        "org_description": (
+            "Local-only org demonstrating PR #77 against an HF-gated upstream. "
+            "Same name as the (gated) HuggingFace org; local content is unrelated."
+        ),
+        "repo_name": "Llama-2-7b",
+        "repo_type": "model",
+        "files": [
+            ("README.md", """# PR #77 demo: meta-llama/Llama-2-7b (LOCAL, with gated HF sibling)
+
+This is a **local-only** repository at `meta-llama/Llama-2-7b`. The
+same path on huggingface.co is a *gated* repository — anonymous
+callers get `401 + X-Error-Code: GatedRepo`, even just to read the
+file metadata.
+
+This local repo is intentionally minimal — README only. The fallback
+config on this khub points at HuggingFace anonymously, so a chain
+probe for any file under `meta-llama/Llama-2-7b` would land on
+HF and get gated.
+
+## What this repo demonstrates
+
+The strict-consistency contract holds even against a *gated*
+upstream: if the local namespace owns the name, the local handler is
+authoritative. The gated HF response never reaches the client — not
+as content, not as a misleading `GatedRepoError`, not as anything.
+The client sees only what the local repo has (or doesn't).
+
+## Expected behavior under PR #77
+
+```python
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError, GatedRepoError
+
+api = HfApi(endpoint="http://127.0.0.1:48888", token="<your-khub-token>")
+
+# (a) Repo exists locally — info / tree succeed locally
+api.model_info("meta-llama/Llama-2-7b")
+# -> ModelInfo with local sha
+api.list_repo_files("meta-llama/Llama-2-7b")
+# -> ['README.md']
+
+# (b) Download README — local bytes
+import tempfile
+with tempfile.TemporaryDirectory() as tmp:
+    p = hf_hub_download(
+        "meta-llama/Llama-2-7b", "README.md",
+        endpoint="http://127.0.0.1:48888",
+        token="<your-khub-token>",
+        cache_dir=tmp,
+    )
+    body = open(p).read()
+    assert "PR #77 demo" in body
+    print("OK - local README served")
+
+# (c) Request `config.json` (HF gates this; local doesn't have it)
+#     -> EntryNotFoundError (NOT GatedRepoError, NOT a silent download)
+try:
+    hf_hub_download(
+        "meta-llama/Llama-2-7b", "config.json",
+        endpoint="http://127.0.0.1:48888",
+        token="<your-khub-token>",
+    )
+    print("FAIL: chain walked to HF and got gated/served something")
+except EntryNotFoundError:
+    print("OK - local short-circuit; HF's gated 401 was never seen")
+except GatedRepoError:
+    print("FAIL: GatedRepoError surfaced - chain ran past local")
+```
+
+## Wire-level signal
+
+```bash
+$ curl -i http://127.0.0.1:48888/meta-llama/Llama-2-7b/resolve/main/config.json
+HTTP/1.1 404 Not Found
+x-error-code: EntryNotFound
+x-error-message: Entry 'config.json' not found in repository 'meta-llama/Llama-2-7b' at revision 'main'
+# Note: no X-Source-Count, no X-Error-Code: GatedRepo, no upstream
+# 401 surfacing. The local namespace owns this name; HF's gating is
+# entirely irrelevant.
+```
+
+## Pre-fix counterfactual
+
+Pre-#75 the chain would have run:
+  1. Local 404 (file not present locally)
+  2. Decorator triggers fallback chain regardless of local X-Error-Code
+  3. HF responds `401 + X-Error-Code: GatedRepo` (anonymous can't access gated)
+  4. Aggregate (single source) -> `401 + GatedRepo` -> hf_hub raises `GatedRepoError`
+  5. Client sees `GatedRepoError` for a file in a *local* repo that has no
+     such file. The error is misleading — it suggests the user lacks
+     access to *their own* repo. Cross-source semantics blur the meaning
+     of every error class.
+
+PR #77 ensures the local handler's `EntryNotFound` is what the client
+sees, with the local repo identified in the message.
+
+## When you DO want HF's gated content
+
+Just don't have a local collision. Anonymous callers will get
+`GatedRepoError` for a real-HF gated repo if there's no local repo at
+the same path; supply a HF token via `Authorization: Bearer <hf-token>`
+or configure the source's admin token to reach the gated content.
+The pure-fallback gated case is documented in the
+`narugo1992-pr77-demo/guide` README on this same khub.
+"""),
+        ],
+    },
+    {
         "org": "narugo1992-pr77-demo",
         "org_description": (
             "PR #77 demo org — fallback-chain pure-pass-through case. "
@@ -277,12 +386,40 @@ try:
     api.model_info("narugo1992-pr77-demo/this-doesnt-exist-anywhere")
     print("FAIL: returned data for non-existent repo")
 except RepositoryNotFoundError:
-    print("OK — RepositoryNotFoundError aggregated from chain")
+    print("OK - RepositoryNotFoundError aggregated from chain")
 ```
 
 The chain probed HF (only configured source), got HF's anti-enum 401
 (or 404+RepoNotFound for authed callers), aggregated to
 ``RepoNotFound``, and the client raises ``RepositoryNotFoundError``.
+
+## Gated upstream, no local collision
+
+When local doesn't have the repo and HF gates it, the chain's gated
+signal *does* reach the client (as it should — there's no local
+namespace to override it). Anonymous fallback to a real-HF gated
+repo:
+
+```python
+from huggingface_hub.errors import GatedRepoError
+
+try:
+    hf_hub_download(
+        "meta-llama/Llama-2-70b",  # really exists on HF, gated
+        "config.json",
+        endpoint="http://127.0.0.1:48888",
+        token="<your-khub-token>",
+    )
+    print("FAIL: anonymous fallback bypassed HF gating")
+except GatedRepoError:
+    print("OK - HF's gated response propagated through the aggregate")
+```
+
+For comparison, the contrasting case where the *local* khub has a
+repo at a same path as a gated HF repo, see
+``meta-llama/Llama-2-7b`` on this same khub: even with HF gated and
+the file present-on-HF, the client receives the *local*
+``EntryNotFound`` — never HF's gated signal.
 
 ## Wire-level inspection
 
@@ -375,12 +512,18 @@ def _ensure_repo(cookies, org: str, name: str, repo_type: str) -> None:
         raise RuntimeError(f"create-repo {org}/{name} failed: {r.status_code} {r.text}")
 
 
-def _file_exists(api, repo_id: str, path: str) -> bool:
+def _existing_file_size(api, repo_id: str, path: str) -> int | None:
+    """Return the existing file's size in bytes, or ``None`` if absent.
+    Used to make the seed idempotent on content equality, not just on
+    path presence — so a script-side README rewrite re-uploads cleanly
+    on next run."""
     try:
-        files = api.list_repo_files(repo_id, repo_type="model")
-        return path in files
+        for it in api.list_repo_tree(repo_id, repo_type="model", recursive=True):
+            if getattr(it, "path", None) == path:
+                return int(getattr(it, "size", 0) or 0)
     except Exception:
-        return False
+        return None
+    return None
 
 
 def _upload_file(api, repo_id: str, path: str, content) -> None:
@@ -422,12 +565,15 @@ def main() -> int:
         _ensure_repo(cookies, org, repo_name, repo_type)
 
         for path, content in spec["files"]:
-            if _file_exists(api, repo_id, path):
-                print(f"  [=] {repo_id}:{path} already present ({len(content)}B)")
+            content_bytes = content.encode("utf-8") if isinstance(content, str) else content
+            existing_size = _existing_file_size(api, repo_id, path)
+            if existing_size == len(content_bytes):
+                print(f"  [=] {repo_id}:{path} present + size matches ({existing_size}B)")
                 continue
             try:
-                _upload_file(api, repo_id, path, content)
-                print(f"  [+] uploaded {repo_id}:{path} ({len(content)}B)")
+                _upload_file(api, repo_id, path, content_bytes)
+                tag = "uploaded" if existing_size is None else "rewrote"
+                print(f"  [+] {tag} {repo_id}:{path} ({len(content_bytes)}B)")
             except Exception as e:
                 # Print but keep going so partial failures don't block.
                 print(f"  [!] upload {repo_id}:{path} failed: {type(e).__name__}: {e}")
