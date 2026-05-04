@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from contextvars import ContextVar
 from typing import Any, Optional
 
@@ -57,6 +58,54 @@ from kohakuhub.api.fallback.utils import FallbackDecision, classify_upstream
 logger = get_logger("FALLBACK_TRACE")
 
 X_CHAIN_TRACE = "X-Chain-Trace"
+
+# Header the chain tester sends to ask the backend to *also* set the
+# trace as a per-probe cookie. The cookie is the chain tester's only
+# reliable pickup channel after a redirect-follow round trip — see
+# ``inject_trace_cookie`` for the rationale (W3C Fetch spec strips
+# redirect-chain response headers from JS).
+PROBE_ID_HEADER = "X-Khub-Probe-Id"
+
+# Per-probe cookie name = ``COOKIE_NAME_PREFIX + sanitized probe_id``.
+# Prefix is namespaced under ``_khub_`` so it's clearly a KohakuHub-
+# internal debug cookie rather than a session/auth cookie.
+COOKIE_NAME_PREFIX = "_khub_chain_trace_"
+
+# Cookie ``Max-Age``. Set deliberately long (5 minutes) so a slow
+# fallback (large redirect chain, sluggish upstream, operator pauses
+# to look at devtools mid-probe) still has a usable trace cookie when
+# the SPA finally reads it. Cleaned up explicitly by the SPA after
+# pickup, so a long Max-Age doesn't leak.
+COOKIE_MAX_AGE_SECONDS = 300
+
+# Probe-id sanitization. Cookie names per RFC 6265 must avoid certain
+# characters (semicolons, commas, whitespace, etc.). We constrain to
+# ``[A-Za-z0-9_-]{1,64}`` which fits UUIDs, hex strings, and short
+# generated tokens. Anything else gets dropped to ``None`` so a
+# malicious / malformed probe id can't inject an extra Set-Cookie line
+# or expand into an unbounded cookie name.
+_PROBE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def sanitize_probe_id(probe_id: Optional[str]) -> Optional[str]:
+    """Validate the probe id supplied via the X-Khub-Probe-Id header.
+
+    Returns the id when it matches ``[A-Za-z0-9_-]{1,64}``, otherwise
+    ``None`` (suppresses cookie injection).
+    """
+    if probe_id and _PROBE_ID_PATTERN.fullmatch(probe_id):
+        return probe_id
+    return None
+
+
+def cookie_name_for_probe(probe_id: str) -> str:
+    """Per-probe cookie name namespaced under the chain-tester prefix.
+
+    Concurrent probes use distinct names so reading one probe's cookie
+    after redirect-follow never picks up a stale value from another
+    probe in flight.
+    """
+    return f"{COOKIE_NAME_PREFIX}{probe_id}"
 
 # ContextVar default = None means "no active trace; recording is a no-op".
 # The decorator at request entry sets a fresh list. ``record_*`` helpers
@@ -223,15 +272,88 @@ def inject_trace_header(response: Any, hops: list[dict]) -> None:
 
 
 def inject_trace_into_exception_headers(
-    exc_headers: Optional[dict], hops: list[dict]
+    exc_headers: Optional[dict],
+    hops: list[dict],
+    probe_id: Optional[str] = None,
 ) -> dict:
     """Build a headers dict for an ``HTTPException`` re-raise.
 
     ``HTTPException`` carries a flat ``headers`` mapping. To attach the
     chain trace to a non-200 path we need to copy + extend it before
     re-raising.
+
+    When ``probe_id`` is supplied, also append a ``Set-Cookie`` line so
+    the chain tester can pick the trace up from ``document.cookie`` —
+    see ``inject_trace_cookie`` for the redirect-follow rationale.
     """
     out = dict(exc_headers or {})
     if hops:
-        out[X_CHAIN_TRACE] = encode_trace_header(hops)
+        encoded = encode_trace_header(hops)
+        out[X_CHAIN_TRACE] = encoded
+        sanitized = sanitize_probe_id(probe_id)
+        if sanitized:
+            out["Set-Cookie"] = _build_trace_cookie_value(sanitized, encoded)
     return out
+
+
+def _build_trace_cookie_value(probe_id: str, encoded_trace: str) -> str:
+    """Construct one ``Set-Cookie`` header value carrying the trace.
+
+    Attributes:
+    - ``Max-Age=300``: 5 minutes — long enough to outlive a slow
+      fallback chain or a paused devtools session.
+    - ``Path=/``: visible to any SPA route on the same origin.
+    - ``SameSite=Lax``: not sent on cross-site requests; chain tester
+      runs same-origin so this is harmless.
+    """
+    return (
+        f"{cookie_name_for_probe(probe_id)}={encoded_trace}; "
+        f"Max-Age={COOKIE_MAX_AGE_SECONDS}; Path=/; SameSite=Lax"
+    )
+
+
+def inject_trace_cookie(
+    response: Any, hops: list[dict], probe_id: Optional[str]
+) -> None:
+    """Set the per-probe trace cookie on ``response`` (best effort).
+
+    Two-channel design rationale: ``inject_trace_header`` already puts
+    the encoded trace on ``X-Chain-Trace`` for everyone (curl, hf_hub,
+    other debug tooling) — that's the universal channel. But the W3C
+    Fetch spec explicitly strips redirect-chain response headers from
+    JS visibility (``opaqueredirect`` filtered response, status=0,
+    headers list empty), and there's no browser API that bypasses it
+    (verified across fetch / XHR / Service Worker / iframe / Resource
+    Timing / Server-Timing — see the PR review thread). So once a
+    probe walks through a 3xx, the SPA can never read X-Chain-Trace
+    via JS. A cookie sidesteps the spec restriction because it lives
+    in the cookie jar rather than on the response object.
+
+    The cookie name is namespaced per ``probe_id`` so concurrent
+    probes don't trample each other's traces; the SPA generates a
+    fresh UUID per call and only reads its own.
+
+    Set-only when ``probe_id`` was supplied — non-tester clients
+    don't set the header, don't pay the Set-Cookie bandwidth.
+    """
+    if not hops:
+        return
+    sanitized = sanitize_probe_id(probe_id)
+    if not sanitized:
+        return
+    encoded = encode_trace_header(hops)
+    try:
+        if hasattr(response, "set_cookie"):
+            response.set_cookie(
+                key=cookie_name_for_probe(sanitized),
+                value=encoded,
+                max_age=COOKIE_MAX_AGE_SECONDS,
+                path="/",
+                samesite="lax",
+            )
+        else:  # pragma: no cover — defensive fallback
+            response.headers["Set-Cookie"] = _build_trace_cookie_value(
+                sanitized, encoded,
+            )
+    except Exception:  # pragma: no cover — defensive
+        logger.debug("inject_trace_cookie: failed to set cookie")

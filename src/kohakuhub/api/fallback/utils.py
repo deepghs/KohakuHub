@@ -2,6 +2,7 @@
 
 import enum
 from typing import Optional
+from urllib.parse import urljoin
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -534,3 +535,122 @@ def add_source_headers(
         "X-Source-URL": source_url,
         "X-Source-Status": str(response.status_code),
     }
+
+
+async def apply_resolve_head_postprocess(
+    response: httpx.Response,
+    source: dict,
+    *,
+    follow_timeout: float = 30.0,
+    follow_token: Optional[str] = None,
+) -> dict:
+    """Reproduce the production resolve-HEAD response-shaping in one place.
+
+    Two HF-specific quirks the production fallback layer fixes up
+    before forwarding HEAD-on-resolve to the client (originally in
+    ``operations._build_resolve_head_response``):
+
+    1. **Relative ``Location`` → absolute.** HF returns 3xx redirects
+       with paths like ``/api/resolve-cache/...`` that only resolve on
+       the HF origin. Rewriting against ``response.request.url`` keeps
+       clients following the redirect on the upstream rather than
+       bouncing it back to KohakuHub.
+    2. **Extra HEAD on non-LFS 3xx for Content-Length/ETag.** HF's 307
+       on a small file carries the redirect body's Content-Length
+       (~278 bytes), not the file's. Without ``X-Linked-Size`` the
+       hf_hub client trusts that bogus Content-Length and fails its
+       post-download consistency check (observed in
+       ``imgutils.get_wd14_tags`` on ``selected_tags.csv``). A second
+       HEAD against the rewritten Location picks up the real
+       ``content-length`` / ``etag`` / ``x-repo-commit``. LFS files
+       already carry ``X-Linked-Size``; hf_hub prefers it over
+       Content-Length so we skip the follow there.
+
+    Plus the universal post-processing every fallback HEAD response
+    gets: ``strip_xet_response_headers`` to keep hf_hub on the classic
+    LFS path, then ``add_source_headers`` for telemetry.
+
+    Returns a dict of headers caller can then attach to whatever
+    ``Response``-like object they want (production builds a Starlette
+    ``Response``; the chain-tester probe attaches them to a
+    ``ProbeAttempt`` for the timeline UI). Caller decides what to do
+    with the returned dict — this function deliberately stays
+    transport-agnostic so production + simulate can share the exact
+    same logic.
+
+    Args:
+        response: The upstream HEAD response we just received from the
+            fallback source.
+        source: The fallback-source dict (used for ``X-Source*`` headers).
+        follow_timeout: Timeout for the optional non-LFS follow-HEAD.
+            Defaults to 30s; production passes ``FallbackClient.timeout``.
+        follow_token: Bearer token to attach to the follow-HEAD if the
+            target requires auth. Production passes the source's token.
+
+    Returns:
+        New headers dict suitable for forwarding to the client.
+    """
+    resp_headers = dict(response.headers)
+    location = resp_headers.get("location") or resp_headers.get("Location")
+    if location:
+        upstream_url = str(response.request.url)
+        absolute_location = urljoin(upstream_url, location)
+        for k in list(resp_headers.keys()):
+            if k.lower() == "location":
+                resp_headers.pop(k, None)
+        resp_headers["location"] = absolute_location
+
+    if (
+        300 <= response.status_code < 400
+        and location
+        and not any(k.lower() == "x-linked-size" for k in resp_headers)
+    ):
+        try:
+            async with httpx.AsyncClient(timeout=follow_timeout) as hc:
+                # ``identity`` asks HF not to gzip the (empty) HEAD body;
+                # otherwise httpx's auto-decoding strips Content-Length
+                # from the response and we lose the value we came here
+                # to fetch.
+                extra_headers = {"Accept-Encoding": "identity"}
+                if follow_token:
+                    extra_headers["Authorization"] = f"Bearer {follow_token}"
+                follow_resp = await hc.head(
+                    resp_headers["location"],
+                    headers=extra_headers,
+                    follow_redirects=False,
+                )
+            # ``content-length`` and ``etag`` always come from the
+            # follow_resp — the 307 itself only carries the redirect
+            # body length, which is wrong for the file. ``x-repo-commit``
+            # is *additive*: HF's resolve-cache 307 already carries
+            # the right value (PR #21 design) and the resolve-cache
+            # CDN HEAD response often does not include it, so we
+            # only backfill from the follow when the original 307
+            # didn't carry it. This keeps the existing PR #21 path
+            # working unchanged while supporting non-HF mirrors that
+            # emit x-repo-commit-less 307s on resolve.
+            replace_keys = ("content-length", "etag")
+            for k in [
+                k for k in list(resp_headers) if k.lower() in replace_keys
+            ]:
+                resp_headers.pop(k)
+            for k, v in follow_resp.headers.items():
+                if k.lower() in replace_keys:
+                    resp_headers[k] = v
+            has_commit = any(
+                k.lower() == "x-repo-commit" for k in resp_headers
+            )
+            if not has_commit:
+                for k, v in follow_resp.headers.items():
+                    if k.lower() == "x-repo-commit":
+                        resp_headers[k] = v
+        except httpx.HTTPError:
+            # Extra HEAD failed — return what we have; no worse than
+            # the original PR #21 behavior.
+            pass
+
+    strip_xet_response_headers(resp_headers)
+    resp_headers.update(
+        add_source_headers(response, source["name"], source["url"])
+    )
+    return resp_headers

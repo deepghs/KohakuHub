@@ -486,3 +486,255 @@ async def test_probe_chain_propagate_response_lands_in_final_response():
     assert report.final_response["status_code"] == 404
     assert report.final_response["headers"]["x-error-code"] == "EntryNotFound"
     assert report.final_response["body_preview"] == '{"error": "no such file"}'
+
+
+# ===========================================================================
+# Resolve fidelity (#78 v3): for op=resolve + BIND_AND_RESPOND the
+# probe must replay ``apply_resolve_head_postprocess`` so the timeline
+# shows the headers an hf_hub client would actually receive (Location
+# rewritten absolute, Content-Length / ETag / X-Repo-Commit backfilled
+# from the non-LFS follow-HEAD), not HF's raw 307.
+# ===========================================================================
+
+
+SRC_HF = {
+    "name": "HF",
+    "url": "https://huggingface.co",
+    "source_type": "huggingface",
+}
+
+
+@pytest.mark.asyncio
+async def test_probe_chain_resolve_postprocess_rewrites_location_for_lfs():
+    """LFS path (``X-Linked-Size`` present) — probe must rewrite the
+    relative ``Location`` to absolute via ``apply_resolve_head_postprocess``
+    and skip the follow-HEAD branch."""
+    _FakeClient.queue(
+        SRC_HF["url"],
+        "HEAD",
+        _resp(
+            307,
+            headers={
+                "location": "https://cdn-lfs.example/path",
+                "x-linked-size": "12345",
+                "etag": '"abc"',
+            },
+            url="https://huggingface.co/models/x/y/resolve/main/big.bin",
+        ),
+    )
+    report = await core.probe_chain(
+        op="resolve", repo_type="model", namespace="x", name="y",
+        revision="main", file_path="big.bin",
+        sources=[SRC_HF], client_factory=_FakeClient,
+    )
+    assert report.final_outcome == "BIND_AND_RESPOND"
+    headers = report.final_response["headers"]
+    # X-Source* added (postprocess ran).
+    assert headers.get("x-source") == "HF"
+    assert headers.get("x-source-url") == "https://huggingface.co"
+    # Location preserved (already absolute in this case).
+    assert headers.get("location") == "https://cdn-lfs.example/path"
+
+
+@pytest.mark.asyncio
+async def test_probe_chain_resolve_postprocess_runs_follow_head_for_non_lfs(
+    monkeypatch,
+):
+    """Non-LFS 307 (no ``X-Linked-Size``) — probe must run the
+    follow-HEAD against the rewritten absolute Location to backfill
+    real ``content-length`` / ``etag`` / ``x-repo-commit`` so simulate
+    is byte-identical to what an hf_hub client gets in production."""
+    captured = []
+
+    class _MockAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, *, headers=None, follow_redirects=False):
+            captured.append(url)
+            return httpx.Response(
+                200,
+                headers={
+                    "content-length": "987654",
+                    "etag": '"real-etag"',
+                    "x-repo-commit": "deadbeef",
+                },
+            )
+
+    monkeypatch.setattr(
+        "kohakuhub.api.fallback.utils.httpx.AsyncClient", _MockAsyncClient
+    )
+
+    _FakeClient.queue(
+        SRC_HF["url"],
+        "HEAD",
+        _resp(
+            307,
+            headers={
+                "location": "/api/resolve-cache/models/x/y/sha/config.json",
+                "content-length": "278",  # bogus redirect-body length
+                "etag": '"redirect-etag"',
+            },
+            url="https://huggingface.co/models/x/y/resolve/main/config.json",
+        ),
+    )
+    report = await core.probe_chain(
+        op="resolve", repo_type="model", namespace="x", name="y",
+        revision="main", file_path="config.json",
+        sources=[SRC_HF], client_factory=_FakeClient,
+    )
+    # Follow-HEAD ran against the rewritten absolute Location.
+    assert captured == [
+        "https://huggingface.co/api/resolve-cache/models/x/y/sha/config.json"
+    ]
+    headers = report.final_response["headers"]
+    # Real values from follow-HEAD.
+    assert headers.get("content-length") == "987654"
+    assert headers.get("etag") == '"real-etag"'
+    assert headers.get("x-repo-commit") == "deadbeef"
+    # Location is now absolute (matches what hf_hub would actually follow).
+    assert (
+        headers.get("location")
+        == "https://huggingface.co/api/resolve-cache/models/x/y/sha/config.json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_chain_resolve_postprocess_skipped_on_propagate(monkeypatch):
+    """``BIND_AND_PROPAGATE`` (4xx EntryNotFound / RevisionNotFound) on
+    resolve — postprocess is intentionally skipped (no Location to
+    rewrite, propagate path doesn't run follow-HEAD). The simulate
+    just shows the curated raw upstream headers."""
+    follow_called = []
+
+    class _SpyClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, *a, **k):  # pragma: no cover — must NOT run
+            follow_called.append(1)
+            raise AssertionError("postprocess must not run on PROPAGATE")
+
+    monkeypatch.setattr(
+        "kohakuhub.api.fallback.utils.httpx.AsyncClient", _SpyClient
+    )
+
+    _FakeClient.queue(
+        SRC_HF["url"],
+        "HEAD",
+        _resp(
+            404,
+            headers={
+                "x-error-code": "EntryNotFound",
+                "x-error-message": "no such file",
+            },
+            url="https://huggingface.co/models/x/y/resolve/main/missing.bin",
+        ),
+    )
+    report = await core.probe_chain(
+        op="resolve", repo_type="model", namespace="x", name="y",
+        revision="main", file_path="missing.bin",
+        sources=[SRC_HF], client_factory=_FakeClient,
+    )
+    assert report.final_outcome == "BIND_AND_PROPAGATE"
+    assert follow_called == []  # postprocess + follow-HEAD NOT triggered
+
+
+@pytest.mark.asyncio
+async def test_probe_chain_resolve_postprocess_failure_falls_through(monkeypatch):
+    """If ``apply_resolve_head_postprocess`` itself raises (very rare —
+    follow-HEAD network error is already swallowed inside the helper),
+    ``_probe_one_source`` must fall through to the curated raw upstream
+    headers rather than crash the simulate."""
+
+    async def _boom_postprocess(*_a, **_k):
+        raise RuntimeError("synthetic postprocess explosion")
+
+    # Patch the OLD core module's globals (the one this test file
+    # bound at import time) rather than ``sys.modules[...]``, since
+    # the conftest's ``clear_backend_modules`` may have reloaded the
+    # latter — see ``test_decorators.py`` comment for full explanation.
+    monkeypatch.setitem(
+        core.probe_chain.__globals__,
+        "apply_resolve_head_postprocess",
+        _boom_postprocess,
+    )
+
+    _FakeClient.queue(
+        SRC_HF["url"],
+        "HEAD",
+        _resp(
+            307,
+            headers={
+                "location": "/api/resolve-cache/x/y/sha/config.json",
+                "etag": '"raw-etag"',
+                "x-linked-size": "999",
+            },
+            url="https://huggingface.co/models/x/y/resolve/main/config.json",
+        ),
+    )
+    report = await core.probe_chain(
+        op="resolve", repo_type="model", namespace="x", name="y",
+        revision="main", file_path="config.json",
+        sources=[SRC_HF], client_factory=_FakeClient,
+    )
+    assert report.final_outcome == "BIND_AND_RESPOND"
+    headers = report.final_response["headers"]
+    # Raw upstream headers preserved (etag, location relative).
+    assert headers.get("etag") == '"raw-etag"'
+    assert headers.get("location") == "/api/resolve-cache/x/y/sha/config.json"
+
+
+@pytest.mark.asyncio
+async def test_probe_chain_info_postprocess_NOT_applied(monkeypatch):
+    """The postprocess only runs for ``op=resolve``. info / tree /
+    paths_info don't redirect, so the existing curated_headers path
+    is correct and we must skip postprocess to avoid pointless extra
+    work + matching production semantics."""
+
+    class _SpyClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, *a, **k):  # pragma: no cover — must NOT run
+            raise AssertionError("info op should not trigger postprocess HEAD")
+
+    monkeypatch.setattr(
+        "kohakuhub.api.fallback.utils.httpx.AsyncClient", _SpyClient
+    )
+
+    _FakeClient.queue(
+        SRC_HF["url"],
+        "GET",
+        _resp(
+            200,
+            headers={"content-type": "application/json"},
+            url="https://huggingface.co/api/models/x/y",
+        ),
+    )
+    report = await core.probe_chain(
+        op="info", repo_type="model", namespace="x", name="y",
+        sources=[SRC_HF], client_factory=_FakeClient,
+    )
+    assert report.final_outcome == "BIND_AND_RESPOND"
+    headers = report.final_response["headers"]
+    # No X-Source injection (postprocess didn't run for info).
+    assert "x-source" not in headers

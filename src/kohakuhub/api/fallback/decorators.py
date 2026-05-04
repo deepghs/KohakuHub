@@ -30,12 +30,15 @@ from kohakuhub.api.fallback.operations import (
     try_fallback_user_repos,
 )
 from kohakuhub.api.fallback.trace import (
+    PROBE_ID_HEADER,
     encode_trace_header,
+    inject_trace_cookie,
     inject_trace_header,
     inject_trace_into_exception_headers,
     record_local_hop,
     start_trace,
     X_CHAIN_TRACE,
+    sanitize_probe_id,
 )
 
 logger = get_logger("FALLBACK_DEC")
@@ -101,7 +104,11 @@ def _classify_local_exception(exc: HTTPException) -> tuple[str, Optional[str], O
     return "LOCAL_MISS", x_code, x_msg
 
 
-def _attach_trace_to_result(result: Any, hops: list[dict]) -> Any:
+def _attach_trace_to_result(
+    result: Any,
+    hops: list[dict],
+    probe_id: Optional[str] = None,
+) -> Any:
     """Return ``result`` with ``X-Chain-Trace`` injected if applicable.
 
     - ``Response`` (or subclass like ``JSONResponse``) → mutate
@@ -113,6 +120,13 @@ def _attach_trace_to_result(result: Any, hops: list[dict]) -> Any:
     - ``None`` → unchanged (FastAPI emits a 200 with no body; nothing to
       attach).
 
+    When ``probe_id`` is supplied (chain-tester opt-in via the
+    ``X-Khub-Probe-Id`` request header), additionally set a per-probe
+    Set-Cookie carrying the same encoded trace — that's the channel
+    the SPA reads after a redirect-follow, since the browser strips
+    redirect-chain response headers from JS per the Fetch spec. See
+    ``trace.inject_trace_cookie`` for the rationale.
+
     No-ops on empty ``hops`` so the function is safe to call
     unconditionally at the decorator's exit.
     """
@@ -120,13 +134,18 @@ def _attach_trace_to_result(result: Any, hops: list[dict]) -> Any:
         return result
     if isinstance(result, Response):
         inject_trace_header(result, hops)
+        if probe_id:
+            inject_trace_cookie(result, hops, probe_id)
         return result
     if result is None:
         return result
-    return JSONResponse(
+    response = JSONResponse(
         content=jsonable_encoder(result),
         headers={X_CHAIN_TRACE: encode_trace_header(hops)},
     )
+    if probe_id:
+        inject_trace_cookie(response, hops, probe_id)
+    return response
 
 
 def with_repo_fallback(operation: OperationType):
@@ -222,6 +241,22 @@ def with_repo_fallback(operation: OperationType):
             # into this one.
             hops = start_trace()
 
+            # Optional per-probe id: the chain tester sends an
+            # ``X-Khub-Probe-Id`` header so we can also Set-Cookie the
+            # trace under a per-probe name — that's the only pickup
+            # channel the SPA has after a redirect-follow round trip
+            # (see trace.inject_trace_cookie). Sanitize to RFC-6265
+            # cookie-name-safe charset to avoid Set-Cookie injection.
+            probe_id = None
+            if request and hasattr(request, "headers"):
+                try:
+                    raw = request.headers.get(PROBE_ID_HEADER) or request.headers.get(
+                        PROBE_ID_HEADER.lower()
+                    )
+                    probe_id = sanitize_probe_id(raw)
+                except Exception:  # pragma: no cover — defensive
+                    probe_id = None
+
             is_404 = False
             original_error = None
             original_response = None
@@ -249,7 +284,7 @@ def with_repo_fallback(operation: OperationType):
                             f"exists, returning local response unchanged "
                             f"(no fallback)"
                         )
-                        return _attach_trace_to_result(local_result, hops)
+                        return _attach_trace_to_result(local_result, hops, probe_id)
                     if decision == "LOCAL_MISS":
                         is_404 = True
                         original_response = local_result
@@ -261,7 +296,7 @@ def with_repo_fallback(operation: OperationType):
                     else:
                         # LOCAL_HIT or LOCAL_OTHER_ERROR — surface the
                         # local response unchanged, with trace attached.
-                        return _attach_trace_to_result(local_result, hops)
+                        return _attach_trace_to_result(local_result, hops, probe_id)
                 else:
                     # dict / list / None → success path. Record a HIT
                     # (status 200 is the value FastAPI will emit) and
@@ -271,7 +306,7 @@ def with_repo_fallback(operation: OperationType):
                         status_code=200,
                         duration_ms=local_dt_ms,
                     )
-                    return _attach_trace_to_result(local_result, hops)
+                    return _attach_trace_to_result(local_result, hops, probe_id)
 
             except HTTPException as e:
                 local_dt_ms = int((time.monotonic() - local_t0) * 1000)
@@ -289,7 +324,7 @@ def with_repo_fallback(operation: OperationType):
                     # can still read what just happened. ``HTTPException``
                     # carries a flat ``headers`` mapping, so we copy +
                     # extend.
-                    new_headers = inject_trace_into_exception_headers(e.headers, hops)
+                    new_headers = inject_trace_into_exception_headers(e.headers, hops, probe_id)
                     raise HTTPException(
                         status_code=e.status_code,
                         detail=e.detail,
@@ -386,7 +421,7 @@ def with_repo_fallback(operation: OperationType):
                     logger.success(
                         f"Fallback SUCCESS for {operation}: {repo_type}/{namespace}/{name}"
                     )
-                    return _attach_trace_to_result(result, hops)
+                    return _attach_trace_to_result(result, hops, probe_id)
                 else:
                     # Not found in any source
                     logger.debug(
@@ -395,7 +430,7 @@ def with_repo_fallback(operation: OperationType):
                     # Return original 404 response or raise original exception
                     if original_error:
                         new_headers = inject_trace_into_exception_headers(
-                            original_error.headers, hops
+                            original_error.headers, hops, probe_id
                         )
                         raise HTTPException(
                             status_code=original_error.status_code,
@@ -404,7 +439,7 @@ def with_repo_fallback(operation: OperationType):
                         ) from original_error
                     else:
                         # Return the original 404 JSONResponse with trace
-                        return _attach_trace_to_result(original_response, hops)
+                        return _attach_trace_to_result(original_response, hops, probe_id)
 
         return wrapper
 

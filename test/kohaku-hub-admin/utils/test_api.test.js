@@ -593,6 +593,168 @@ describe("admin API client", () => {
     expect(call.data).toEqual({ paths: ["README.md", "config.json"] });
   });
 
+  // -------------------------------------------------------------------
+  // Per-probe trace cookie pickup (#78 v3): on redirect-follow paths
+  // the W3C Fetch spec strips X-Chain-Trace from JS visibility, so
+  // ``runFallbackProbe`` falls back to a per-probe cookie set by the
+  // backend. The cookie name is ``_khub_chain_trace_<probeId>`` where
+  // probeId comes from the request's ``X-Khub-Probe-Id`` header.
+  // -------------------------------------------------------------------
+
+  // Helper: clear any leftover trace cookies between tests so cookie
+  // jar from prior cases doesn't leak into the current one. The test
+  // file's ``afterEach`` only resets axios mocks.
+  function _clearAllTraceCookies() {
+    document.cookie
+      .split(";")
+      .map((c) => c.trim())
+      .forEach((cookie) => {
+        const eq = cookie.indexOf("=");
+        const name = eq > 0 ? cookie.slice(0, eq) : cookie;
+        if (name.startsWith("_khub_chain_trace_")) {
+          document.cookie = `${name}=; Max-Age=0; Path=/; SameSite=Lax`;
+        }
+      });
+  }
+
+  it("runFallbackProbe sends X-Khub-Probe-Id header on every call", async () => {
+    const api = await loadModule();
+    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {},
+    });
+    await api.runFallbackProbe({
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
+    });
+    const call = requestSpy.mock.calls[0][0];
+    expect(call.headers["X-Khub-Probe-Id"]).toMatch(/.+/);
+  });
+
+  it("runFallbackProbe generates a fresh probe id per call", async () => {
+    const api = await loadModule();
+    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: {},
+    });
+    await api.runFallbackProbe({
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
+    });
+    await api.runFallbackProbe({
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
+    });
+    const id1 = requestSpy.mock.calls[0][0].headers["X-Khub-Probe-Id"];
+    const id2 = requestSpy.mock.calls[1][0].headers["X-Khub-Probe-Id"];
+    expect(id1).not.toBe(id2);
+  });
+
+  it("runFallbackProbe falls back to per-probe cookie when X-Chain-Trace header is missing", async () => {
+    _clearAllTraceCookies();
+    const api = await loadModule();
+    // Capture the probe id the SPA generates so we can plant a
+    // matching cookie before the axios mock returns.
+    let capturedProbeId = null;
+    vi.spyOn(axios, "request").mockImplementation(async (cfg) => {
+      capturedProbeId = cfg.headers["X-Khub-Probe-Id"];
+      // Plant the cookie now — simulates the redirect-follow case
+      // where the backend Set-Cookie'd before the redirect, and the
+      // browser carried it through to the post-redirect response.
+      const hops = [
+        { kind: "local", source_name: "local", decision: "LOCAL_MISS",
+          status_code: 404, duration_ms: 1 },
+        { kind: "fallback", source_name: "HF", decision: "BIND_AND_RESPOND",
+          status_code: 200, duration_ms: 12 },
+      ];
+      const traceValue = btoa(JSON.stringify({ version: 1, hops }));
+      document.cookie =
+        `_khub_chain_trace_${capturedProbeId}=${traceValue}; ` +
+        `Max-Age=300; Path=/; SameSite=Lax`;
+      return { status: 200, headers: {}, data: {} };  // no X-Chain-Trace
+    });
+
+    const report = await api.runFallbackProbe({
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
+    });
+    expect(report.attempts).toHaveLength(2);
+    expect(report.attempts[0].decision).toBe("LOCAL_MISS");
+    expect(report.attempts[1].decision).toBe("BIND_AND_RESPOND");
+    expect(report.final_outcome).toBe("BIND_AND_RESPOND");
+    // Cookie cleaned up after pickup.
+    expect(document.cookie).not.toContain(
+      `_khub_chain_trace_${capturedProbeId}=`,
+    );
+  });
+
+  it("runFallbackProbe prefers X-Chain-Trace header over cookie when both present", async () => {
+    _clearAllTraceCookies();
+    const api = await loadModule();
+    const headerHops = [
+      { kind: "local", source_name: "local", decision: "LOCAL_HIT",
+        status_code: 200, duration_ms: 7 },
+    ];
+    const headerEncoded = btoa(JSON.stringify({ version: 1, hops: headerHops }));
+    let plantedProbeId = null;
+    vi.spyOn(axios, "request").mockImplementation(async (cfg) => {
+      plantedProbeId = cfg.headers["X-Khub-Probe-Id"];
+      // Plant a *different* trace into the cookie so we can prove
+      // the header took precedence.
+      const decoyHops = [
+        { kind: "local", source_name: "local", decision: "LOCAL_MISS",
+          status_code: 404, duration_ms: 1 },
+      ];
+      const decoy = btoa(JSON.stringify({ version: 1, hops: decoyHops }));
+      document.cookie =
+        `_khub_chain_trace_${plantedProbeId}=${decoy}; ` +
+        `Max-Age=300; Path=/; SameSite=Lax`;
+      return {
+        status: 200,
+        headers: { "x-chain-trace": headerEncoded },
+        data: {},
+      };
+    });
+    const report = await api.runFallbackProbe({
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
+    });
+    // Header (LOCAL_HIT) wins — not the cookie's LOCAL_MISS decoy.
+    expect(report.attempts).toHaveLength(1);
+    expect(report.attempts[0].decision).toBe("LOCAL_HIT");
+    expect(report.final_outcome).toBe("LOCAL_HIT");
+    // Cookie still cleaned up regardless.
+    expect(document.cookie).not.toContain(
+      `_khub_chain_trace_${plantedProbeId}=`,
+    );
+  });
+
+  it("runFallbackProbe doesn't read other probes' cookies (concurrent isolation)", async () => {
+    _clearAllTraceCookies();
+    const api = await loadModule();
+    // Plant a cookie under a *different* probe id (simulating a
+    // concurrent in-flight probe from another tab/run).
+    const otherHops = [{ kind: "local", source_name: "local",
+      decision: "LOCAL_HIT", status_code: 200, duration_ms: 1 }];
+    const otherEncoded = btoa(JSON.stringify({ version: 1, hops: otherHops }));
+    document.cookie =
+      `_khub_chain_trace_other-probe=${otherEncoded}; ` +
+      `Max-Age=300; Path=/; SameSite=Lax`;
+
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200, headers: {}, data: {},
+    });
+    const report = await api.runFallbackProbe({
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
+    });
+    // Empty timeline — own cookie wasn't planted, other-probe's
+    // cookie must NOT be picked up because the name doesn't match.
+    expect(report.attempts).toEqual([]);
+    expect(report.final_outcome).toBe("CHAIN_EXHAUSTED");
+    // The other probe's cookie is untouched (different probe id,
+    // different cookie name).
+    expect(document.cookie).toContain("_khub_chain_trace_other-probe=");
+    // Clean up so this doesn't leak into other tests.
+    _clearAllTraceCookies();
+  });
+
   it("verifies admin tokens and formats quota sizes safely", async () => {
     const api = await loadModule();
 

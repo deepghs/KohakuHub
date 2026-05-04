@@ -39,6 +39,7 @@ from kohakuhub.logger import get_logger
 from kohakuhub.api.fallback.client import FallbackClient
 from kohakuhub.api.fallback.utils import (
     FallbackDecision,
+    apply_resolve_head_postprocess,
     classify_upstream,
 )
 
@@ -273,6 +274,45 @@ async def _probe_one_source(
 
     decision = classify_upstream(response)
     decision_name = decision.name
+
+    # Default: curated subset of the raw upstream response headers.
+    response_headers = _curated_headers(response)
+
+    # Resolve fidelity (#78 v3): the production HEAD path runs the
+    # response through ``apply_resolve_head_postprocess`` before
+    # forwarding to the client (Location urljoin + non-LFS follow-HEAD
+    # backfill + xet strip + X-Source*). Without replaying that here
+    # the simulate's ``response_headers`` shows HF's raw 307 — relative
+    # Location, redirect-body Content-Length, no X-Source — none of
+    # which is what an hf_hub client actually receives. Replay the
+    # postprocess on BIND_AND_RESPOND so simulate matches production.
+    # Skip on BIND_AND_PROPAGATE (4xx EntryNotFound / RevisionNotFound
+    # / Disabled) — those don't carry a Location to rewrite and
+    # production's ``_propagate_upstream_response`` does the lighter
+    # strip+source-tag inline; for simulate the curated subset is
+    # already enough.
+    if op == "resolve" and decision is FallbackDecision.BIND_AND_RESPOND:
+        try:
+            client_timeout = getattr(client, "timeout", 30.0)
+            post_headers = await apply_resolve_head_postprocess(
+                response,
+                source,
+                follow_timeout=client_timeout,
+                follow_token=source.get("token"),
+            )
+            response_headers = {
+                k.lower(): v
+                for k, v in post_headers.items()
+                if k.lower() in _RELEVANT_HEADERS
+            }
+        except Exception as e:  # pragma: no cover — defensive
+            # Postprocess failure shouldn't blow up the simulate; fall
+            # through to raw curated headers and surface the error in
+            # the attempt so the operator can see what happened.
+            logger.warning(
+                f"resolve postprocess failed for {source.get('name')}: {e}"
+            )
+
     return ProbeAttempt(
         source_name=source.get("name", source["url"]),
         source_url=source["url"],
@@ -286,7 +326,7 @@ async def _probe_one_source(
         duration_ms=duration_ms,
         error=None,
         response_body_preview=_preview_body(response),
-        response_headers=_curated_headers(response),
+        response_headers=response_headers,
     )
 
 

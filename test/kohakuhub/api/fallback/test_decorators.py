@@ -676,6 +676,229 @@ async def test_with_user_fallback_unknown_local_namespace_falls_through(monkeypa
 
 
 # ===========================================================================
+# Per-probe trace cookie (#78 v3): the chain tester sends an
+# ``X-Khub-Probe-Id`` header so the decorator additionally Set-Cookie's
+# the encoded trace under a per-probe name. Browsers strip
+# redirect-chain response headers from JS visibility (W3C Fetch spec
+# opaqueredirect filter), so the cookie is the only reliable pickup
+# channel after a redirect-follow round trip.
+# ===========================================================================
+
+
+def _request_with_probe_id(path: str, probe_id: str | None, **kw):
+    headers = {}
+    if probe_id is not None:
+        headers["X-Khub-Probe-Id"] = probe_id
+    return SimpleNamespace(
+        method=kw.get("method", "GET"),
+        url=SimpleNamespace(path=path),
+        query_params=kw.get("query") or {},
+        state=SimpleNamespace(external_tokens=kw.get("external_tokens") or {}),
+        # Real Starlette Request.headers is case-insensitive; mimic that
+        # so the decorator's lookup of ``X-Khub-Probe-Id`` works.
+        headers=headers,
+    )
+
+
+def _decode_set_cookie(set_cookie_value: str) -> tuple[str, str, dict]:
+    """Tiny RFC-6265-ish parser for the test (name, value, attrs)."""
+    parts = [p.strip() for p in set_cookie_value.split(";") if p.strip()]
+    head = parts[0]
+    name, value = head.split("=", 1)
+    attrs = {}
+    for chunk in parts[1:]:
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            attrs[k.strip().lower()] = v.strip()
+        else:
+            attrs[chunk.strip().lower()] = ""
+    return name, value, attrs
+
+
+@pytest.mark.asyncio
+async def test_trace_cookie_set_when_probe_id_header_present(monkeypatch):
+    """Probe id supplied → response carries Set-Cookie alongside the
+    X-Chain-Trace header. Cookie name = ``_khub_chain_trace_<id>``,
+    cookie value = same encoded trace as the header."""
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return Response(status_code=200, content=b'{"ok":true}')
+
+    request = _request_with_probe_id("/api/models/owner/demo", "abc123uuid")
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo", request=request,
+    )
+    # X-Chain-Trace still set on the universal channel.
+    trace_header = result.headers.get("x-chain-trace") or result.headers.get(
+        "X-Chain-Trace"
+    )
+    assert trace_header
+    # And the cookie is set.
+    set_cookie = result.headers.get("set-cookie") or result.headers.get(
+        "Set-Cookie"
+    )
+    assert set_cookie, "Set-Cookie must be present when probe id supplied"
+    name, value, attrs = _decode_set_cookie(set_cookie)
+    assert name == "_khub_chain_trace_abc123uuid"
+    assert value == trace_header  # cookie value == header value
+    # Max-Age = 300s (5 minutes) per the user's requirement.
+    assert attrs.get("max-age") == "300"
+    assert attrs.get("path") == "/"
+    assert attrs.get("samesite", "").lower() == "lax"
+
+
+@pytest.mark.asyncio
+async def test_trace_cookie_NOT_set_when_probe_id_header_absent(monkeypatch):
+    """No probe id → only X-Chain-Trace header, no Set-Cookie. Avoids
+    paying the extra bytes + cookie-jar pollution for ordinary
+    business clients (curl, hf_hub) that don't need the pickup
+    channel."""
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return Response(status_code=200, content=b'{"ok":true}')
+
+    request = _request_with_probe_id("/api/models/owner/demo", None)
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo", request=request,
+    )
+    assert result.headers.get("x-chain-trace")  # universal channel still set
+    assert (
+        result.headers.get("set-cookie") is None
+        and result.headers.get("Set-Cookie") is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_cookie_concurrent_probes_get_distinct_names(monkeypatch):
+    """Two probes with different ids must get different cookie names so
+    the SPA can read its own trace without colliding with an in-flight
+    probe from another tab (or another logical run within the same
+    tab)."""
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return Response(status_code=200, content=b'{}')
+
+    r1 = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        request=_request_with_probe_id("/api/models/owner/demo", "id-AAAA"),
+    )
+    r2 = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        request=_request_with_probe_id("/api/models/owner/demo", "id-BBBB"),
+    )
+    n1, _, _ = _decode_set_cookie(r1.headers["set-cookie"])
+    n2, _, _ = _decode_set_cookie(r2.headers["set-cookie"])
+    assert n1 == "_khub_chain_trace_id-AAAA"
+    assert n2 == "_khub_chain_trace_id-BBBB"
+    assert n1 != n2
+
+
+@pytest.mark.asyncio
+async def test_trace_cookie_rejects_unsafe_probe_id(monkeypatch):
+    """A malicious probe id with cookie-name-illegal characters
+    (semicolons, equals, whitespace, comma) must NOT inject a
+    Set-Cookie line. ``sanitize_probe_id`` rejects → no cookie."""
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return Response(status_code=200, content=b'{}')
+
+    bad_ids = [
+        "abc;def=evil",     # ; injection
+        "abc def",          # whitespace
+        "abc,def",          # comma
+        "abc\nSet-Cookie:x=y",  # newline injection
+        "x" * 65,           # too long
+        "",                 # empty
+    ]
+    for bad in bad_ids:
+        result = await handler(
+            repo_type="model", namespace="owner", name="demo",
+            request=_request_with_probe_id("/api/models/owner/demo", bad),
+        )
+        assert result.headers.get("x-chain-trace")  # header still set
+        assert (
+            result.headers.get("set-cookie") is None
+            and result.headers.get("Set-Cookie") is None
+        ), f"unsafe probe id {bad!r} must not produce a Set-Cookie"
+
+
+@pytest.mark.asyncio
+async def test_trace_cookie_set_on_dict_return_jsonresponse_wrap(monkeypatch):
+    """LOCAL_HIT dict path goes through the JSONResponse wrap branch of
+    ``_attach_trace_to_result``. Cookie injection must work there too."""
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return {"id": "owner/demo", "private": False}
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        request=_request_with_probe_id("/api/models/owner/demo", "wrapped-id"),
+    )
+    assert isinstance(result, JSONResponse)
+    set_cookie = result.headers.get("set-cookie") or result.headers.get(
+        "Set-Cookie"
+    )
+    assert set_cookie
+    name, value, _attrs = _decode_set_cookie(set_cookie)
+    assert name == "_khub_chain_trace_wrapped-id"
+    assert value == result.headers["x-chain-trace"]
+
+
+@pytest.mark.asyncio
+async def test_trace_cookie_set_on_httpexception_path(monkeypatch):
+    """Non-404 HTTPException re-raise: ``inject_trace_into_exception_headers``
+    threads the probe id into the headers dict so the cookie rides on
+    the error response too."""
+
+    async def fail(*_a, **_k):
+        raise AssertionError("fallback must NOT run on non-404")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_info", fail)
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        raise HTTPException(status_code=500, detail="boom")
+
+    with pytest.raises(HTTPException) as exc:
+        await handler(
+            repo_type="model", namespace="owner", name="demo",
+            request=_request_with_probe_id("/api/models/owner/demo", "exc-probe"),
+        )
+    headers = exc.value.headers or {}
+    assert headers.get("X-Chain-Trace") or headers.get("x-chain-trace")
+    set_cookie = headers.get("Set-Cookie") or headers.get("set-cookie")
+    assert set_cookie
+    name, _, attrs = _decode_set_cookie(set_cookie)
+    assert name == "_khub_chain_trace_exc-probe"
+    assert attrs.get("max-age") == "300"
+
+
+@pytest.mark.asyncio
+async def test_trace_cookie_never_set_without_hops(monkeypatch):
+    """When fallback is disabled (``cfg.fallback.enabled = False``) the
+    decorator short-circuits before ``start_trace``. No hops → no
+    cookie even if probe id supplied."""
+
+    monkeypatch.setattr(fallback_decorators.cfg.fallback, "enabled", False)
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return Response(status_code=200, content=b'{}')
+
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo",
+        request=_request_with_probe_id("/api/models/owner/demo", "ignored-id"),
+    )
+    assert result.headers.get("x-chain-trace") is None
+    assert result.headers.get("set-cookie") is None
+
+
+# ===========================================================================
 # X-Chain-Trace emission contract (#78 redesign)
 #
 # The chain tester sends a real production request from the browser and

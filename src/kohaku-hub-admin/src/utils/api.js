@@ -1063,6 +1063,76 @@ export function buildProbeRequestTarget({
   }
 }
 
+// ===========================================================================
+// Per-probe trace cookie (#78 v3)
+// ===========================================================================
+//
+// W3C Fetch spec strips response headers from the redirect chain
+// (filtered ``opaqueredirect`` response, status=0, headers list empty)
+// before JS can read them. There's no browser API that bypasses this
+// — verified across fetch / XHR / Service Worker / iframe / Resource
+// Timing / Server-Timing. So once a real probe walks through a 3xx
+// (which resolve always does on fallback bind), the SPA never sees
+// the X-Chain-Trace header on the post-redirect response.
+//
+// Workaround: chain tester sends ``X-Khub-Probe-Id: <uuid>`` on the
+// request; backend (in ``with_repo_fallback``) Set-Cookie's the same
+// trace under ``_khub_chain_trace_<uuid>`` alongside the X-Chain-Trace
+// header. Cookies live in the cookie jar, which survives the redirect.
+// SPA reads its cookie after the request settles, then deletes it so
+// document.cookie doesn't accumulate stale trace blobs.
+
+const PROBE_ID_HEADER = "X-Khub-Probe-Id";
+const TRACE_COOKIE_PREFIX = "_khub_chain_trace_";
+
+/**
+ * Generate a fresh per-call probe id. Used as the cookie-name suffix
+ * on the trace-pickup channel so concurrent probes don't clobber each
+ * other.
+ *
+ * Not security-sensitive — just needs to be unique per call.
+ */
+function _generateProbeId() {
+  if (
+    typeof window !== "undefined" &&
+    window.crypto &&
+    typeof window.crypto.randomUUID === "function"
+  ) {
+    return window.crypto.randomUUID();
+  }
+  // Fallback for older runtimes (and jsdom in vitest, which lacks
+  // ``crypto.randomUUID`` on some Node versions): timestamp + random.
+  return `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Look up the per-probe trace cookie. Returns the encoded base64 trace
+ * value or null if no such cookie is set (e.g. backend doesn't yet
+ * support cookie injection, or the request didn't go through
+ * ``with_repo_fallback``).
+ *
+ * Cookie value is base64-encoded JSON — base64 alphabet
+ * (``[A-Za-z0-9+/=]``) is cookie-value-safe, so no URL decoding needed.
+ */
+function _readProbeCookie(probeId) {
+  const name = `${TRACE_COOKIE_PREFIX}${probeId}`;
+  const match = document.cookie.match(
+    new RegExp(`(?:^|;\\s*)${name}=([^;]+)`),
+  );
+  return match ? match[1] : null;
+}
+
+/**
+ * Drop the per-probe trace cookie after pickup. Without this,
+ * ``document.cookie`` accumulates stale trace blobs across probes —
+ * not a security issue (Max-Age=300s caps each one), but messy.
+ */
+function _clearProbeCookie(probeId) {
+  document.cookie =
+    `${TRACE_COOKIE_PREFIX}${probeId}=; ` +
+    `Max-Age=0; Path=/; SameSite=Lax`;
+}
+
 /**
  * Send a real request to the local KohakuHub instance — exactly the
  * shape a production hf_hub client would issue — then read the
@@ -1099,8 +1169,18 @@ export function buildProbeRequestTarget({
  */
 export async function runFallbackProbe(req) {
   const target = buildProbeRequestTarget(req);
-  const headers = {};
+  // Per-call probe id: lets the backend Set-Cookie the trace under a
+  // unique-name so concurrent probes don't trample each other and so
+  // the SPA can pick up its own trace post redirect-follow.
+  const probeId = _generateProbeId();
+  const headers = {
+    [PROBE_ID_HEADER]: probeId,
+  };
   if (req.authorization) headers["Authorization"] = req.authorization;
+  // Clear any stale cookie under this id (defensive — a fresh uuid
+  // shouldn't collide, but if the SPA reuses an id by accident we
+  // don't want the prior trace bleeding through).
+  _clearProbeCookie(probeId);
   // Probe runs through the production handler chain, which means a
   // real cache write may happen on bind. That's intentional — the
   // tester surfaces "what would my prod call do" and the user can
@@ -1128,7 +1208,8 @@ export async function runFallbackProbe(req) {
 
   if (networkError || !response) {
     // No response — synthesize a single-attempt error report so the
-    // timeline still has something to render.
+    // timeline still has something to render. Cookie cleanup is
+    // unnecessary here — the backend never had a chance to Set-Cookie.
     return {
       final_outcome: "ERROR",
       bound_source: null,
@@ -1154,11 +1235,24 @@ export async function runFallbackProbe(req) {
     };
   }
 
-  const traceHeader =
+  // Two-channel pickup. Order matters:
+  // 1. Header (universal channel, always present on direct responses):
+  //    works when no redirect happened in the chain (e.g. info/tree/
+  //    paths_info LOCAL_HIT, or HEAD on local resolve).
+  // 2. Per-probe cookie (redirect-follow fallback): backend Set-Cookie
+  //    under the probe id; survives the W3C Fetch spec's
+  //    ``opaqueredirect`` filter that strips redirect-chain headers.
+  // Cookie is always cleared after pickup whether or not it was used,
+  // so document.cookie doesn't leak old trace blobs.
+  let traceValue =
     response.headers["x-chain-trace"] ||
     response.headers["X-Chain-Trace"] ||
     null;
-  const hops = decodeChainTraceHeader(traceHeader);
+  if (!traceValue) {
+    traceValue = _readProbeCookie(probeId);
+  }
+  _clearProbeCookie(probeId);
+  const hops = decodeChainTraceHeader(traceValue);
 
   const attempts = hops.map((h) => ({
     kind: h.kind || "fallback",
