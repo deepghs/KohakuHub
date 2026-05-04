@@ -3,6 +3,7 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import AdminLayout from "@/components/AdminLayout.vue";
 import ProbeReportView from "@/components/ProbeReportView.vue";
+import { useChainTesterState } from "@/composables/useChainTesterState";
 import { useAdminStore } from "@/stores/admin";
 import {
   listFallbackSources,
@@ -545,10 +546,10 @@ const PROBE_OPS = PROBE_OP_OPTIONS.map((o) => o.value);
 const REPO_TYPES = ["model", "dataset", "space"];
 const SOURCE_TYPES = ["huggingface", "kohakuhub"];
 
-// System-state draft. Independent from ``sources`` (the live config).
-// Edits accumulate; only ``pushDraftToSystem`` propagates them back.
-const draftSources = ref([]);
-const draftDirty = ref(false);
+// ``draftSources`` and ``draftDirty`` come from ``useChainTesterState``
+// at the top of this script — see comment there for why they're
+// module-level. Edits accumulate; only ``pushDraftToSystem`` propagates
+// them back to the live config.
 
 function _blankDraftSource() {
   return {
@@ -650,33 +651,24 @@ async function pushDraftToSystem() {
   }
 }
 
-// Tab selector for the two probe modes.
-//
-// - ``simulate`` (Frame 1): probes a *draft* source list against an
-//   impersonated identity via the ``/admin/api/fallback/test/simulate``
-//   endpoint. Pure read — never touches the production cache or the
-//   live fallback config. The right place to test "what would happen
-//   if I added source X for user Y".
-// - ``real`` (Frame 2): sends a real production request from the
-//   browser to this KohakuHub instance, with the operator's *own*
-//   credentials (admin can't fake another user's token), and reads
-//   the chain off ``X-Chain-Trace`` on the response. The right place
-//   to verify "live config is actually working as expected" — what
-//   simulate can't tell you.
-const probeTab = ref("simulate");
-
-// Probe target shared by both frames — the operator typically tests
-// the same (op, repo) on draft vs live to compare outcomes, so making
-// the target form sticky across tabs is the right default.
-const probeForm = ref({
-  op: "info",
-  repo_type: "model",
-  namespace: "",
-  name: "",
-  revision: "main",
-  file_path: "",
-  paths_csv: "", // comma-separated; parsed to a list before submit
-});
+// Chain Tester state lives in module-level singletons (see
+// useChainTesterState) so SPA route switches don't unmount it.
+// Component-local refs would reset every time the operator
+// navigates away and back, blowing away any pending draft edits.
+// Browser refresh still resets the page (whole bundle re-evaluates),
+// and admin logout calls ``resetChainTesterState`` for cleanup —
+// route changes and tab switches preserve every field.
+const {
+  probeTab,
+  probeForm,
+  draftSources,
+  draftDirty,
+  simIdentity,
+  simHeaderTokens,
+  realKhubToken,
+  realHeaderTokens,
+  autoLoadDone,
+} = useChainTesterState();
 
 // =====================================================================
 // Frame 1: Draft simulate
@@ -688,13 +680,9 @@ const probeForm = ref({
 // overlay. Impersonation is only meaningful in simulate mode — admin
 // doesn't bear other users' khub credentials, so for the real-probe
 // frame we drop it and use the operator's own auth instead.
-
-const simIdentity = ref({
-  mode: "anonymous", // "anonymous" | "username" | "user_id"
-  username: "",
-  user_id: null,
-});
-const simHeaderTokens = ref([]);
+//
+// ``simIdentity`` and ``simHeaderTokens`` come from
+// ``useChainTesterState`` (module-level singletons).
 
 function addSimHeaderToken() {
   simHeaderTokens.value.push({ url: "", token: "" });
@@ -785,9 +773,9 @@ async function runSimulate() {
 // fallback-source tokens, combined into a single ``Authorization``
 // header in the production "Bearer khub_xxx|url,token|..." shape.
 // Empty everywhere ⇒ anonymous, no header sent.
-
-const realKhubToken = ref("");
-const realHeaderTokens = ref([]);
+//
+// ``realKhubToken`` and ``realHeaderTokens`` come from
+// ``useChainTesterState`` (module-level singletons).
 
 function addRealHeaderToken() {
   realHeaderTokens.value.push({ url: "", token: "" });
@@ -858,37 +846,24 @@ function decisionTagType(decision) {
   }
 }
 
-// First-visit auto-load:
-//   When the operator lands on this page for the first time within
-//   their admin session, seed the draft area from the live config so
-//   they can edit + simulate immediately. Subsequent navigations
-//   away and back must NOT reload — that would clobber any pending
-//   edits. The flag is scoped to ``sessionStorage`` (tab-level) and
-//   cleared on admin logout (see admin.store) so re-login gets a
-//   fresh auto-seed.
-const _AUTO_LOAD_FLAG_KEY = "khub_admin_chain_tester_draft_loaded_once";
-
+// First-mount auto-seed:
+//   On the operator's first visit per page-load, seed the draft
+//   from the live config so they can edit + simulate immediately
+//   without clicking Load. ``autoLoadDone`` is module-level (see
+//   useChainTesterState) so subsequent route-switch returns DON'T
+//   re-seed — that would clobber pending edits and would also
+//   override an explicit Discard the operator just performed.
+//
+//   Page refresh resets ``autoLoadDone`` to false (whole bundle re-
+//   evaluates), and admin logout resets it via
+//   ``resetChainTesterState`` — both correctly fall back to "auto-
+//   seed on next mount".
 onMounted(async () => {
   await loadSources();
   await loadCacheStats();
-  let alreadyLoaded = false;
-  try {
-    alreadyLoaded =
-      sessionStorage.getItem(_AUTO_LOAD_FLAG_KEY) === "true";
-  } catch (_e) {
-    // SessionStorage may be blocked (private browsing, embedded
-    // contexts) — fall through to "not loaded" so we still get the
-    // helpful auto-seed on first paint. Worst case is a duplicate
-    // load on tab switch, which is harmless (deep-copy of live
-    // config, ``draftDirty`` resets).
-  }
-  if (!alreadyLoaded && draftSources.value.length === 0) {
+  if (!autoLoadDone.value && draftSources.value.length === 0) {
     loadDraftFromSystem();
-    try {
-      sessionStorage.setItem(_AUTO_LOAD_FLAG_KEY, "true");
-    } catch (_e) {
-      // see above
-    }
+    autoLoadDone.value = true;
   }
 });
 </script>

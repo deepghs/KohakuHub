@@ -74,6 +74,7 @@ vi.mock("@/components/AdminLayout.vue", () => ({
 }));
 
 import FallbackSourcesPage from "@/pages/fallback-sources.vue";
+import { resetChainTesterState } from "@/composables/useChainTesterState";
 
 const messageBoxConfirmSpy = vi.fn();
 const messageSuccessSpy = vi.fn();
@@ -245,16 +246,11 @@ describe("admin fallback-sources page", () => {
     messageBoxConfirmSpy.mockReset();
     messageSuccessSpy.mockReset();
     messageErrorSpy.mockReset();
-    // Clear the per-tab session-storage flag the chain tester uses
-    // to gate "first visit auto-load from system". Without this,
-    // the first test that mounts the page sets the flag and every
-    // subsequent test skips auto-load — making "first visit" tests
-    // order-dependent.
-    try {
-      sessionStorage.removeItem("khub_admin_chain_tester_draft_loaded_once");
-    } catch (_e) {
-      // jsdom always has sessionStorage; the catch is for safety.
-    }
+    // Chain tester state lives at module scope so SPA route switches
+    // don't blow it away — but tests share that module across cases,
+    // so we explicitly reset between tests to keep them order-
+    // independent. Production gets a similar reset on admin logout.
+    resetChainTesterState();
 
     if (!elementPlusModule) {
       elementPlusModule = await vi.importActual("element-plus");
@@ -294,40 +290,119 @@ describe("admin fallback-sources page", () => {
     expect(wrapper.text()).toContain("10000"); // maxsize
   });
 
-  it("auto-loads draft from system on first visit and sets the session flag", async () => {
+  it("auto-loads draft from system on every mount", async () => {
+    // ``draftSources`` is component-local — Vue Router unmounts the
+    // page on navigation away, so it's always [] at mount time. Page
+    // must seed it from live config every mount, otherwise the
+    // operator sees an empty editor on every return visit.
     mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF, SOURCE_MIRROR]);
     mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
-    sessionStorage.removeItem("khub_admin_chain_tester_draft_loaded_once");
 
     const wrapper = mountPage();
     await flushPromises();
 
-    // Two draft rows seeded automatically — operator can edit + run
-    // simulate immediately on first paint without clicking Load.
     expect(wrapper.find('[data-testid="draft-row-0"]').exists()).toBe(true);
     expect(wrapper.find('[data-testid="draft-row-1"]').exists()).toBe(true);
-    // Session flag is set so a re-mount within the same admin session
-    // does NOT clobber pending edits.
-    expect(
-      sessionStorage.getItem("khub_admin_chain_tester_draft_loaded_once"),
-    ).toBe("true");
   });
 
-  it("does NOT auto-load when the session flag is already set", async () => {
-    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF, SOURCE_MIRROR]);
+  it("auto-load skips when live config is empty (no draft rows to seed)", async () => {
+    mocks.api.listFallbackSources.mockResolvedValue([]);
     mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
-    sessionStorage.setItem(
-      "khub_admin_chain_tester_draft_loaded_once",
-      "true",
-    );
 
     const wrapper = mountPage();
     await flushPromises();
 
-    // Live config is still loaded, but the draft area stays empty
-    // (the operator's pending edits — or empty draft they intentionally
-    // discarded — must survive a tab switch).
+    // Empty live config → empty draft. UI shows the empty-state
+    // hint instead of a row.
     expect(wrapper.find('[data-testid="draft-row-0"]').exists()).toBe(false);
+  });
+
+  it("draft state survives unmount + remount (SPA route switch)", async () => {
+    // Hoisted-to-module-scope state must persist across the unmount
+    // / remount cycle Vue Router triggers when the operator clicks
+    // away to another admin page and comes back. Without this the
+    // operator returns to a blank editor on every navigation —
+    // exactly the bug useChainTesterState fixes.
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF, SOURCE_MIRROR]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+
+    // First visit: auto-load runs, two rows seeded.
+    const w1 = mountPage();
+    await flushPromises();
+    expect(w1.find('[data-testid="draft-row-0"]').exists()).toBe(true);
+    expect(w1.find('[data-testid="draft-row-1"]').exists()).toBe(true);
+
+    // Edit one row so we can verify the edit *also* survives remount.
+    const row0 = w1.get('[data-testid="draft-row-0"]');
+    const inputs = row0.findAll("input");
+    await inputs[0].setValue("EditedName");
+    await flushPromises();
+
+    // Operator navigates away — Vue Router calls unmount.
+    w1.unmount();
+
+    // Operator comes back — fresh component instance, but shares the
+    // module-level state.
+    const w2 = mountPage();
+    await flushPromises();
+    expect(w2.find('[data-testid="draft-row-0"]').exists()).toBe(true);
+    expect(w2.find('[data-testid="draft-row-1"]').exists()).toBe(true);
+    // The hand edit on row 0 is preserved (stored in module-level
+    // ``draftSources``, not in the destroyed component).
+    const row0After = w2.get('[data-testid="draft-row-0"]');
+    expect(row0After.find("input").element.value).toBe("EditedName");
+  });
+
+  it("Discard Draft + remount does NOT re-auto-load (operator's wish respected)", async () => {
+    // Auto-load only runs the *first* time per page-load
+    // (``autoLoadDone`` flag). After the operator explicitly clicks
+    // Discard the draft is empty AND ``autoLoadDone`` is already
+    // true, so a route-switch return shows an empty editor — same
+    // empty state the operator just chose.
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF, SOURCE_MIRROR]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+
+    const w1 = mountPage();
+    await flushPromises();
+    expect(w1.find('[data-testid="draft-row-0"]').exists()).toBe(true);
+
+    // Operator clicks Discard — draft empty.
+    await w1.get('[data-testid="discard-draft-btn"]').trigger("click");
+    await flushPromises();
+    expect(w1.find('[data-testid="draft-row-0"]').exists()).toBe(false);
+
+    w1.unmount();
+
+    // Re-mount: draft must STAY empty (autoLoadDone latched on first
+    // mount; we don't re-seed against the operator's discard choice).
+    const w2 = mountPage();
+    await flushPromises();
+    expect(w2.find('[data-testid="draft-row-0"]').exists()).toBe(false);
+  });
+
+  it("logout resets chain tester state — next mount re-auto-loads", async () => {
+    // After admin logout, ``resetChainTesterState`` clears
+    // ``autoLoadDone`` so the next operator (or the same operator
+    // after re-login) gets a fresh first-mount auto-seed instead
+    // of inheriting the previous session's state.
+    mocks.api.listFallbackSources.mockResolvedValue([SOURCE_HF]);
+    mocks.api.getFallbackCacheStats.mockResolvedValue(STATS);
+
+    const w1 = mountPage();
+    await flushPromises();
+    expect(w1.find('[data-testid="draft-row-0"]').exists()).toBe(true);
+    // Operator discards.
+    await w1.get('[data-testid="discard-draft-btn"]').trigger("click");
+    await flushPromises();
+    w1.unmount();
+
+    // Simulate logout.
+    resetChainTesterState();
+
+    // Re-mount post-login → should auto-seed again.
+    const w2 = mountPage();
+    await flushPromises();
+    expect(w2.find('[data-testid="draft-row-0"]').exists()).toBe(true);
   });
 
   it("redirects to /login when admin token is missing", async () => {
