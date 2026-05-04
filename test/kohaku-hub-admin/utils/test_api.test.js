@@ -456,7 +456,30 @@ describe("admin API client", () => {
     ).toThrow(/Unknown probe op/);
   });
 
-  it("runFallbackProbe sends the real request, decodes X-Chain-Trace, and assembles a report", async () => {
+  // ``runFallbackProbe`` was refactored from axios to native ``fetch``
+  // with ``redirect: 'manual'`` (#78 v3) so cross-origin redirects on
+  // resolve fallback don't silently hang in the browser. Tests now
+  // mock ``globalThis.fetch`` instead. Helper builds Response-like
+  // objects with proper Headers + ``text()`` so the curated-headers
+  // and body-preview paths in ``runFallbackProbe`` exercise the same
+  // shape they'd see in production.
+  function _makeFetchResponse({
+    status = 200,
+    type = "basic",
+    headers = {},
+    bodyText = "",
+  } = {}) {
+    const h = new Headers();
+    for (const [k, v] of Object.entries(headers)) h.set(k, v);
+    return {
+      status,
+      type,
+      headers: h,
+      text: async () => bodyText,
+    };
+  }
+
+  it("runFallbackProbe sends the real fetch request, decodes X-Chain-Trace, and assembles a report", async () => {
     const api = await loadModule();
 
     const hops = [
@@ -477,14 +500,18 @@ describe("admin API client", () => {
     ];
     const encoded = btoa(JSON.stringify({ version: 1, hops }));
 
-    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        "x-chain-trace": encoded,
-      },
-      data: { id: "owner/demo", private: false },
-    });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        _makeFetchResponse({
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-chain-trace": encoded,
+          },
+          bodyText: '{"id": "owner/demo", "private": false}',
+        }),
+      );
 
     const report = await api.runFallbackProbe({
       op: "info",
@@ -495,14 +522,17 @@ describe("admin API client", () => {
       authorization: "Bearer khub_xxx|https://hf.example,hf_yyy",
     });
 
-    expect(requestSpy).toHaveBeenCalledTimes(1);
-    const call = requestSpy.mock.calls[0][0];
-    expect(call.url).toBe("/api/models/owner/demo");
-    expect(call.method).toBe("get");
-    expect(call.headers.Authorization).toBe(
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("/api/models/owner/demo");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe(
       "Bearer khub_xxx|https://hf.example,hf_yyy",
     );
-    expect(call.validateStatus(404)).toBe(true);  // accepts all statuses
+    // ``redirect: 'manual'`` is non-negotiable — without it, axios's
+    // (and fetch's default ``follow``) cross-origin redirect chain
+    // silently hangs in the browser on resolve fallback.
+    expect(init.redirect).toBe("manual");
 
     expect(report.final_outcome).toBe("LOCAL_HIT");
     expect(report.bound_source).toEqual({ name: "local", url: null });
@@ -511,7 +541,6 @@ describe("admin API client", () => {
     expect(report.attempts[0].kind).toBe("local");
     expect(report.final_response.status_code).toBe(200);
     expect(report.final_response.body_preview).toContain('"id": "owner/demo"');
-    // Curated headers — only the relevant set is preserved.
     expect(report.final_response.headers["content-type"]).toBe(
       "application/json",
     );
@@ -519,24 +548,24 @@ describe("admin API client", () => {
 
   it("runFallbackProbe with no Authorization sends no Authorization header", async () => {
     const api = await loadModule();
-    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {},
-    });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(_makeFetchResponse({ bodyText: "{}" }));
     await api.runFallbackProbe({
       op: "info",
       repo_type: "model",
       namespace: "owner",
       name: "demo",
     });
-    const call = requestSpy.mock.calls[0][0];
-    expect(call.headers.Authorization).toBeUndefined();
+    const [, init] = fetchSpy.mock.calls[0];
+    expect(init.headers.Authorization).toBeUndefined();
   });
 
-  it("runFallbackProbe synthesizes a NETWORK_ERROR report when the request throws", async () => {
+  it("runFallbackProbe synthesizes a NETWORK_ERROR report when the fetch throws", async () => {
     const api = await loadModule();
-    vi.spyOn(axios, "request").mockRejectedValue(new Error("connection refused"));
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      new Error("connection refused"),
+    );
 
     const report = await api.runFallbackProbe({
       op: "info",
@@ -555,11 +584,13 @@ describe("admin API client", () => {
 
   it("runFallbackProbe missing X-Chain-Trace yields an empty timeline (CHAIN_EXHAUSTED)", async () => {
     const api = await loadModule();
-    vi.spyOn(axios, "request").mockResolvedValue({
-      status: 200,
-      headers: { "content-type": "text/plain" },
-      data: "hello",
-    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      _makeFetchResponse({
+        status: 200,
+        headers: { "content-type": "text/plain" },
+        bodyText: "hello",
+      }),
+    );
     const report = await api.runFallbackProbe({
       op: "info",
       repo_type: "model",
@@ -572,13 +603,58 @@ describe("admin API client", () => {
     expect(report.final_response.body_preview).toBe("hello");
   });
 
-  it("runFallbackProbe paths_info packs paths into the request body", async () => {
+  it("runFallbackProbe opaqueredirect path reads cookie + reconstructs final_response from bound hop", async () => {
+    // The 3xx case the v3 fix targets: backend returns 307 +
+    // ``Location: <cross-origin>`` + Set-Cookie. ``fetch`` with
+    // ``redirect: 'manual'`` resolves immediately with type=opaqueredirect
+    // (status=0, headers list empty per Fetch spec), and we read the
+    // trace off the cookie that was set on the same-origin response.
+    _clearAllTraceCookies();
     const api = await loadModule();
-    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: [],
+    const hops = [
+      { kind: "local", source_name: "local", decision: "LOCAL_MISS",
+        status_code: 404, duration_ms: 1 },
+      { kind: "fallback", source_name: "HF",
+        source_url: "https://huggingface.co",
+        decision: "BIND_AND_RESPOND",
+        status_code: 307, duration_ms: 800 },
+    ];
+    const encoded = btoa(JSON.stringify({ version: 1, hops }));
+
+    let plantedProbeId = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      plantedProbeId = init.headers["X-Khub-Probe-Id"];
+      // Plant the cookie BEFORE returning the opaqueredirect — same
+      // ordering production has (Set-Cookie + Location on the 307).
+      document.cookie =
+        `_khub_chain_trace_${plantedProbeId}=${encoded}; ` +
+        `Max-Age=300; Path=/; SameSite=Lax`;
+      return _makeFetchResponse({
+        status: 0,
+        type: "opaqueredirect",
+        headers: {},
+        bodyText: "",
+      });
     });
+
+    const report = await api.runFallbackProbe({
+      op: "resolve", repo_type: "model", namespace: "openai-community",
+      name: "gpt2", revision: "main", file_path: "config.json",
+    });
+    expect(report.attempts).toHaveLength(2);
+    expect(report.attempts[1].decision).toBe("BIND_AND_RESPOND");
+    expect(report.final_outcome).toBe("BIND_AND_RESPOND");
+    // final_response reconstructed from the bound hop, not the
+    // (zeroed) opaqueredirect Response.
+    expect(report.final_response.status_code).toBe(307);
+    expect(report.final_response.body_preview).toContain("redirect");
+  });
+
+  it("runFallbackProbe paths_info packs paths into the request body as JSON", async () => {
+    const api = await loadModule();
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(_makeFetchResponse({ bodyText: "[]" }));
     await api.runFallbackProbe({
       op: "paths_info",
       repo_type: "dataset",
@@ -587,10 +663,14 @@ describe("admin API client", () => {
       revision: "main",
       paths: ["README.md", "config.json"],
     });
-    const call = requestSpy.mock.calls[0][0];
-    expect(call.method).toBe("post");
-    expect(call.url).toBe("/api/datasets/owner/demo/paths-info/main");
-    expect(call.data).toEqual({ paths: ["README.md", "config.json"] });
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(init.method).toBe("POST");
+    expect(url).toBe("/api/datasets/owner/demo/paths-info/main");
+    // Fetch needs a serialized body — verify the JSON shape.
+    expect(JSON.parse(init.body)).toEqual({
+      paths: ["README.md", "config.json"],
+    });
+    expect(init.headers["Content-Type"]).toBe("application/json");
   });
 
   // -------------------------------------------------------------------
@@ -619,58 +699,50 @@ describe("admin API client", () => {
 
   it("runFallbackProbe sends X-Khub-Probe-Id header on every call", async () => {
     const api = await loadModule();
-    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {},
-    });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(_makeFetchResponse({ bodyText: "{}" }));
     await api.runFallbackProbe({
       op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
-    const call = requestSpy.mock.calls[0][0];
-    expect(call.headers["X-Khub-Probe-Id"]).toMatch(/.+/);
+    const [, init] = fetchSpy.mock.calls[0];
+    expect(init.headers["X-Khub-Probe-Id"]).toMatch(/.+/);
   });
 
   it("runFallbackProbe generates a fresh probe id per call", async () => {
     const api = await loadModule();
-    const requestSpy = vi.spyOn(axios, "request").mockResolvedValue({
-      status: 200,
-      headers: {},
-      data: {},
-    });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(_makeFetchResponse({ bodyText: "{}" }));
     await api.runFallbackProbe({
       op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     await api.runFallbackProbe({
       op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
-    const id1 = requestSpy.mock.calls[0][0].headers["X-Khub-Probe-Id"];
-    const id2 = requestSpy.mock.calls[1][0].headers["X-Khub-Probe-Id"];
+    const id1 = fetchSpy.mock.calls[0][1].headers["X-Khub-Probe-Id"];
+    const id2 = fetchSpy.mock.calls[1][1].headers["X-Khub-Probe-Id"];
     expect(id1).not.toBe(id2);
   });
 
   it("runFallbackProbe falls back to per-probe cookie when X-Chain-Trace header is missing", async () => {
     _clearAllTraceCookies();
     const api = await loadModule();
-    // Capture the probe id the SPA generates so we can plant a
-    // matching cookie before the axios mock returns.
     let capturedProbeId = null;
-    vi.spyOn(axios, "request").mockImplementation(async (cfg) => {
-      capturedProbeId = cfg.headers["X-Khub-Probe-Id"];
-      // Plant the cookie now — simulates the redirect-follow case
-      // where the backend Set-Cookie'd before the redirect, and the
-      // browser carried it through to the post-redirect response.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      capturedProbeId = init.headers["X-Khub-Probe-Id"];
       const hops = [
         { kind: "local", source_name: "local", decision: "LOCAL_MISS",
           status_code: 404, duration_ms: 1 },
         { kind: "fallback", source_name: "HF", decision: "BIND_AND_RESPOND",
-          status_code: 200, duration_ms: 12 },
+          status_code: 307, duration_ms: 12 },
       ];
       const traceValue = btoa(JSON.stringify({ version: 1, hops }));
       document.cookie =
         `_khub_chain_trace_${capturedProbeId}=${traceValue}; ` +
         `Max-Age=300; Path=/; SameSite=Lax`;
-      return { status: 200, headers: {}, data: {} };  // no X-Chain-Trace
+      // Returned without X-Chain-Trace header — forces cookie pickup.
+      return _makeFetchResponse({ bodyText: "{}" });
     });
 
     const report = await api.runFallbackProbe({
@@ -680,7 +752,6 @@ describe("admin API client", () => {
     expect(report.attempts[0].decision).toBe("LOCAL_MISS");
     expect(report.attempts[1].decision).toBe("BIND_AND_RESPOND");
     expect(report.final_outcome).toBe("BIND_AND_RESPOND");
-    // Cookie cleaned up after pickup.
     expect(document.cookie).not.toContain(
       `_khub_chain_trace_${capturedProbeId}=`,
     );
@@ -695,10 +766,8 @@ describe("admin API client", () => {
     ];
     const headerEncoded = btoa(JSON.stringify({ version: 1, hops: headerHops }));
     let plantedProbeId = null;
-    vi.spyOn(axios, "request").mockImplementation(async (cfg) => {
-      plantedProbeId = cfg.headers["X-Khub-Probe-Id"];
-      // Plant a *different* trace into the cookie so we can prove
-      // the header took precedence.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      plantedProbeId = init.headers["X-Khub-Probe-Id"];
       const decoyHops = [
         { kind: "local", source_name: "local", decision: "LOCAL_MISS",
           status_code: 404, duration_ms: 1 },
@@ -707,30 +776,52 @@ describe("admin API client", () => {
       document.cookie =
         `_khub_chain_trace_${plantedProbeId}=${decoy}; ` +
         `Max-Age=300; Path=/; SameSite=Lax`;
-      return {
-        status: 200,
+      return _makeFetchResponse({
         headers: { "x-chain-trace": headerEncoded },
-        data: {},
-      };
+        bodyText: "{}",
+      });
     });
     const report = await api.runFallbackProbe({
       op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
-    // Header (LOCAL_HIT) wins — not the cookie's LOCAL_MISS decoy.
     expect(report.attempts).toHaveLength(1);
     expect(report.attempts[0].decision).toBe("LOCAL_HIT");
     expect(report.final_outcome).toBe("LOCAL_HIT");
-    // Cookie still cleaned up regardless.
     expect(document.cookie).not.toContain(
       `_khub_chain_trace_${plantedProbeId}=`,
     );
   });
 
+  it("runFallbackProbe strips surrounding double quotes when reading the cookie", async () => {
+    // Defensive guard for upstreams that re-introduce SimpleCookie-
+    // style quoting (we patched our own backend, but a reverse proxy
+    // or future runtime might still wrap base64 values).
+    _clearAllTraceCookies();
+    const api = await loadModule();
+    const hops = [
+      { kind: "local", source_name: "local", decision: "LOCAL_HIT",
+        status_code: 200, duration_ms: 1 },
+    ];
+    const encoded = btoa(JSON.stringify({ version: 1, hops }));
+    let plantedProbeId = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      plantedProbeId = init.headers["X-Khub-Probe-Id"];
+      document.cookie =
+        `_khub_chain_trace_${plantedProbeId}="${encoded}"; ` +
+        `Max-Age=300; Path=/; SameSite=Lax`;
+      return _makeFetchResponse({ bodyText: "{}" });
+    });
+    const report = await api.runFallbackProbe({
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
+    });
+    expect(report.attempts).toHaveLength(1);
+    expect(report.attempts[0].decision).toBe("LOCAL_HIT");
+    expect(report.final_outcome).toBe("LOCAL_HIT");
+  });
+
   it("runFallbackProbe doesn't read other probes' cookies (concurrent isolation)", async () => {
     _clearAllTraceCookies();
     const api = await loadModule();
-    // Plant a cookie under a *different* probe id (simulating a
-    // concurrent in-flight probe from another tab/run).
     const otherHops = [{ kind: "local", source_name: "local",
       decision: "LOCAL_HIT", status_code: 200, duration_ms: 1 }];
     const otherEncoded = btoa(JSON.stringify({ version: 1, hops: otherHops }));
@@ -738,20 +829,15 @@ describe("admin API client", () => {
       `_khub_chain_trace_other-probe=${otherEncoded}; ` +
       `Max-Age=300; Path=/; SameSite=Lax`;
 
-    vi.spyOn(axios, "request").mockResolvedValue({
-      status: 200, headers: {}, data: {},
-    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      _makeFetchResponse({ bodyText: "{}" }),
+    );
     const report = await api.runFallbackProbe({
       op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
-    // Empty timeline — own cookie wasn't planted, other-probe's
-    // cookie must NOT be picked up because the name doesn't match.
     expect(report.attempts).toEqual([]);
     expect(report.final_outcome).toBe("CHAIN_EXHAUSTED");
-    // The other probe's cookie is untouched (different probe id,
-    // different cookie name).
     expect(document.cookie).toContain("_khub_chain_trace_other-probe=");
-    // Clean up so this doesn't leak into other tests.
     _clearAllTraceCookies();
   });
 

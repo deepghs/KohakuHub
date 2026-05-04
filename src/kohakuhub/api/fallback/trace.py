@@ -342,18 +342,20 @@ def inject_trace_cookie(
     if not sanitized:
         return
     encoded = encode_trace_header(hops)
+    cookie_line = _build_trace_cookie_value(sanitized, encoded)
     try:
-        if hasattr(response, "set_cookie"):
-            response.set_cookie(
-                key=cookie_name_for_probe(sanitized),
-                value=encoded,
-                max_age=COOKIE_MAX_AGE_SECONDS,
-                path="/",
-                samesite="lax",
-            )
-        else:  # pragma: no cover — defensive fallback
-            response.headers["Set-Cookie"] = _build_trace_cookie_value(
-                sanitized, encoded,
-            )
+        # Append the raw Set-Cookie header line directly rather than
+        # going through ``response.set_cookie`` (Starlette's helper
+        # delegates to ``http.cookies.SimpleCookie`` which wraps
+        # values containing ``=`` in double quotes — RFC 6265 allows
+        # ``=`` unquoted in cookie-octets but SimpleCookie's
+        # ``_LegalChars`` set is overly conservative). Quoted values
+        # would force the SPA to strip them before ``atob``, which
+        # the SPA does defensively anyway, but cleaner wire bytes
+        # don't hurt.
+        if hasattr(response, "headers") and hasattr(response.headers, "append"):
+            response.headers.append("Set-Cookie", cookie_line)
+        else:  # pragma: no cover — defensive fallback for plain dicts
+            response.headers["Set-Cookie"] = cookie_line
     except Exception:  # pragma: no cover — defensive
         logger.debug("inject_trace_cookie: failed to set cookie")

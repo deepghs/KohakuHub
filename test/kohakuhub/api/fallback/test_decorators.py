@@ -716,6 +716,40 @@ def _decode_set_cookie(set_cookie_value: str) -> tuple[str, str, dict]:
 
 
 @pytest.mark.asyncio
+async def test_trace_cookie_value_is_NOT_double_quoted(monkeypatch):
+    """Regression guard: Python's ``http.cookies.SimpleCookie`` wraps
+    values containing ``=`` in double quotes, but RFC 6265 allows
+    ``=`` unquoted in cookie-octets and quoted values trip up the
+    SPA's ``atob`` call (``"`` isn't valid base64). The backend must
+    bypass SimpleCookie and write the raw Set-Cookie line so the
+    base64 trace value reaches the browser unquoted.
+    """
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        return Response(status_code=200, content=b'{"ok":true}')
+
+    request = _request_with_probe_id("/api/models/owner/demo", "uuid-123")
+    result = await handler(
+        repo_type="model", namespace="owner", name="demo", request=request,
+    )
+    set_cookie = result.headers.get("set-cookie") or result.headers.get(
+        "Set-Cookie"
+    )
+    assert set_cookie
+    name, value, _attrs = _decode_set_cookie(set_cookie)
+    # The value must be the raw base64 trace, NOT wrapped in quotes.
+    # ``atob`` in the browser would reject ``"`` as non-base64 and
+    # the SPA would fall through to CHAIN_EXHAUSTED.
+    assert not value.startswith('"'), f"cookie value is quoted: {value!r}"
+    assert not value.endswith('"'), f"cookie value is quoted: {value!r}"
+    # And it should be exactly the same string as the X-Chain-Trace header.
+    assert value == result.headers.get("x-chain-trace") or value == result.headers.get(
+        "X-Chain-Trace"
+    )
+
+
+@pytest.mark.asyncio
 async def test_trace_cookie_set_when_probe_id_header_present(monkeypatch):
     """Probe id supplied → response carries Set-Cookie alongside the
     X-Chain-Trace header. Cookie name = ``_khub_chain_trace_<id>``,

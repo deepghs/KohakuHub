@@ -973,6 +973,20 @@ const _PROBE_RELEVANT_HEADERS = new Set([
   "www-authenticate",
 ]);
 
+function _curatedHeadersFromFetch(headers) {
+  // ``fetch`` returns a ``Headers`` instance (iterable of
+  // ``[name, value]`` pairs, names lowercased). Filter to the curated
+  // set so the timeline doesn't drown in date/server/keep-alive noise.
+  const out = {};
+  if (!headers || typeof headers.entries !== "function") return out;
+  for (const [k, v] of headers.entries()) {
+    if (_PROBE_RELEVANT_HEADERS.has(k.toLowerCase())) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 function _curatedHeaders(rawHeaders) {
   // axios normalizes header keys to lowercase in browsers (XHR
   // ``getAllResponseHeaders`` returns lowercase). We filter to the
@@ -1119,7 +1133,18 @@ function _readProbeCookie(probeId) {
   const match = document.cookie.match(
     new RegExp(`(?:^|;\\s*)${name}=([^;]+)`),
   );
-  return match ? match[1] : null;
+  if (!match) return null;
+  let value = match[1];
+  // Defensive: if some upstream (Python ``http.cookies.SimpleCookie``,
+  // certain reverse proxies, or RFC-6265 quoted-pair handling) wraps
+  // the cookie value in double quotes, strip them before handing to
+  // ``atob`` — which would otherwise reject ``"`` as a non-base64
+  // character. Backend ``inject_trace_cookie`` now writes the raw
+  // header line unquoted, so this is a belt-and-suspenders guard.
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    value = value.slice(1, -1);
+  }
+  return value;
 }
 
 /**
@@ -1189,17 +1214,36 @@ export async function runFallbackProbe(req) {
   const t0 = performance.now();
   let response;
   let networkError = null;
+  // Use ``fetch`` with ``redirect: 'manual'`` instead of axios/XHR.
+  // Why:
+  //   axios uses XMLHttpRequest under the hood, which transparently
+  //   follows redirects. When the chain binds to a fallback source
+  //   (e.g. HF), the backend's 307 ``Location: https://huggingface.co/...``
+  //   triggers a *cross-origin* redirect. XHR's same-origin mode
+  //   doesn't error cleanly on this — Chrome silently drops the
+  //   request, the promise never resolves *or* rejects, and the SPA
+  //   hangs forever. ``fetch + redirect: 'manual'`` resolves
+  //   immediately on a 3xx with a filtered ``opaqueredirect`` response
+  //   (status=0, headers empty per the Fetch spec) — the *cookie* set
+  //   on the same-origin 307 is already in the cookie jar at that
+  //   point, so we just read it. For non-3xx responses (e.g. local
+  //   info LOCAL_HIT returns 200), ``redirect: 'manual'`` is
+  //   transparent and the Response is the regular ``basic`` type.
   try {
-    response = await axios.request({
-      url: target.url,
-      method: target.method,
+    let body;
+    if (target.method === "post") {
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify({ paths: req.paths || [] });
+    }
+    response = await fetch(target.url, {
+      method: target.method.toUpperCase(),
       headers,
-      // POST paths-info needs a body; other methods don't.
-      data: target.method === "post" ? { paths: req.paths || [] } : undefined,
-      // Surface 4xx/5xx as resolved promises so we can read the trace
-      // header and the error body together. Network errors / aborts
-      // still throw and we catch below.
-      validateStatus: () => true,
+      body,
+      // Don't follow — see comment above.
+      redirect: "manual",
+      // Send admin's session cookie (chain tester runs admin-only,
+      // and the local handler's permission gate inspects it).
+      credentials: "same-origin",
     });
   } catch (e) {
     networkError = e;
@@ -1207,9 +1251,8 @@ export async function runFallbackProbe(req) {
   const total_ms = Math.round(performance.now() - t0);
 
   if (networkError || !response) {
-    // No response — synthesize a single-attempt error report so the
-    // timeline still has something to render. Cookie cleanup is
-    // unnecessary here — the backend never had a chance to Set-Cookie.
+    // Genuine network failure — DNS, refused, TLS, etc. Backend
+    // never got a chance to Set-Cookie, so cookie cleanup is moot.
     return {
       final_outcome: "ERROR",
       bound_source: null,
@@ -1235,19 +1278,23 @@ export async function runFallbackProbe(req) {
     };
   }
 
-  // Two-channel pickup. Order matters:
-  // 1. Header (universal channel, always present on direct responses):
-  //    works when no redirect happened in the chain (e.g. info/tree/
-  //    paths_info LOCAL_HIT, or HEAD on local resolve).
-  // 2. Per-probe cookie (redirect-follow fallback): backend Set-Cookie
-  //    under the probe id; survives the W3C Fetch spec's
-  //    ``opaqueredirect`` filter that strips redirect-chain headers.
-  // Cookie is always cleared after pickup whether or not it was used,
-  // so document.cookie doesn't leak old trace blobs.
-  let traceValue =
-    response.headers["x-chain-trace"] ||
-    response.headers["X-Chain-Trace"] ||
-    null;
+  // Two-channel trace pickup. The Fetch spec's ``opaqueredirect``
+  // filter zeroes ``status`` and empties the headers list on
+  // redirect responses (status=0), so:
+  //   - Header (X-Chain-Trace): readable on non-redirect responses
+  //     (info/tree/paths_info LOCAL_HIT, resolve LOCAL_HIT HEAD).
+  //   - Per-probe cookie: set by the backend on the same-origin
+  //     response (alongside the 307 + Location header). Cookie is
+  //     stored regardless of redirect status — it survives the
+  //     opaqueredirect filter because it lives in the cookie jar
+  //     rather than on the response object.
+  // Cookie is cleaned up after pickup so document.cookie doesn't
+  // accumulate stale blobs.
+  const isOpaqueRedirect = response.type === "opaqueredirect";
+  let traceValue = null;
+  if (!isOpaqueRedirect) {
+    traceValue = response.headers.get("x-chain-trace");
+  }
   if (!traceValue) {
     traceValue = _readProbeCookie(probeId);
   }
@@ -1292,11 +1339,47 @@ export async function runFallbackProbe(req) {
     }
   }
 
-  const final_response = {
-    status_code: response.status,
-    headers: _curatedHeaders(response.headers),
-    body_preview: _bodyPreview(response.data),
-  };
+  // ``final_response`` shows what a production hf_hub client would
+  // see for this exact request. Two paths:
+  //   - opaqueredirect (status=0, headers empty per Fetch spec): the
+  //     response.status / response.headers are inaccessible via fetch
+  //     API, so we reconstruct from the bound hop's recorded values.
+  //     This is the binding outcome the backend reported in the
+  //     trace; a real hf_hub client would follow the redirect and
+  //     receive HF's 200, but the chain tester surfaces what the
+  //     KohakuHub layer decided + the redirect target it issued.
+  //   - basic / cors (200 etc.): regular fetch response, headers and
+  //     body readable. Stream the body once for preview.
+  let final_response;
+  if (isOpaqueRedirect) {
+    const boundHop = hops.find(
+      (h) => h.decision === "BIND_AND_RESPOND"
+              || h.decision === "BIND_AND_PROPAGATE"
+              || h.decision === "LOCAL_HIT"
+              || h.decision === "LOCAL_FILTERED"
+              || h.decision === "LOCAL_OTHER_ERROR",
+    );
+    final_response = boundHop
+      ? {
+          status_code: boundHop.status_code,
+          headers: {},  // opaqueredirect: real headers unreadable
+          body_preview:
+            "[redirect — body served by upstream after redirect-follow]",
+        }
+      : null;
+  } else {
+    let bodyText = "";
+    try {
+      bodyText = await response.text();
+    } catch (_e) {
+      bodyText = "";
+    }
+    final_response = {
+      status_code: response.status,
+      headers: _curatedHeadersFromFetch(response.headers),
+      body_preview: _bodyPreview(bodyText),
+    };
+  }
 
   return {
     final_outcome,
