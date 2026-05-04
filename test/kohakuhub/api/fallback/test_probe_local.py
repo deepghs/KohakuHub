@@ -234,3 +234,72 @@ async def test_probe_local_unsupported_op_yields_local_other_error(
     assert attempt.decision == "LOCAL_OTHER_ERROR"
     assert attempt.status_code == 500
     assert "Unsupported probe op" in (attempt.x_error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# Contract: ``_build_kwargs`` must hand a parameter set the inner
+# handler accepts, no matter how the handler signatures evolve.
+#
+# Without this, an optional-kwarg rename (e.g. ``repo_name`` → ``name``)
+# could silently break simulate at runtime — the e2e tests above only
+# catch the failure mode if the rename happens to involve a parameter
+# they exercise. The contract test below uses ``inspect.signature`` so
+# every kwarg ``_build_kwargs`` produces is verified to land somewhere
+# the handler accepts, and every required parameter the handler
+# declares is verified to be in the kwargs we pass.
+# ---------------------------------------------------------------------------
+
+
+import inspect
+
+from kohakuhub.api.fallback.core import SUPPORTED_OPS
+from kohakuhub.api.fallback.probe_local import (
+    _build_kwargs,
+    _build_synthetic_request,
+    _resolve_inner,
+)
+
+
+@pytest.mark.parametrize("op", SUPPORTED_OPS)
+def test_build_kwargs_matches_inner_handler_signature(op, backend_test_state):
+    """For every supported op, ``_build_kwargs`` must produce kwargs
+    that the inner handler accepts (no extra unknown args) and supply
+    every required parameter the handler declares (no missing ones).
+    """
+    inner = _resolve_inner(op)
+    sig = inspect.signature(inner)
+    request = _build_synthetic_request(method="GET", upstream_path="/foo")
+    kwargs = _build_kwargs(
+        op=op,
+        repo_type="model",
+        namespace="ns",
+        name="n",
+        revision="main",
+        file_path="",
+        paths=None,
+        request=request,
+        user=None,
+    )
+
+    handler_params = sig.parameters
+    # No unknown kwargs (would TypeError at call time).
+    unknown = [k for k in kwargs if k not in handler_params]
+    assert not unknown, (
+        f"_build_kwargs for op={op!r} produces kwarg(s) the handler "
+        f"doesn't accept: {unknown}"
+    )
+    # Every required handler parameter must be present in kwargs.
+    missing = [
+        name
+        for name, p in handler_params.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind not in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        )
+        and name not in kwargs
+    ]
+    assert not missing, (
+        f"_build_kwargs for op={op!r} is missing required "
+        f"handler parameter(s): {missing}"
+    )

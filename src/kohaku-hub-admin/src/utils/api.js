@@ -956,6 +956,14 @@ export function decodeChainTraceHeader(headerValue) {
   return [];
 }
 
+// Mirrored on the backend at
+// ``src/kohakuhub/api/fallback/core.py:_RELEVANT_HEADERS``. When
+// adding / removing entries here, update the backend list too. They're
+// deliberately separate copies (build-time bundle decoupling) but
+// semantically the same allowlist; small drift between the two is
+// expected (frontend has ``x-source-count`` + ``x-chain-trace``
+// because the SPA reads them; backend has ``content-length`` because
+// it forwards it). Cross-check the backend file when in doubt.
 const _PROBE_RELEVANT_HEADERS = new Set([
   "content-type",
   "etag",

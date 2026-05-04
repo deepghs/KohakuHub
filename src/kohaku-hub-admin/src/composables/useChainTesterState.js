@@ -103,3 +103,48 @@ export function resetChainTesterState() {
   realHeaderTokens.value = [];
   autoLoadDone.value = false;
 }
+
+// Vite HMR self-preservation: when this composable file (or any file
+// that imports it) is hot-edited in dev, the module is re-evaluated
+// and the singleton refs above are recreated empty — wiping any
+// pending draft / edit / token. Stash the current state in
+// ``import.meta.hot.data`` before disposal and restore it after the
+// new module loads. Production builds have no ``import.meta.hot`` so
+// this is a no-op cost.
+//
+// HMR is dev-time UX only; a real browser refresh is still meant to
+// reset state (see useChainTesterState header docstring), and a
+// logout still calls ``resetChainTesterState`` explicitly.
+// ``import.meta.hot.data`` may be ``undefined`` in some test runtimes
+// (vitest/jsdom can populate ``import.meta.hot`` itself but leave
+// ``.data`` unset until vite plugin wires it up). Guard with ``?.`` so
+// the module load never throws when HMR happens to be partially
+// stubbed.
+if (import.meta.hot) {
+  const saved = import.meta.hot.data?.chainTesterState;
+  if (saved) {
+    probeTab.value = saved.probeTab;
+    probeForm.value = saved.probeForm;
+    draftSources.value = saved.draftSources;
+    draftDirty.value = saved.draftDirty;
+    simIdentity.value = saved.simIdentity;
+    simHeaderTokens.value = saved.simHeaderTokens;
+    realKhubToken.value = saved.realKhubToken;
+    realHeaderTokens.value = saved.realHeaderTokens;
+    autoLoadDone.value = saved.autoLoadDone;
+  }
+  import.meta.hot.dispose?.((data) => {
+    if (!data) return;
+    data.chainTesterState = {
+      probeTab: probeTab.value,
+      probeForm: probeForm.value,
+      draftSources: draftSources.value,
+      draftDirty: draftDirty.value,
+      simIdentity: simIdentity.value,
+      simHeaderTokens: simHeaderTokens.value,
+      realKhubToken: realKhubToken.value,
+      realHeaderTokens: realHeaderTokens.value,
+      autoLoadDone: autoLoadDone.value,
+    };
+  });
+}

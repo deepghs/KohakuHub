@@ -776,14 +776,18 @@ def _apply_user_tokens(
 
 
 def _annotate_local_kind(report: dict) -> dict:
-    """Tag each attempt with ``kind`` ("local" or "fallback") for the UI.
+    """Backstop for ``kind`` on each attempt.
 
-    ``ProbeAttempt`` doesn't carry ``kind`` itself — local attempts
-    have ``source_type="local"`` (set by ``probe_local``), so we
-    transcribe that here at the API boundary instead of changing the
-    dataclass shape and forcing every existing caller to update.
+    ``ProbeAttempt`` carries ``kind`` itself now (defaults to
+    ``"fallback"``; ``probe_local`` sets ``"local"`` explicitly), so
+    this is a no-op for v3+ probes. Kept as a defensive backstop in
+    case a future caller constructs a ``ProbeAttempt`` without the
+    field — fills it from ``source_type == "local"`` to keep the UI
+    contract intact.
     """
     for att in report.get("attempts", []):
+        if att.get("kind"):
+            continue
         att["kind"] = "local" if att.get("source_type") == "local" else "fallback"
     return report
 

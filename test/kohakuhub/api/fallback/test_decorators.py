@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import httpx
 from types import SimpleNamespace
 
 from fastapi import HTTPException
@@ -1156,6 +1157,75 @@ async def test_trace_local_other_error_httpexception_carries_header(monkeypatch)
     hops = json.loads(decoded)["hops"]
     assert hops[0]["decision"] == "LOCAL_OTHER_ERROR"
     assert hops[0]["status_code"] == 500
+
+
+@pytest.mark.asyncio
+async def test_trace_local_handler_raises_generic_exception_emits_trace(monkeypatch):
+    """Production path #2: LakeFS / DB / generic exception from the
+    inner handler must NOT propagate before the trace is recorded.
+    Pre-fix the decorator only caught HTTPException, so any other
+    raised type (httpx.ReadTimeout from LakeFS, peewee
+    OperationalError, etc.) skipped record_local_hop entirely and
+    surfaced as an unannotated 500 with no X-Chain-Trace.
+
+    Now: catch generic Exception, record LOCAL_OTHER_ERROR, re-raise
+    as 500 with the trace gated on probe_id presence (same auth
+    contract as every other emission path).
+    """
+
+    async def fail(*_a, **_k):
+        raise AssertionError("fallback must NOT run on generic exception")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_info", fail)
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        raise httpx.ReadTimeout("synthetic LakeFS timeout")
+
+    with pytest.raises(HTTPException) as exc:
+        await handler(
+            repo_type="model", namespace="owner", name="demo",
+            request=_request("/api/models/owner/demo"),
+        )
+    assert exc.value.status_code == 500
+    headers = exc.value.headers or {}
+    trace_header = headers.get("X-Chain-Trace") or headers.get("x-chain-trace")
+    assert trace_header, (
+        "X-Chain-Trace must ride on the 500 response so the chain "
+        "tester can still see what went wrong"
+    )
+    decoded = base64.b64decode(trace_header).decode("utf-8")
+    hops = json.loads(decoded)["hops"]
+    assert hops[0]["decision"] == "LOCAL_OTHER_ERROR"
+    assert hops[0]["status_code"] == 500
+    assert "ReadTimeout" in (hops[0]["x_error_message"] or "")
+
+
+@pytest.mark.asyncio
+async def test_trace_local_handler_raises_no_trace_without_probe_id(monkeypatch):
+    """Anonymous caller hitting a generic exception still gets a 500
+    but with NO X-Chain-Trace (auth gate stays in place even on the
+    error path)."""
+
+    async def fail(*_a, **_k):
+        raise AssertionError("fallback must NOT run on generic exception")
+
+    monkeypatch.setattr(fallback_decorators, "try_fallback_info", fail)
+
+    @fallback_decorators.with_repo_fallback("info")
+    async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
+        raise RuntimeError("boom")
+
+    with pytest.raises(HTTPException) as exc:
+        await handler(
+            repo_type="model", namespace="owner", name="demo",
+            request=_request("/api/models/owner/demo", probe_id=None),
+        )
+    assert exc.value.status_code == 500
+    headers = exc.value.headers or {}
+    assert headers.get("X-Chain-Trace") is None
+    assert headers.get("x-chain-trace") is None
+    assert headers.get("Set-Cookie") is None
 
 
 @pytest.mark.asyncio

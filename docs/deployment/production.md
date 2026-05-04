@@ -27,6 +27,30 @@ server {
     server_name hub.yourdomain.com;
     ssl_certificate /path/to/cert.pem;
     ssl_certificate_key /path/to/key.pem;
+
+    # Forward every KohakuHub path to the backend. The hf_hub-compatible
+    # public URLs (no /api prefix) MUST be reachable at the root since
+    # huggingface_hub clients hit them directly:
+    #   /<repo_type>s/<ns>/<name>/resolve/<rev>/<path>   (HEAD/GET file)
+    #   /<repo_type>s/<ns>/<name>/tree/<rev>/...         (list files)
+    #   /<ns>/<name>/resolve/...                         (model default)
+    # The chain tester in the admin SPA exercises these same routes
+    # (see src/kohaku-hub-admin/vite.config.js for the dev-mode mirror)
+    # so misconfigured nginx → CHAIN_EXHAUSTED on every probe.
+    location / {
+        proxy_pass http://kohakuhub-backend:48888;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Admin SPA static bundle — path-prefixed under /admin so it
+    # coexists with the hf_hub-compat root paths.
+    location /admin/ {
+        alias /var/www/kohakuhub-admin/;
+        try_files $uri $uri/ /admin/index.html;
+    }
 }
 ```
 

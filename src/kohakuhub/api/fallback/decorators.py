@@ -134,6 +134,16 @@ def _attach_trace_to_result(
 
     No-ops on empty ``hops`` or missing ``probe_id`` so the function
     is safe to call unconditionally at the decorator's exit.
+
+    .. warning::
+
+        The dict / list path wraps the return in ``JSONResponse``
+        which **bypasses FastAPI's** ``response_model`` validation.
+        None of the current ``with_repo_fallback``-decorated routes
+        use ``response_model``, so this is latent. If you ever add
+        ``response_model=`` to a fallback-decorated route, audit
+        this wrap — you'll lose the schema-coercion side-effect of
+        FastAPI's auto-conversion.
     """
     if not hops or not probe_id:
         return result
@@ -341,6 +351,51 @@ def with_repo_fallback(operation: OperationType):
                     f"(X-Error-Code={x_code or 'none'}), trying "
                     f"fallback sources..."
                 )
+
+            except (asyncio.CancelledError, GeneratorExit):
+                # Cooperative cancellation must propagate cleanly so the
+                # ASGI event loop can tear down the request — never
+                # swallow these. No trace recorded (the request itself
+                # is being aborted; the chain tester won't see this
+                # response anyway).
+                raise
+
+            except Exception as e:
+                # Generic exception from the local handler (LakeFS
+                # ``httpx.ReadTimeout``, peewee ``OperationalError``,
+                # AssertionError from a stale dev branch, etc.).
+                # Without this branch the exception propagates before
+                # ``record_local_hop`` runs, so the chain tester sees
+                # nothing useful and the production wire surfaces an
+                # unannotated 500 — defeating the universal-debug
+                # claim of the trace channel. Record the hop as
+                # LOCAL_OTHER_ERROR and re-raise as a 500 carrying
+                # the trace (gated on probe_id like every other
+                # emission path; anonymous callers still see the
+                # original exception's effect via FastAPI's default
+                # 500 response).
+                local_dt_ms = int((time.monotonic() - local_t0) * 1000)
+                err_msg = f"{type(e).__name__}: {e}"
+                logger.exception(
+                    f"Local handler raised {type(e).__name__} for "
+                    f"{repo_type}/{namespace}/{name}"
+                )
+                record_local_hop(
+                    decision="LOCAL_OTHER_ERROR",
+                    status_code=500,
+                    x_error_code=None,
+                    x_error_message=err_msg,
+                    duration_ms=local_dt_ms,
+                    error=err_msg,
+                )
+                new_headers = inject_trace_into_exception_headers(
+                    None, hops, probe_id,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={"error": "Internal server error in local handler"},
+                    headers=new_headers,
+                ) from e
 
             # If we got here, we have a 404 - try fallback
             if is_404:

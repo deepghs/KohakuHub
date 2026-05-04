@@ -103,7 +103,6 @@ def _build_synthetic_request(
     *,
     method: str,
     upstream_path: str,
-    user_token_overlay: dict[str, str],
 ) -> SimpleNamespace:
     """Construct the minimum Request shape the inner handlers consume.
 
@@ -113,12 +112,23 @@ def _build_synthetic_request(
     Any handler reaching for something else will surface as a clean
     AttributeError that the simulate endpoint reports as
     ``LOCAL_OTHER_ERROR``.
+
+    ``state.external_tokens`` is hard-coded empty: local handlers in
+    this codebase don't read it (it's the fallback decorator's
+    private channel for forwarding ``Bearer xxx|url,token|...``
+    overrides into the chain). The simulate endpoint *does* compute a
+    per-user token overlay (see ``_resolve_user_token_overlay`` in
+    ``admin/routers/fallback.py``) but applies it only to the
+    fallback source list — never to the local probe — which matches
+    the production split. Wired this way intentionally rather than
+    plumbed-but-empty-on-the-call-site so a future reader doesn't
+    misread the shape.
     """
     return SimpleNamespace(
         method=method,
         url=SimpleNamespace(path=upstream_path),
         query_params={},
-        state=SimpleNamespace(external_tokens=user_token_overlay or {}),
+        state=SimpleNamespace(external_tokens={}),
     )
 
 
@@ -226,13 +236,7 @@ def _attempt_from_response(
     x_error_message: Optional[str],
     body_preview: Optional[str],
 ) -> ProbeAttempt:
-    """Build a ``ProbeAttempt`` for a local hop with the canonical kind=local shape.
-
-    ``ProbeAttempt`` is a dataclass without a ``kind`` field — we add
-    it via ``to_dict`` post-processing in the simulate endpoint so
-    older callers stay backwards-compatible. Here we only populate
-    the fields ``ProbeAttempt`` declares.
-    """
+    """Build a ``ProbeAttempt`` for a local hop with ``kind="local"``."""
     duration_ms = int((time.perf_counter() - started) * 1000)
     return ProbeAttempt(
         source_name="local",
@@ -248,6 +252,7 @@ def _attempt_from_response(
         error=None,
         response_body_preview=body_preview,
         response_headers={},
+        kind="local",
     )
 
 
@@ -301,12 +306,12 @@ async def probe_local(
             error=str(e),
             response_body_preview=None,
             response_headers={},
+            kind="local",
         )
 
     request = _build_synthetic_request(
         method=method,
         upstream_path=upstream_path,
-        user_token_overlay={},
     )
 
     kwargs = _build_kwargs(
@@ -350,6 +355,7 @@ async def probe_local(
             error=f"{type(e).__name__}: {e}",
             response_body_preview=None,
             response_headers={},
+            kind="local",
         )
 
     # Result is a Response object (JSONResponse / Response) or a dict / list.

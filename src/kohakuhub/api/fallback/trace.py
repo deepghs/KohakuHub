@@ -84,6 +84,19 @@ COOKIE_MAX_AGE_SECONDS = 300
 # generated tokens. Anything else gets dropped to ``None`` so a
 # malicious / malformed probe id can't inject an extra Set-Cookie line
 # or expand into an unbounded cookie name.
+#
+# Examples — accepted:
+#     "d6d1f117-2977-4101-af89-caddb11ef394"  (uuid v4)
+#     "abc-123_def"                            (alphanumerics + - _)
+#     "a"                                       (single char)
+#
+# Examples — rejected (sanitize_probe_id returns None):
+#     "abc;def=evil"           (cookie-attribute injection)
+#     "abc def"                (whitespace)
+#     "abc,def"                (comma)
+#     "abc\nSet-Cookie:x=y"    (CRLF injection)
+#     "x" * 65                  (over the 64-char cap)
+#     ""                        (empty)
 _PROBE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 

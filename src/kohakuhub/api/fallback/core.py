@@ -58,6 +58,12 @@ _BODY_PREVIEW_LIMIT = 4096
 
 # Curated headers worth surfacing in the UI per attempt — the rest are
 # internal CDN bookkeeping not useful for a chain-debug timeline.
+#
+# Mirrored on the frontend at
+# ``src/kohaku-hub-admin/src/utils/api.js:_PROBE_RELEVANT_HEADERS``.
+# When adding / removing entries here, update the frontend list too;
+# they're deliberately separate (build-time bundle decoupling) but
+# semantically the same allowlist.
 _RELEVANT_HEADERS = {
     "content-type",
     "content-length",
@@ -112,6 +118,11 @@ class ProbeAttempt:
     ``decision`` is a string-name version of ``FallbackDecision`` plus
     transport-failure outcomes (``NETWORK_ERROR`` / ``TIMEOUT``).
 
+    ``kind`` distinguishes the local probe from fallback-source probes
+    so the chain-tester UI can render the timeline with the correct
+    badge per hop. Defaults to ``"fallback"``; the local-hop builder
+    in ``probe_local`` sets ``"local"`` explicitly.
+
     ``response_body_preview`` is the first ``_BODY_PREVIEW_LIMIT`` bytes
     of the upstream's response body, decoded as UTF-8 when possible.
     ``response_headers`` is a curated subset (see ``_RELEVANT_HEADERS``).
@@ -132,6 +143,7 @@ class ProbeAttempt:
     error: Optional[str]
     response_body_preview: Optional[str] = None
     response_headers: dict = field(default_factory=dict)
+    kind: str = "fallback"
 
     def to_dict(self) -> dict:
         return asdict(self)
