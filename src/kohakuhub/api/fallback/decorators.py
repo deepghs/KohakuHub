@@ -109,33 +109,37 @@ def _attach_trace_to_result(
     hops: list[dict],
     probe_id: Optional[str] = None,
 ) -> Any:
-    """Return ``result`` with ``X-Chain-Trace`` injected if applicable.
+    """Return ``result`` with ``X-Chain-Trace`` + cookie injected — only
+    when the caller is the chain tester (``X-Khub-Probe-Id`` header on
+    the inbound request).
+
+    Auth gating rationale: the encoded hop list reveals every fallback
+    source's name + URL, which is operator-internal topology data. An
+    earlier draft of this PR emitted the header on every fallback-
+    decorated response; that was a regression vs the pre-#78 wire
+    because anonymous callers could decode it and enumerate the
+    operator's mirror config. Now we treat the header as chain-tester
+    opt-in: no probe id ⇒ no trace on the wire (the ContextVar is
+    still populated for in-process logs / telemetry, just not emitted).
 
     - ``Response`` (or subclass like ``JSONResponse``) → mutate
-      ``response.headers`` and return as-is.
-    - dict / list / etc. → wrap in a fresh ``JSONResponse`` carrying the
-      trace header. We use ``jsonable_encoder`` to mirror FastAPI's
+      ``response.headers`` to add ``X-Chain-Trace`` + ``Set-Cookie``,
+      return as-is.
+    - dict / list / etc. → wrap in a fresh ``JSONResponse`` carrying
+      both. We use ``jsonable_encoder`` to mirror FastAPI's
       auto-conversion path so non-JSON-native types (datetime, UUID,
       etc.) survive.
-    - ``None`` → unchanged (FastAPI emits a 200 with no body; nothing to
-      attach).
+    - ``None`` → unchanged (FastAPI emits a 200 with no body; nothing
+      to attach).
 
-    When ``probe_id`` is supplied (chain-tester opt-in via the
-    ``X-Khub-Probe-Id`` request header), additionally set a per-probe
-    Set-Cookie carrying the same encoded trace — that's the channel
-    the SPA reads after a redirect-follow, since the browser strips
-    redirect-chain response headers from JS per the Fetch spec. See
-    ``trace.inject_trace_cookie`` for the rationale.
-
-    No-ops on empty ``hops`` so the function is safe to call
-    unconditionally at the decorator's exit.
+    No-ops on empty ``hops`` or missing ``probe_id`` so the function
+    is safe to call unconditionally at the decorator's exit.
     """
-    if not hops:
+    if not hops or not probe_id:
         return result
     if isinstance(result, Response):
         inject_trace_header(result, hops)
-        if probe_id:
-            inject_trace_cookie(result, hops, probe_id)
+        inject_trace_cookie(result, hops, probe_id)
         return result
     if result is None:
         return result
@@ -143,8 +147,7 @@ def _attach_trace_to_result(
         content=jsonable_encoder(result),
         headers={X_CHAIN_TRACE: encode_trace_header(hops)},
     )
-    if probe_id:
-        inject_trace_cookie(response, hops, probe_id)
+    inject_trace_cookie(response, hops, probe_id)
     return response
 
 

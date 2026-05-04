@@ -48,12 +48,25 @@ def _request(
     method: str = "GET",
     query: dict[str, str] | None = None,
     external_tokens: dict[str, str] | None = None,
+    probe_id: str | None = "test-probe",
 ):
+    """Synthetic Request stand-in.
+
+    Defaults to sending an ``X-Khub-Probe-Id`` header so the trace-
+    emission path runs in the most-common test mode (chain tester is
+    the primary consumer of X-Chain-Trace; production-anonymous
+    callers shouldn't see it). Pass ``probe_id=None`` explicitly to
+    test the anonymous (no-trace) path.
+    """
+    headers: dict[str, str] = {}
+    if probe_id is not None:
+        headers["X-Khub-Probe-Id"] = probe_id
     return SimpleNamespace(
         method=method,
         url=SimpleNamespace(path=path),
         query_params=query or {},
         state=SimpleNamespace(external_tokens=external_tokens or {}),
+        headers=headers,
     )
 
 
@@ -783,11 +796,16 @@ async def test_trace_cookie_set_when_probe_id_header_present(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_trace_cookie_NOT_set_when_probe_id_header_absent(monkeypatch):
-    """No probe id → only X-Chain-Trace header, no Set-Cookie. Avoids
-    paying the extra bytes + cookie-jar pollution for ordinary
-    business clients (curl, hf_hub) that don't need the pickup
-    channel."""
+async def test_trace_NOT_emitted_when_probe_id_header_absent(monkeypatch):
+    """Anonymous caller (no ``X-Khub-Probe-Id``) → neither
+    ``X-Chain-Trace`` header nor ``Set-Cookie``. Encoded hops contain
+    fallback ``source_url`` + ``source_name`` which is operator-
+    internal topology data — emitting it on every fallback-decorated
+    response (the early draft of #78) was an info-disclosure
+    regression caught in PR review. Trace emission is now
+    chain-tester opt-in: probe id ⇒ both channels active, no probe
+    id ⇒ neither (the in-process ContextVar is still populated for
+    server-side logging, just not put on the wire)."""
 
     @fallback_decorators.with_repo_fallback("info")
     async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
@@ -797,7 +815,8 @@ async def test_trace_cookie_NOT_set_when_probe_id_header_absent(monkeypatch):
     result = await handler(
         repo_type="model", namespace="owner", name="demo", request=request,
     )
-    assert result.headers.get("x-chain-trace")  # universal channel still set
+    assert result.headers.get("x-chain-trace") is None
+    assert result.headers.get("X-Chain-Trace") is None
     assert (
         result.headers.get("set-cookie") is None
         and result.headers.get("Set-Cookie") is None
@@ -831,10 +850,14 @@ async def test_trace_cookie_concurrent_probes_get_distinct_names(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_trace_cookie_rejects_unsafe_probe_id(monkeypatch):
-    """A malicious probe id with cookie-name-illegal characters
-    (semicolons, equals, whitespace, comma) must NOT inject a
-    Set-Cookie line. ``sanitize_probe_id`` rejects → no cookie."""
+async def test_trace_rejects_unsafe_probe_id(monkeypatch):
+    """A malicious probe id with cookie-name-illegal characters must
+    NOT produce *any* trace output: ``sanitize_probe_id`` returns
+    None, the request is treated as anonymous, neither X-Chain-Trace
+    nor Set-Cookie is emitted. (Pre-fix, X-Chain-Trace was still
+    emitted on the assumption that "trace header is universal" — but
+    that exposed source URLs to anonymous callers, which is the
+    info-disclosure regression we now block.)"""
 
     @fallback_decorators.with_repo_fallback("info")
     async def handler(repo_type, namespace, name, request=None, fallback: bool = True, user=None):
@@ -853,7 +876,9 @@ async def test_trace_cookie_rejects_unsafe_probe_id(monkeypatch):
             repo_type="model", namespace="owner", name="demo",
             request=_request_with_probe_id("/api/models/owner/demo", bad),
         )
-        assert result.headers.get("x-chain-trace")  # header still set
+        assert result.headers.get("x-chain-trace") is None, (
+            f"unsafe probe id {bad!r} must not produce X-Chain-Trace"
+        )
         assert (
             result.headers.get("set-cookie") is None
             and result.headers.get("Set-Cookie") is None

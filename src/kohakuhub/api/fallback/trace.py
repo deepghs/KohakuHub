@@ -276,23 +276,23 @@ def inject_trace_into_exception_headers(
     hops: list[dict],
     probe_id: Optional[str] = None,
 ) -> dict:
-    """Build a headers dict for an ``HTTPException`` re-raise.
+    """Build a headers dict for an ``HTTPException`` re-raise, gated on
+    the caller having sent ``X-Khub-Probe-Id``.
 
-    ``HTTPException`` carries a flat ``headers`` mapping. To attach the
-    chain trace to a non-200 path we need to copy + extend it before
-    re-raising.
-
-    When ``probe_id`` is supplied, also append a ``Set-Cookie`` line so
-    the chain tester can pick the trace up from ``document.cookie`` —
-    see ``inject_trace_cookie`` for the redirect-follow rationale.
+    ``HTTPException`` carries a flat ``headers`` mapping. The chain
+    tester reads the trace from the re-raised exception's headers, so
+    we attach ``X-Chain-Trace`` plus a per-probe ``Set-Cookie`` only
+    when ``probe_id`` is present — same auth gate the success path
+    uses (see ``_attach_trace_to_result``). Without the gate, an
+    anonymous caller hitting an error path could decode the chain
+    config from the header.
     """
     out = dict(exc_headers or {})
-    if hops:
+    sanitized = sanitize_probe_id(probe_id)
+    if hops and sanitized:
         encoded = encode_trace_header(hops)
         out[X_CHAIN_TRACE] = encoded
-        sanitized = sanitize_probe_id(probe_id)
-        if sanitized:
-            out["Set-Cookie"] = _build_trace_cookie_value(sanitized, encoded)
+        out["Set-Cookie"] = _build_trace_cookie_value(sanitized, encoded)
     return out
 
 
