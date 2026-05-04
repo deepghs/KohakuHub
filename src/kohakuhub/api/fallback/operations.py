@@ -155,7 +155,13 @@ def _propagate_upstream_redirect(
     # Presigned redirects expire — never let an intermediary cache a
     # response whose target URL has a baked-in deadline.
     headers["cache-control"] = "no-store"
-    strip_xet_response_headers(headers)
+    # NOTE: the explicit four-key whitelist above (etag / x-repo-commit
+    # / x-linked-etag / x-linked-size) plus location / cache-control is
+    # the actual Xet-leak defense — none of those keys can collide with
+    # ``x-xet-*``, so a defensive ``strip_xet_response_headers`` here
+    # would be a guaranteed no-op. The contract is enforced by the
+    # whitelist; ``test_try_fallback_resolve_get_redirect_drops_xet_headers_from_upstream``
+    # locks it at the response surface.
     headers.update(add_source_headers(response, source["name"], source["url"]))
     return Response(
         status_code=response.status_code,
@@ -647,6 +653,22 @@ async def _resolve_one_source(
     )
 
     if method == "HEAD":
+        # Asymmetry-by-design vs. the GET path below: HEAD does NOT
+        # forward ``client_headers`` upstream. Two reasons —
+        #   1) ``huggingface_hub`` HEAD-on-resolve never carries Range;
+        #      partial-content semantics are a GET-only concern.
+        #   2) ``apply_resolve_head_postprocess`` fires its own
+        #      follow-HEAD with ``Accept-Encoding: identity`` to keep
+        #      Content-Length intact (PR #21 — gzip auto-decompression
+        #      in httpx silently strips Content-Length and breaks
+        #      hf_hub's post-download size check). Forwarding a
+        #      client-supplied ``Accept-Encoding: gzip`` upstream
+        #      would re-engage that bug.
+        # If you need ``If-None-Match`` 304 short-circuit on HEAD,
+        # plumb a NARROWER whitelist into the binding HEAD probe ONLY
+        # — never into the follow-HEAD inside the postprocess.
+        # ``test_try_fallback_resolve_head_does_not_forward_client_headers``
+        # is the regression-guard.
         return await _build_resolve_head_response(response, source, client)
 
     # GET phase. Once HEAD has bound this source we are committed:

@@ -3238,3 +3238,141 @@ async def test_try_fallback_resolve_get_inline_200_still_returns_body(monkeypatc
     # when the response happens to be a direct 200.
     get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
     assert get_calls[0][3].get("follow_redirects") is False
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_redirect_drops_xet_headers_from_upstream(monkeypatch):
+    """Plan A redirect-passthrough must NOT leak ``x-xet-*`` headers
+    upstream might attach. The output is built from an explicit
+    six-key whitelist (``etag`` / ``x-repo-commit`` / ``x-linked-etag``
+    / ``x-linked-size`` / ``location`` / ``cache-control``), so any
+    Xet-shaped key on the upstream response must not survive — even
+    if the (defensive) ``strip_xet_response_headers`` call is later
+    removed as redundant. This test locks the contract at the
+    response surface so that refactor stays safe."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            302,
+            headers={
+                "location": "https://cas-bridge.xethub.hf.co/object?sig=xyz",
+                "etag": '"deadbeef"',
+                "x-repo-commit": "abc123",
+                "x-linked-size": "1519984962",
+                # Hostile / accidental upstream headers we must drop.
+                "x-xet-cas-url": "https://cas.xethub.hf.co",
+                "x-xet-hash": "shardhash",
+                "x-xet-cas-uid": "public",
+                "x-xet-something-future": "still-dropped",
+            },
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors", method="GET",
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://cas-bridge.xethub.hf.co/object?sig=xyz"
+    # Whitelist survivors.
+    assert response.headers["etag"] == '"deadbeef"'
+    assert response.headers["x-repo-commit"] == "abc123"
+    assert response.headers["x-linked-size"] == "1519984962"
+    # Xet hints must NOT be present — this enforces the contract at
+    # the OUTPUT regardless of how the curation logic is implemented.
+    lower_keys = {k.lower() for k in response.headers.keys()}
+    assert not any(k.startswith("x-xet-") for k in lower_keys), (
+        f"x-xet-* headers leaked into redirect response: "
+        f"{[k for k in lower_keys if k.startswith('x-xet-')]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_head_does_not_forward_client_headers(monkeypatch):
+    """HEAD path is intentionally asymmetric with GET on header
+    forwarding: ``client.head`` is invoked WITHOUT ``client_headers``.
+    Two reasons (kept here as the regression-guard for the next
+    refactor that's tempted to "make HEAD symmetric"):
+
+      1) ``huggingface_hub`` HEAD-on-resolve never carries Range — the
+         metadata probe is positional, partial-content semantics are a
+         GET-only concern.
+      2) ``apply_resolve_head_postprocess`` fires its own follow-HEAD
+         with ``Accept-Encoding: identity`` deliberately set so httpx
+         doesn't auto-decompress and silently strip Content-Length
+         (PR #21). Forwarding a client-supplied ``Accept-Encoding:
+         gzip`` upstream would re-engage that bug.
+
+    If a future PR wants ``If-None-Match`` 304 short-circuit on HEAD,
+    the right fix is a NARROWER whitelist forwarded to the binding
+    HEAD probe ONLY — never to the follow-HEAD inside
+    apply_resolve_head_postprocess. This test fails loudly if that
+    boundary is crossed (any client header reaches the binding
+    HEAD probe)."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "HEAD",
+        path,
+        _content_response(
+            302,
+            headers={
+                "location": "https://cas-bridge.xethub.hf.co/object?sig=xyz",
+                "x-linked-size": "1519984962",
+                "x-linked-etag": '"deadbeef"',
+                "x-repo-commit": "abc123",
+            },
+        ),
+    )
+
+    await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors",
+        method="HEAD",
+        # Caller passes everything — Range, conditional, even
+        # Authorization (which the operations-layer filter normally
+        # drops anyway). The HEAD probe must receive none of it.
+        client_headers={
+            "Range": "bytes=0-100000",
+            "If-None-Match": '"abc"',
+            "Authorization": "Bearer secret",
+        },
+    )
+
+    head_calls = [c for c in FakeFallbackClient.calls if c[1] == "HEAD"]
+    assert len(head_calls) == 1
+    head_kwargs = head_calls[0][3]
+    # Two equivalent guards:
+    # (a) ``headers`` kwarg either absent or empty/None — the call
+    #     site does ``await client.head(kohaku_path, repo_type)`` with
+    #     no extra args.
+    fwd_headers = head_kwargs.get("headers") or {}
+    assert not fwd_headers, (
+        f"HEAD probe leaked client headers: {dict(fwd_headers)}. "
+        f"See PR #21 — Accept-Encoding propagation breaks Content-Length."
+    )
+    # (b) Specifically none of the whitelist or auth headers may
+    #     appear, even if a future implementation refactors how the
+    #     ``headers`` kwarg is shaped.
+    fwd_lower = {k.lower(): v for k, v in fwd_headers.items()}
+    for forbidden in ("range", "if-none-match", "authorization"):
+        assert forbidden not in fwd_lower
