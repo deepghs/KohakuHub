@@ -632,3 +632,213 @@ def test_aggregate_disabled_loses_to_gated_repo():
     assert resp.status_code == 401
     assert resp.headers.get("x-error-code") == "GatedRepo"
 
+
+# ===========================================================================
+# apply_resolve_head_postprocess (#78 v3): the production HEAD-on-resolve
+# response shaping, extracted into utils.py so the chain-tester probe
+# can reuse it for byte-identical fidelity.
+# ===========================================================================
+
+
+from kohakuhub.api.fallback.utils import apply_resolve_head_postprocess
+
+
+def _httpx_response(
+    status: int,
+    *,
+    headers: dict | None = None,
+    body: bytes = b"",
+    request_url: str = "https://hf.example/api/path",
+) -> httpx.Response:
+    """Build a stand-in ``httpx.Response`` with the request URL bound.
+
+    The postprocess uses ``response.request.url`` for the urljoin
+    base, so we have to wire that up properly — bare ``httpx.Response``
+    construction without a request leaves it ``None``.
+    """
+    req = httpx.Request("HEAD", request_url)
+    return httpx.Response(
+        status_code=status,
+        headers=headers or {},
+        content=body,
+        request=req,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_postprocess_rewrites_relative_location_to_absolute():
+    """HF returns 307 with a relative ``Location`` like
+    ``/api/resolve-cache/...`` that only resolves on the HF origin.
+    Postprocess must rewrite it to absolute against the upstream URL
+    so a downstream client can follow it."""
+    upstream_resp = _httpx_response(
+        307,
+        headers={
+            "location": "/api/resolve-cache/models/x/y/sha/config.json",
+            "x-linked-size": "12345",  # LFS — skips follow-HEAD branch
+        },
+        request_url="https://huggingface.co/models/x/y/resolve/main/config.json",
+    )
+    out = await apply_resolve_head_postprocess(
+        upstream_resp, {"name": "HF", "url": "https://huggingface.co"},
+    )
+    assert (
+        out["location"]
+        == "https://huggingface.co/api/resolve-cache/models/x/y/sha/config.json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_postprocess_skips_follow_head_for_lfs():
+    """LFS files carry ``X-Linked-Size``; hf_hub prefers that over
+    Content-Length and PR #21's follow-HEAD is unnecessary. Postprocess
+    must skip the follow to avoid a wasted upstream HEAD."""
+    follow_called = []
+
+    class _SpyClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, *a, **k):  # pragma: no cover — must NOT run
+            follow_called.append((a, k))
+            raise AssertionError("follow HEAD must not run for LFS")
+
+    upstream_resp = _httpx_response(
+        307,
+        headers={
+            "location": "https://cdn-lfs.example/path",
+            "x-linked-size": "12345",
+        },
+        request_url="https://huggingface.co/models/x/y/resolve/main/big.bin",
+    )
+    out = await apply_resolve_head_postprocess(
+        upstream_resp, {"name": "HF", "url": "https://huggingface.co"},
+    )
+    assert follow_called == []
+    # X-Source* still added, xet stripped.
+    assert out.get("X-Source") == "HF"
+
+
+@pytest.mark.asyncio
+async def test_resolve_postprocess_runs_follow_head_for_non_lfs(monkeypatch):
+    """Non-LFS 307 (no X-Linked-Size) → follow-HEAD against the
+    rewritten Location to backfill real Content-Length / ETag /
+    X-Repo-Commit. PR #21 fix; without it hf_hub trusts the redirect
+    body's bogus Content-Length and fails a download consistency check.
+    """
+    captured_url = []
+
+    class _MockAsyncClient:
+        def __init__(self, *a, **k):
+            self.timeout = k.get("timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, *, headers=None, follow_redirects=False):
+            captured_url.append(url)
+            return httpx.Response(
+                200,
+                headers={
+                    "content-length": "999999",
+                    "etag": '"real-etag"',
+                    "x-repo-commit": "real-sha",
+                },
+            )
+
+    monkeypatch.setattr(
+        "kohakuhub.api.fallback.utils.httpx.AsyncClient", _MockAsyncClient
+    )
+
+    upstream_resp = _httpx_response(
+        307,
+        headers={
+            "location": "/api/resolve-cache/models/x/y/sha/config.json",
+            "content-length": "278",  # bogus redirect body length
+            "etag": '"redirect-etag"',
+        },
+        request_url="https://huggingface.co/models/x/y/resolve/main/config.json",
+    )
+    out = await apply_resolve_head_postprocess(
+        upstream_resp, {"name": "HF", "url": "https://huggingface.co"},
+    )
+    # Follow-HEAD ran against the rewritten absolute Location.
+    assert captured_url == [
+        "https://huggingface.co/api/resolve-cache/models/x/y/sha/config.json"
+    ]
+    # Real values from follow-HEAD overwrote the redirect-body bogus ones.
+    assert out.get("content-length") == "999999"
+    assert out.get("etag") == '"real-etag"'
+    assert out.get("x-repo-commit") == "real-sha"
+
+
+@pytest.mark.asyncio
+async def test_resolve_postprocess_swallows_follow_head_failure(monkeypatch):
+    """If the follow-HEAD itself errors (network / timeout), postprocess
+    must return the partially-rewritten headers rather than blow up —
+    no worse than pre-PR-#21 behavior."""
+
+    class _BoomClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, *a, **k):
+            raise httpx.ConnectError("synthetic")
+
+    monkeypatch.setattr(
+        "kohakuhub.api.fallback.utils.httpx.AsyncClient", _BoomClient
+    )
+
+    upstream_resp = _httpx_response(
+        307,
+        headers={"location": "/api/resolve-cache/x/y/sha/config.json"},
+        request_url="https://hf.example/x/y/resolve/main/config.json",
+    )
+    out = await apply_resolve_head_postprocess(
+        upstream_resp, {"name": "HF", "url": "https://hf.example"},
+    )
+    # Should still get back the rewritten Location at least.
+    assert (
+        out["location"]
+        == "https://hf.example/api/resolve-cache/x/y/sha/config.json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_postprocess_strips_xet_and_adds_x_source():
+    """Universal post-processing every fallback HEAD response gets:
+    strip ``X-Xet-*`` so hf_hub stays on the classic LFS path, and
+    add ``X-Source*`` for telemetry."""
+    upstream_resp = _httpx_response(
+        200,
+        headers={
+            "x-xet-hash": "abc",
+            "x-xet-foo": "bar",
+            "etag": '"plain"',
+        },
+    )
+    out = await apply_resolve_head_postprocess(
+        upstream_resp,
+        {"name": "Mirror", "url": "https://mirror.example"},
+    )
+    assert "x-xet-hash" not in {k.lower() for k in out}
+    assert "x-xet-foo" not in {k.lower() for k in out}
+    assert out.get("X-Source") == "Mirror"
+    assert out.get("X-Source-URL") == "https://mirror.example"
+    assert out.get("X-Source-Status") == "200"
+

@@ -139,6 +139,11 @@ app.add_middleware(
         "X-Linked-Etag",
         "X-Linked-Size",
         "X-Xet-Hash",
+        # Chain trace (#78): the admin chain tester reads X-Chain-Trace
+        # from the response of a real request to render the per-hop
+        # timeline. The header carries no protocol semantics for
+        # huggingface_hub clients, which ignore unknown headers.
+        "X-Chain-Trace",
     ],
 )
 

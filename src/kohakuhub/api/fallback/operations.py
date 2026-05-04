@@ -1,9 +1,9 @@
 """Fallback operations for different endpoint types."""
 
 import asyncio
+import time
 from collections import defaultdict
 from typing import Optional
-from urllib.parse import urljoin
 
 import httpx
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -13,8 +13,10 @@ from kohakuhub.logger import get_logger
 from kohakuhub.api.fallback.cache import compute_tokens_hash, get_cache
 from kohakuhub.api.fallback.client import FallbackClient
 from kohakuhub.api.fallback.config import get_enabled_sources
+from kohakuhub.api.fallback.trace import record_source_hop
 from kohakuhub.api.fallback.utils import (
     add_source_headers,
+    apply_resolve_head_postprocess,
     build_fallback_attempt,
     build_aggregate_failure_response,
     classify_upstream,
@@ -348,6 +350,7 @@ async def _resolve_one_source(
         ``None`` if the source falls through (TRY_NEXT_SOURCE) — the
         attempt has already been appended to ``attempts``.
     """
+    head_t0 = time.monotonic()
     try:
         client = FallbackClient(
             source_url=source["url"],
@@ -356,15 +359,42 @@ async def _resolve_one_source(
         )
         response = await client.head(kohaku_path, repo_type)
     except httpx.TimeoutException as e:
+        head_dt_ms = int((time.monotonic() - head_t0) * 1000)
         logger.warning(f"Fallback source {source['name']} HEAD timed out")
         attempts.append(build_fallback_attempt(source, timeout=e))
+        record_source_hop(
+            source,
+            method="HEAD",
+            upstream_path=kohaku_path,
+            duration_ms=head_dt_ms,
+            transport_decision="TIMEOUT",
+            error=str(e) or "request timed out",
+        )
         return None
     except Exception as e:
+        head_dt_ms = int((time.monotonic() - head_t0) * 1000)
         logger.warning(f"Fallback source {source['name']} HEAD failed: {e}")
         attempts.append(build_fallback_attempt(source, network=e))
+        record_source_hop(
+            source,
+            method="HEAD",
+            upstream_path=kohaku_path,
+            duration_ms=head_dt_ms,
+            transport_decision="NETWORK_ERROR",
+            error=str(e) or type(e).__name__,
+        )
         return None
 
+    head_dt_ms = int((time.monotonic() - head_t0) * 1000)
     decision = classify_upstream(response)
+    record_source_hop(
+        source,
+        method="HEAD",
+        upstream_path=kohaku_path,
+        response=response,
+        decision=decision,
+        duration_ms=head_dt_ms,
+    )
 
     if decision is FallbackDecision.TRY_NEXT_SOURCE:
         logger.warning(
@@ -422,13 +452,23 @@ async def _resolve_one_source(
     # the user gets. Falling through to another source here is the
     # cross-source mixing bug #75 fixes (HEAD-200 at A, GET-502 at A,
     # then sneak over to B's same-named-but-different repo).
+    get_t0 = time.monotonic()
     try:
         get_response = await client.get(
             kohaku_path, repo_type, follow_redirects=True
         )
     except httpx.TimeoutException as e:
+        get_dt_ms = int((time.monotonic() - get_t0) * 1000)
         logger.warning(
             f"GET timed out at bound source {source['name']} after HEAD bind: {e}"
+        )
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            duration_ms=get_dt_ms,
+            transport_decision="TIMEOUT",
+            error=str(e) or "request timed out",
         )
         # Bound, no upstream response to forward. Synthesize a 502 from
         # this single attempt; the aggregate-failure helper already
@@ -437,12 +477,31 @@ async def _resolve_one_source(
             [build_fallback_attempt(source, timeout=e)]
         )
     except Exception as e:
+        get_dt_ms = int((time.monotonic() - get_t0) * 1000)
         logger.warning(
             f"GET failed at bound source {source['name']} after HEAD bind: {e}"
+        )
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            duration_ms=get_dt_ms,
+            transport_decision="NETWORK_ERROR",
+            error=str(e) or type(e).__name__,
         )
         return build_aggregate_failure_response(
             [build_fallback_attempt(source, network=e)]
         )
+
+    get_dt_ms = int((time.monotonic() - get_t0) * 1000)
+    record_source_hop(
+        source,
+        method="GET",
+        upstream_path=kohaku_path,
+        response=get_response,
+        decision=classify_upstream(get_response),
+        duration_ms=get_dt_ms,
+    )
 
     if get_response.status_code == 200:
         # Proxy the content with original headers, stripping the
@@ -475,89 +534,18 @@ async def _resolve_one_source(
 async def _build_resolve_head_response(
     response: httpx.Response, source: dict, client: "FallbackClient"
 ) -> Response:
-    """Build the HEAD-method response with HF-quirks handling.
+    """Build the HEAD-method response delegated to ``apply_resolve_head_postprocess``.
 
-    Two HF-specific quirks survive from the original implementation:
-
-    1. **Relative Location → absolute.** HF returns 3xx redirects with
-       paths like ``/api/resolve-cache/...`` that only resolve on the HF
-       origin. Rewriting against ``response.request.url`` keeps clients
-       following the redirect on the upstream rather than bouncing it
-       back to KohakuHub.
-    2. **Extra HEAD on non-LFS 3xx for Content-Length/ETag.** HF's 307
-       on a small file carries the redirect body's Content-Length
-       (~278B), not the file's. Without ``X-Linked-Size`` the hf_hub
-       client trusts that bogus Content-Length and fails its
-       post-download consistency check (observed in
-       ``imgutils.get_wd14_tags`` on ``selected_tags.csv``). A second
-       HEAD against the rewritten Location picks up the real values.
-       LFS files already carry ``X-Linked-Size``; hf_hub prefers it
-       over Content-Length so we skip the follow there.
+    The actual Location-rewrite + non-LFS follow-HEAD + xet-strip +
+    X-Source* logic now lives in ``utils.apply_resolve_head_postprocess``
+    so the chain-tester ``probe_chain`` can reuse the same code path
+    for byte-identical fidelity (#78 v3).
     """
-    resp_headers = dict(response.headers)
-    location = resp_headers.get("location") or resp_headers.get("Location")
-    if location:
-        upstream_url = str(response.request.url)
-        absolute_location = urljoin(upstream_url, location)
-        for k in list(resp_headers.keys()):
-            if k.lower() == "location":
-                resp_headers.pop(k, None)
-        resp_headers["location"] = absolute_location
-
-    if (
-        300 <= response.status_code < 400
-        and location
-        and not any(k.lower() == "x-linked-size" for k in resp_headers)
-    ):
-        try:
-            async with httpx.AsyncClient(timeout=client.timeout) as hc:
-                # `identity` asks HF not to gzip the (empty) HEAD body;
-                # otherwise httpx's auto-decoding strips Content-Length
-                # from the response and we lose the value we came here
-                # to fetch.
-                extra_headers = {"Accept-Encoding": "identity"}
-                if client.token:
-                    extra_headers["Authorization"] = f"Bearer {client.token}"
-                follow_resp = await hc.head(
-                    resp_headers["location"],
-                    headers=extra_headers,
-                    follow_redirects=False,
-                )
-            # ``content-length`` and ``etag`` always come from the
-            # follow_resp — the 307 itself only carries the redirect
-            # body length, which is wrong for the file. ``x-repo-commit``
-            # is *additive*: HF's resolve-cache 307 already carries
-            # the right value (PR #21 design) and the resolve-cache
-            # CDN HEAD response often does not include it, so we
-            # only backfill from the follow when the original 307
-            # didn't carry it. This keeps the existing PR #21 path
-            # working unchanged while supporting non-HF mirrors that
-            # emit x-repo-commit-less 307s on resolve.
-            replace_keys = ("content-length", "etag")
-            for k in [
-                k
-                for k in list(resp_headers)
-                if k.lower() in replace_keys
-            ]:
-                resp_headers.pop(k)
-            for k, v in follow_resp.headers.items():
-                if k.lower() in replace_keys:
-                    resp_headers[k] = v
-            has_commit = any(
-                k.lower() == "x-repo-commit" for k in resp_headers
-            )
-            if not has_commit:
-                for k, v in follow_resp.headers.items():
-                    if k.lower() == "x-repo-commit":
-                        resp_headers[k] = v
-        except httpx.HTTPError:
-            # Extra HEAD failed — return what we have; no worse than
-            # the original PR#21 behavior.
-            pass
-
-    strip_xet_response_headers(resp_headers)
-    resp_headers.update(
-        add_source_headers(response, source["name"], source["url"])
+    resp_headers = await apply_resolve_head_postprocess(
+        response,
+        source,
+        follow_timeout=client.timeout,
+        follow_token=client.token,
     )
     return Response(
         status_code=response.status_code,
@@ -599,6 +587,7 @@ async def try_fallback_info(
     attempts: list[dict] = []
 
     async def _attempt(source, gens):
+        t0 = time.monotonic()
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -607,15 +596,42 @@ async def try_fallback_info(
             )
             response = await client.get(kohaku_path, repo_type)
         except httpx.TimeoutException as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback info timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="TIMEOUT",
+                error=str(e) or "request timed out",
+            )
             return None
         except Exception as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback info failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="NETWORK_ERROR",
+                error=str(e) or type(e).__name__,
+            )
             return None
 
+        dt_ms = int((time.monotonic() - t0) * 1000)
         decision = classify_upstream(response)
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            response=response,
+            decision=decision,
+            duration_ms=dt_ms,
+        )
         if decision is FallbackDecision.TRY_NEXT_SOURCE:
             logger.warning(
                 f"Fallback info {source['name']}: HTTP {response.status_code} "
@@ -711,6 +727,7 @@ async def try_fallback_tree(
         params["cursor"] = cursor
 
     async def _attempt(source, gens):
+        t0 = time.monotonic()
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -719,15 +736,42 @@ async def try_fallback_tree(
             )
             response = await client.get(kohaku_path, repo_type, params=params)
         except httpx.TimeoutException as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback tree timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="TIMEOUT",
+                error=str(e) or "request timed out",
+            )
             return None
         except Exception as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback tree failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
+            record_source_hop(
+                source,
+                method="GET",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="NETWORK_ERROR",
+                error=str(e) or type(e).__name__,
+            )
             return None
 
+        dt_ms = int((time.monotonic() - t0) * 1000)
         decision = classify_upstream(response)
+        record_source_hop(
+            source,
+            method="GET",
+            upstream_path=kohaku_path,
+            response=response,
+            decision=decision,
+            duration_ms=dt_ms,
+        )
         if decision is FallbackDecision.TRY_NEXT_SOURCE:
             logger.warning(
                 f"Fallback tree {source['name']}: HTTP {response.status_code} "
@@ -819,6 +863,7 @@ async def try_fallback_paths_info(
     attempts: list[dict] = []
 
     async def _attempt(source, gens):
+        t0 = time.monotonic()
         try:
             client = FallbackClient(
                 source_url=source["url"],
@@ -829,15 +874,42 @@ async def try_fallback_paths_info(
                 kohaku_path, repo_type, data={"paths": paths, "expand": expand}
             )
         except httpx.TimeoutException as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback paths-info timed out at {source['name']}")
             attempts.append(build_fallback_attempt(source, timeout=e))
+            record_source_hop(
+                source,
+                method="POST",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="TIMEOUT",
+                error=str(e) or "request timed out",
+            )
             return None
         except Exception as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
             logger.warning(f"Fallback paths-info failed for {source['name']}: {e}")
             attempts.append(build_fallback_attempt(source, network=e))
+            record_source_hop(
+                source,
+                method="POST",
+                upstream_path=kohaku_path,
+                duration_ms=dt_ms,
+                transport_decision="NETWORK_ERROR",
+                error=str(e) or type(e).__name__,
+            )
             return None
 
+        dt_ms = int((time.monotonic() - t0) * 1000)
         decision = classify_upstream(response)
+        record_source_hop(
+            source,
+            method="POST",
+            upstream_path=kohaku_path,
+            response=response,
+            decision=decision,
+            duration_ms=dt_ms,
+        )
         if decision is FallbackDecision.TRY_NEXT_SOURCE:
             logger.warning(
                 f"Fallback paths-info {source['name']}: HTTP "
