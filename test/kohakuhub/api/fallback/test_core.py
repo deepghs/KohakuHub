@@ -8,6 +8,8 @@ both here and in the production-path tests in ``test_operations.py``.
 """
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -452,9 +454,12 @@ async def test_probe_chain_final_response_mirrors_bound_attempt():
 
 @pytest.mark.asyncio
 async def test_probe_chain_chain_exhausted_has_no_final_response():
-    """final_response must be None when the chain exhausts so the UI
-    knows to fall back to the per-attempt list rather than rendering a
-    misleading `last attempt as final` view."""
+    """``probe_chain`` (low-level) leaves ``final_response=None`` on
+    exhaust — it doesn't have the op + local-hop context needed to
+    reconstruct the right aggregate. Its caller
+    (``probe_full_chain`` / the simulate endpoint) is responsible for
+    filling it in production-faithfully — see
+    ``test_probe_full_chain_exhaust_with_sources_uses_aggregate``."""
     _FakeClient.queue(SRC_A["url"], "GET", _resp(503))
     report = await core.probe_chain(
         op="info", repo_type="model", namespace="owner", name="demo",
@@ -738,3 +743,231 @@ async def test_probe_chain_info_postprocess_NOT_applied(monkeypatch):
     headers = report.final_response["headers"]
     # No X-Source injection (postprocess didn't run for info).
     assert "x-source" not in headers
+
+
+# ---------------------------------------------------------------------------
+# _build_chain_exhausted_aggregate — production-faithful reconstruction
+#
+# Production's ``with_repo_fallback`` returns ``build_aggregate_failure_response``
+# JSON to the client when the chain exhausts (not the local 404 — the
+# aggregate body wraps the per-source attempt list). The simulate
+# endpoint must mirror that *exactly* in its ``final_response`` so the
+# operator-visible "what client gets" panel matches a real hf_hub call.
+# Unit-test the reconstruction directly so the production-parity claim
+# is regression-pinned.
+# ---------------------------------------------------------------------------
+
+
+def _attempt(
+    *, source_name="hf", source_url="https://huggingface.co",
+    status_code=401, x_error_code=None, x_error_message=None,
+    decision="TRY_NEXT_SOURCE", body_preview="",
+    response_headers=None, error=None,
+):
+    return core.ProbeAttempt(
+        source_name=source_name, source_url=source_url,
+        source_type="huggingface", method="HEAD",
+        upstream_path="/models/x/y/resolve/main/",
+        status_code=status_code, x_error_code=x_error_code,
+        x_error_message=x_error_message, decision=decision,
+        duration_ms=10, error=error,
+        response_body_preview=body_preview,
+        response_headers=response_headers or {},
+    )
+
+
+def test_build_chain_exhausted_aggregate_bare_401_promotes_to_repo_not_found():
+    """Bare 401 (no X-Error-Code) → HF anti-enum signal → aggregate
+    promotes to ``RepoNotFound`` even on per-file ops (resolve here),
+    matching ``utils.build_aggregate_failure_response``'s repo_miss
+    rule. The simulate must surface that exact ``X-Error-Code`` so a
+    hf_hub client parsing the simulate panel reaches the same
+    ``RepositoryNotFoundError`` it would hitting production."""
+    out = core._build_chain_exhausted_aggregate(
+        "resolve",
+        [_attempt(status_code=401, body_preview="")],
+    )
+    assert out["status_code"] == 404
+    assert out["headers"]["x-error-code"] == "RepoNotFound"
+    assert out["headers"]["x-error-message"] == (
+        "No fallback source serves this repository."
+    )
+    body = json.loads(out["body_preview"])
+    assert body["error"] == "RepoNotFound"
+    assert body["sources"][0]["status"] == 401
+    assert body["sources"][0]["category"] == "not-found"
+    # Empty HEAD body → message falls through to "HTTP {status}" exactly
+    # like production's ``extract_error_message``.
+    assert body["sources"][0]["message"] == "HTTP 401"
+
+
+def test_build_chain_exhausted_aggregate_per_file_scope_keeps_entry_not_found():
+    """All-404 with ``EntryNotFound`` codes → aggregate stays at
+    ``EntryNotFound`` for per-file ops (no bare-401 escalation to
+    ``RepoNotFound``)."""
+    out = core._build_chain_exhausted_aggregate(
+        "resolve",
+        [
+            _attempt(
+                status_code=404, x_error_code="EntryNotFound",
+                body_preview='{"error": "EntryNotFound"}',
+            ),
+        ],
+    )
+    assert out["status_code"] == 404
+    assert out["headers"]["x-error-code"] == "EntryNotFound"
+    body = json.loads(out["body_preview"])
+    assert body["error"] == "EntryNotFound"
+    assert body["sources"][0]["error_code"] == "EntryNotFound"
+
+
+def test_build_chain_exhausted_aggregate_repo_scope_uses_repo_not_found():
+    """Repo-wide ops (info/tree) classify all-404 as ``RepoNotFound``
+    regardless of bare-401 escalation — the scope itself selects the
+    right hf_hub exception subclass."""
+    out = core._build_chain_exhausted_aggregate(
+        "info",
+        [_attempt(status_code=404, x_error_code="RepoNotFound")],
+    )
+    assert out["headers"]["x-error-code"] == "RepoNotFound"
+    body = json.loads(out["body_preview"])
+    assert body["error"] == "RepoNotFound"
+
+
+def test_build_chain_exhausted_aggregate_extracts_json_error_field_for_message():
+    """Body preview is JSON with ``error`` field → message uses that
+    field (matches production's ``extract_error_message``)."""
+    out = core._build_chain_exhausted_aggregate(
+        "info",
+        [_attempt(
+            status_code=404, x_error_code="RepoNotFound",
+            body_preview='{"error": "Repository not found"}',
+        )],
+    )
+    body = json.loads(out["body_preview"])
+    assert body["sources"][0]["message"] == "Repository not found"
+
+
+def test_build_chain_exhausted_aggregate_handles_truncated_preview():
+    """Preview was capped by ``_BODY_PREVIEW_LIMIT`` and carries the
+    truncation marker. The marker breaks JSON parsing; the helper
+    should strip the marker, fall back to raw text, and not crash."""
+    truncated = '{"error": "no' + "\n…[truncated, total 12345 bytes]"
+    out = core._build_chain_exhausted_aggregate(
+        "info",
+        [_attempt(
+            status_code=404, x_error_code="RepoNotFound",
+            body_preview=truncated,
+        )],
+    )
+    # Stripped marker → still not valid JSON → message is the raw
+    # un-truncated head, not a crash.
+    body = json.loads(out["body_preview"])
+    assert body["sources"][0]["message"] == '{"error": "no'
+
+
+def test_build_chain_exhausted_aggregate_timeout_attempts_use_timeout_category():
+    """Transport-level failures (TIMEOUT / NETWORK_ERROR) keep their
+    category through reconstruction — the aggregate's status-priority
+    logic then maps the all-timeout case to 502 like production."""
+    out = core._build_chain_exhausted_aggregate(
+        "info",
+        [_attempt(
+            status_code=None, decision="TIMEOUT",
+            error="read timed out",
+        )],
+    )
+    assert out["status_code"] == 502
+    body = json.loads(out["body_preview"])
+    assert body["sources"][0]["category"] == "timeout"
+    assert body["sources"][0]["status"] is None
+    assert "timed out" in body["sources"][0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_probe_full_chain_exhaust_with_no_sources_uses_local_response(
+    monkeypatch,
+):
+    """``probe_full_chain`` with ``sources=[]`` and a LOCAL_MISS goes
+    through the "no chain attempts" branch — production's
+    ``with_repo_fallback`` returns the original local 404 in that
+    case (``try_fallback_*`` returns None when sources is empty), so
+    ``final_response`` should mirror the local hop's status/headers/body.
+    """
+
+    async def _fake_local(op, repo_type, namespace, name, **kw):
+        return core.ProbeAttempt(
+            source_name="local", source_url="",
+            source_type="local", method="HEAD",
+            upstream_path=f"/models/{namespace}/{name}/resolve/main/",
+            status_code=404, x_error_code="RepoNotFound",
+            x_error_message="not found",
+            decision="LOCAL_MISS", duration_ms=1, error=None,
+            response_body_preview='{"error": "Repository not found"}',
+            response_headers={"content-type": "application/json"},
+            kind="local",
+        )
+
+    monkeypatch.setattr(
+        "kohakuhub.api.fallback.probe_local.probe_local", _fake_local
+    )
+
+    report = await core.probe_full_chain(
+        op="resolve", repo_type="model", namespace="ns", name="n",
+        sources=[], client_factory=_FakeClient,
+    )
+    assert report.final_outcome == "CHAIN_EXHAUSTED"
+    assert report.final_response is not None
+    assert report.final_response["status_code"] == 404
+    assert report.final_response["body_preview"] == (
+        '{"error": "Repository not found"}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_full_chain_exhaust_with_sources_uses_aggregate(
+    monkeypatch,
+):
+    """``probe_full_chain`` with sources walked + LOCAL_MISS + every
+    source falls through → production hands the client the
+    ``build_aggregate_failure_response`` body. Simulate's
+    ``final_response`` must match that — *not* the local 404, since
+    the production caller never sees the local body when the chain
+    has been walked."""
+
+    async def _fake_local(op, repo_type, namespace, name, **kw):
+        return core.ProbeAttempt(
+            source_name="local", source_url="",
+            source_type="local", method="HEAD",
+            upstream_path=f"/models/{namespace}/{name}/resolve/main/",
+            status_code=404, x_error_code="RepoNotFound",
+            x_error_message="not found",
+            decision="LOCAL_MISS", duration_ms=1, error=None,
+            response_body_preview='{"error": "Repository not found"}',
+            response_headers={"content-type": "application/json"},
+            kind="local",
+        )
+
+    monkeypatch.setattr(
+        "kohakuhub.api.fallback.probe_local.probe_local", _fake_local
+    )
+
+    SRC = {"name": "hf", "url": "https://huggingface.co", "source_type": "huggingface"}
+    _FakeClient.queue(
+        SRC["url"], "HEAD",
+        _resp(401, headers={"x-error-message": "Invalid username or password."}),
+    )
+    report = await core.probe_full_chain(
+        op="resolve", repo_type="model", namespace="ns", name="n",
+        sources=[SRC], client_factory=_FakeClient,
+    )
+    assert report.final_outcome == "CHAIN_EXHAUSTED"
+    assert report.final_response is not None
+    # NOT the local 404 body — the aggregate body.
+    assert report.final_response["status_code"] == 404
+    assert report.final_response["headers"]["x-error-code"] == "RepoNotFound"
+    body = json.loads(report.final_response["body_preview"])
+    assert body["error"] == "RepoNotFound"
+    assert body["detail"] == "No fallback source serves this repository."
+    assert body["sources"][0]["name"] == "hf"
+    assert body["sources"][0]["status"] == 401

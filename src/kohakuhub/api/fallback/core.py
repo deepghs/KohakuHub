@@ -111,6 +111,42 @@ def _curated_headers(response: httpx.Response) -> dict[str, str]:
     }
 
 
+def _extract_message_from_preview(preview: Optional[str]) -> Optional[str]:
+    """Best-effort port of ``utils.extract_error_message`` that operates
+    on a ``ProbeAttempt.response_body_preview`` string instead of a live
+    ``httpx.Response``.
+
+    Returns the error/message/detail/msg field of a JSON body, the raw
+    preview text otherwise, or ``None`` when there's nothing useful
+    (empty / truncation-only marker). Caller falls back to ``HTTP
+    {status}`` in that case to match production exactly.
+    """
+    if not preview:
+        return None
+    # Truncation marker added by ``_preview_body`` on overlong bodies —
+    # the JSON parse below would fail on it, so strip before trying.
+    text = preview.split("\n…[truncated", 1)[0]
+    if not text:
+        return None
+    try:
+        import json
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    if isinstance(parsed, dict):
+        for field in ("error", "message", "detail", "msg"):
+            if field in parsed:
+                value = parsed[field]
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, dict) and isinstance(
+                    value.get("message"), str
+                ):
+                    return value["message"]
+        return str(parsed)
+    return str(parsed)
+
+
 @dataclass
 class ProbeAttempt:
     """A single source's probe result.
@@ -431,14 +467,135 @@ async def probe_full_chain(
         client_factory=client_factory,
     )
     duration_ms = int((time.perf_counter() - overall_started) * 1000)
+
+    # Production parity for CHAIN_EXHAUSTED. ``probe_chain`` on its own
+    # leaves ``final_response=None`` for the exhaust case (it can't
+    # know the right aggregate-scope semantics in isolation), but
+    # production *always* hands the client a concrete response — and
+    # the simulate is supposed to mirror that byte-for-byte. Two
+    # subcases, matching what ``with_repo_fallback`` does:
+    #
+    #   1. Sources were walked, all fell through →
+    #      ``try_fallback_*`` returns a truthy
+    #      ``build_aggregate_failure_response`` JSON
+    #      (``{error, detail, sources: [...]}``); ``with_repo_fallback``
+    #      forwards that under ``if result:``. Reconstruct it here
+    #      from the chain attempts so the simulate's ``final_response``
+    #      matches the body the hf_hub client would actually parse.
+    #   2. No sources were walked (``sources=[]`` passed in, or every
+    #      source was filtered upstream) → ``try_fallback_*`` returns
+    #      ``None`` and ``with_repo_fallback`` falls into the else
+    #      branch, returning the local 404 verbatim. Mirror the local
+    #      hop's status/headers/body in that case.
+    if (
+        fallback_report.final_outcome == "CHAIN_EXHAUSTED"
+        and fallback_report.final_response is None
+    ):
+        if fallback_report.attempts:
+            fallback_report.final_response = _build_chain_exhausted_aggregate(
+                op, fallback_report.attempts,
+            )
+        else:
+            fallback_report.final_response = {
+                "status_code": local_attempt.status_code,
+                "headers": dict(local_attempt.response_headers or {}),
+                "body_preview": local_attempt.response_body_preview,
+            }
+
     fallback_report.attempts = [local_attempt, *fallback_report.attempts]
     fallback_report.duration_ms = duration_ms
-    # ``final_outcome`` / ``bound_source`` / ``final_response`` come
-    # from the fallback chain unchanged: if the chain bound, those
-    # describe the bound source; if it exhausted, ``CHAIN_EXHAUSTED``
-    # (with ``final_response=None``) — the local hop having LOCAL_MISS
-    # is already represented in ``attempts[0]``.
     return fallback_report
+
+
+def _build_chain_exhausted_aggregate(
+    op: ProbeOp, chain_attempts: list["ProbeAttempt"]
+) -> dict:
+    """Reconstruct production's chain-exhausted aggregate response shape.
+
+    Production runs ``build_aggregate_failure_response`` over per-source
+    attempt dicts assembled inside ``operations._run_cached_then_chain``
+    via ``build_fallback_attempt``. The simulate's ``probe_chain``
+    builds richer ``ProbeAttempt`` records instead, so this adapter
+    converts each one into the dict shape ``build_aggregate_failure_response``
+    expects (``name, url, status, error_code, category, message``)
+    using the same ``_categorize_status`` rules as the production path.
+    Aggregate scope: ``"repo"`` for repo-wide ops (info/tree),
+    ``"file"`` for per-file ops (resolve/paths_info) — same split as
+    operations.py's call sites.
+    """
+    # Local imports to avoid a top-level utils → core cycle and to keep
+    # ``core``'s import graph minimal for callers that don't need
+    # aggregate reconstruction (probe_chain alone, which leaves
+    # ``final_response=None`` and lets callers — including this helper —
+    # decide what to do).
+    from kohakuhub.api.fallback.utils import (
+        CATEGORY_NETWORK,
+        CATEGORY_OTHER,
+        CATEGORY_TIMEOUT,
+        MAX_ATTEMPT_MESSAGE_LEN,
+        _categorize_status,
+        build_aggregate_failure_response,
+    )
+
+    aggregate_attempts: list[dict] = []
+    for a in chain_attempts:
+        if a.status_code is not None:
+            category = _categorize_status(
+                a.status_code, a.x_error_code, a.x_error_message,
+            )
+            status = a.status_code
+            # Production's ``build_fallback_attempt`` calls
+            # ``extract_error_message(response)`` — JSON body's
+            # error/message/detail/msg field, or the raw body text,
+            # or ``HTTP {status}`` if neither yields anything. Mirror
+            # that here using ``response_body_preview`` so the
+            # ``sources[*].message`` field matches what the hf_hub
+            # client actually parses out of the production response.
+            message = (
+                _extract_message_from_preview(a.response_body_preview)
+                or f"HTTP {a.status_code}"
+            )
+        elif a.decision == "TIMEOUT":
+            category = CATEGORY_TIMEOUT
+            status = None
+            message = a.error or "request timed out"
+        elif a.decision == "NETWORK_ERROR":
+            category = CATEGORY_NETWORK
+            status = None
+            message = a.error or "network error"
+        else:  # pragma: no cover — defensive
+            category = CATEGORY_OTHER
+            status = None
+            message = a.error or ""
+        aggregate_attempts.append({
+            "name": a.source_name,
+            "url": a.source_url,
+            "status": status,
+            "category": category,
+            "error_code": a.x_error_code,
+            "message": message[:MAX_ATTEMPT_MESSAGE_LEN],
+        })
+
+    scope = "file" if op in ("resolve", "paths_info") else "repo"
+    response = build_aggregate_failure_response(
+        aggregate_attempts, scope=scope,
+    )
+    body_bytes = response.body or b""
+    try:
+        body_preview = body_bytes.decode("utf-8")
+    except UnicodeDecodeError:  # pragma: no cover — JSON is always utf-8
+        body_preview = f"[binary, {len(body_bytes)} bytes]"
+
+    headers = {
+        k.lower(): v
+        for k, v in response.headers.items()
+        if k.lower() in _RELEVANT_HEADERS
+    }
+    return {
+        "status_code": response.status_code,
+        "headers": headers,
+        "body_preview": body_preview,
+    }
 
 
 async def probe_chain(
@@ -515,9 +672,13 @@ async def probe_chain(
     # response shape — that's literally what a production caller would
     # see (modulo the production path's HEAD-then-GET commit for
     # ``resolve``, which the tester intentionally simplifies). For
-    # CHAIN_EXHAUSTED we leave ``final_response = None`` since the
-    # aggregate envelope production builds depends on
-    # ``aggregate_scope`` semantics the tester doesn't impose.
+    # CHAIN_EXHAUSTED we leave ``final_response = None`` here because
+    # the aggregate envelope production builds depends on
+    # ``aggregate_scope`` semantics this low-level primitive
+    # deliberately doesn't impose. ``probe_full_chain`` (which knows
+    # the op and therefore the right scope) fills it in via
+    # ``_build_chain_exhausted_aggregate`` so the simulate endpoint
+    # surfaces the production-faithful response.
     final_response: Optional[dict] = None
     if final_outcome != "CHAIN_EXHAUSTED" and attempts:
         last = attempts[-1]
