@@ -2991,3 +2991,250 @@ async def test_lock_supervisor_releases_lock_when_attempt_fn_wedges(monkeypatch)
             f"response: {r!r}. The supervisor should surface a clean "
             f"aggregate failure, not propagate the cancellation."
         )
+
+
+# ---------------------------------------------------------------------------
+# Plan A: resolve GET as redirect-passthrough.
+#
+# Background: before this change, ``_resolve_one_source`` GET path issued
+# ``client.get(..., follow_redirects=True)`` and proxied the upstream body
+# through ``response.content`` — meaning a 1.5 GB safetensors download was
+# fully buffered into backend RAM before any byte reached the client, AND
+# the client's ``Range`` / ``If-*`` headers were silently dropped because
+# the call site forwarded no headers. Two failure modes:
+#
+#   (1) OOM / DoS — n concurrent large-file fetches × full file size
+#   (2) ~20 s 502 — supervisor ``wait_for`` cancels the runaway download
+#       (because the per-source httpx ``read`` timeout is an idle timeout,
+#       not a total-time timeout, so it never trips while the proxy keeps
+#       trickling bytes)
+#
+# Plan A: never proxy bytes for GET. ``follow_redirects=False`` upstream;
+# if upstream replies with 30x → forward ``Location`` to the client (same
+# shape as the local presigned-URL redirect in ``api/files.py``); if
+# upstream replies 200 inline (small files like ``config.json``) the
+# existing ``.content`` path is kept.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_redirect_passthrough(monkeypatch):
+    """Bound source GET → 302 to a CDN: forward the redirect to the client
+    verbatim, do not chase ``Location`` from inside httpx, do not buffer
+    any redirect-target body."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    cdn_location = "https://cas-bridge.xethub.hf.co/object?sig=xyz"
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            302,
+            headers={
+                "location": cdn_location,
+                "etag": '"deadbeef"',
+                "x-repo-commit": "abc123",
+                "x-linked-size": "1519984962",
+            },
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors", method="GET",
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == cdn_location
+    assert response.headers["X-Source"] == "HF"
+    # Metadata HF clients read off the redirect must survive.
+    assert response.headers["x-repo-commit"] == "abc123"
+    assert response.headers["x-linked-size"] == "1519984962"
+    # ``follow_redirects=False`` was passed so httpx did not chase Location
+    # inside the client. No second GET against any source either.
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    assert len(get_calls) == 1, get_calls
+    assert get_calls[0][3].get("follow_redirects") is False
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_forwards_range_header(monkeypatch):
+    """Client's ``Range`` / ``If-*`` request headers must reach the upstream
+    so a partial-content client request stays partial. Before Plan A the
+    ``FallbackClient.get`` call site never passed any headers — Range was
+    silently dropped and HF returned the full body."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(302, headers={"location": "https://cdn/obj"}),
+    )
+
+    await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors",
+        method="GET",
+        client_headers={
+            "Range": "bytes=0-100000",
+            "If-None-Match": '"abc"',
+            # Not on the whitelist — must NOT propagate. Forwarding
+            # ``Accept-Encoding`` would also re-engage httpx's auto-decompression
+            # which is incompatible with redirect-passthrough.
+            "Accept-Encoding": "gzip",
+            "User-Agent": "kohakuhub/test",
+        },
+    )
+
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    assert len(get_calls) == 1
+    fwd = {k.lower(): v for k, v in (get_calls[0][3].get("headers") or {}).items()}
+    assert fwd.get("range") == "bytes=0-100000"
+    assert fwd.get("if-none-match") == '"abc"'
+    assert "accept-encoding" not in fwd
+    assert "user-agent" not in fwd
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_never_forwards_authorization_or_cookie(monkeypatch):
+    """Safety: client's ``Authorization`` / ``Cookie`` /
+    ``Proxy-Authorization`` MUST NEVER reach the upstream. The only
+    credential that may travel upstream is the admin-configured source
+    token, attached by ``FallbackClient`` itself."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(302, headers={"location": "https://cdn/obj"}),
+    )
+
+    await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors",
+        method="GET",
+        client_headers={
+            "Range": "bytes=0-100000",
+            "Authorization": "Bearer user-secret",
+            "Cookie": "session_id=secret-cookie",
+            "Proxy-Authorization": "Basic Zm9vOmJhcg==",
+        },
+    )
+
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    fwd = {k.lower(): v for k, v in (get_calls[0][3].get("headers") or {}).items()}
+    assert fwd.get("range") == "bytes=0-100000"
+    assert "authorization" not in fwd
+    assert "cookie" not in fwd
+    assert "proxy-authorization" not in fwd
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_redirect_rewrites_relative_location(monkeypatch):
+    """HF's non-LFS resolve-cache pattern returns a 307 with a *relative*
+    Location like ``/api/resolve-cache/...``. Plan A must rewrite that
+    to absolute against the upstream URL so the client follows the
+    redirect on the upstream itself — NOT back to KohakuHub which
+    does not serve ``/api/resolve-cache/``."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/pattern_a.txt"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            307,
+            headers={
+                "location": "/api/resolve-cache/models/owner/demo/sha/pattern_a.txt",
+                "x-repo-commit": "abc123",
+            },
+            url="https://hf.local/owner/demo/resolve/main/pattern_a.txt",
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "pattern_a.txt", method="GET",
+    )
+
+    assert response.status_code == 307
+    # urljoin against the upstream URL gives us the upstream-absolute
+    # path; the client now follows on the upstream rather than bouncing
+    # the relative path back to our own backend.
+    assert (
+        response.headers["location"]
+        == "https://hf.local/api/resolve-cache/models/owner/demo/sha/pattern_a.txt"
+    )
+    assert response.headers["x-repo-commit"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_inline_200_still_returns_body(monkeypatch):
+    """Plan A only changes the redirect path. A small inline 200 (e.g.
+    ``config.json``) still passes the body through verbatim with the
+    historical ``Content-Encoding`` / ``Content-Length`` /
+    ``Transfer-Encoding`` strip applied."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/config.json"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            200,
+            b'{"hello":"world"}',
+            headers={"content-type": "application/json"},
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json", method="GET",
+    )
+
+    assert response.status_code == 200
+    assert response.body == b'{"hello":"world"}'
+    assert response.headers["X-Source"] == "HF"
+    # The GET upstream must still have been issued with redirect chasing
+    # disabled — the same ``follow_redirects=False`` invariant applies even
+    # when the response happens to be a direct 200.
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    assert get_calls[0][3].get("follow_redirects") is False

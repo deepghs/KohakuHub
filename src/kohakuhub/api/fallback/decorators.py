@@ -417,6 +417,11 @@ def with_repo_fallback(operation: OperationType):
                         # Detect HTTP method from request
                         request = kwargs.get("request")
                         method = request.method if request else "GET"
+                        # Plan A: forward client request headers so
+                        # Range / If-* survive end-to-end. The actual
+                        # whitelist is enforced inside
+                        # ``try_fallback_resolve`` (defense in depth) —
+                        # passing raw ``request.headers`` is safe.
                         result = await try_fallback_resolve(
                             repo_type,
                             namespace,
@@ -426,6 +431,9 @@ def with_repo_fallback(operation: OperationType):
                             user_tokens=user_tokens,
                             method=method,
                             user=user,
+                            client_headers=(
+                                request.headers if request is not None else None
+                            ),
                         )
 
                     case "tree":

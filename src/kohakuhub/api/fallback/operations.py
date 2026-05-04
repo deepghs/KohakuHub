@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections import defaultdict
 from typing import Optional
+from urllib.parse import urljoin
 
 import httpx
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -33,6 +34,48 @@ def _resolve_user_id(user) -> Optional[int]:
     if user is None:
         return None
     return getattr(user, "id", None)
+
+
+# Plan A: only these client request headers are forwarded upstream on
+# resolve probes. Authorization / Cookie / Proxy-Authorization are
+# deliberately excluded — the only credential allowed upstream is the
+# admin-configured source token attached by ``FallbackClient`` itself.
+# Accept-Encoding is excluded because httpx auto-decompresses responses,
+# which would corrupt the redirect-passthrough contract.
+_FORWARDABLE_RESOLVE_HEADERS: tuple[str, ...] = (
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+)
+
+
+def _filter_client_headers(headers) -> dict[str, str]:
+    """Return a fresh dict containing only the whitelisted resolve headers.
+
+    Defense-in-depth filter: even if a caller forgets to pre-strip
+    Authorization / Cookie before invoking ``try_fallback_resolve``,
+    this guard catches it. Header name comparison is case-insensitive;
+    values are forwarded with canonical Title-Case names so logs read
+    naturally upstream-side.
+    """
+    if not headers:
+        return {}
+    if hasattr(headers, "items"):
+        items = headers.items()
+    else:
+        items = headers
+    out: dict[str, str] = {}
+    allowed = set(_FORWARDABLE_RESOLVE_HEADERS)
+    for k, v in items:
+        if not k or v is None:
+            continue
+        lower = k.lower()
+        if lower in allowed:
+            out[lower.title()] = v
+    return out
 
 
 def _propagate_upstream_response(
@@ -67,6 +110,59 @@ def _propagate_upstream_response(
         content=response.content,
         headers=headers,
     )
+
+
+def _propagate_upstream_redirect(
+    response: httpx.Response, source: dict
+) -> Response:
+    """Forward an upstream resolve-GET 30x to the client without buffering.
+
+    Plan A: bytes never traverse the backend on the resolve GET path.
+    ``client.get`` is invoked with ``follow_redirects=False``, so when the
+    upstream resolves to a CDN / presigned URL via 301/302/303/307/308
+    we hand that ``Location`` back to the client and the actual byte
+    transfer is client→CDN, mirroring the local ``resolve_file_get``
+    presigned-S3 redirect flow.
+
+    Relative ``Location`` (e.g. HF's ``/api/resolve-cache/...`` 307) is
+    rewritten to absolute against the upstream request URL — same fix
+    the HEAD postprocess applies — so the client follows it back to the
+    upstream, NOT back to KohakuHub which doesn't serve that path.
+    """
+    headers: dict[str, str] = {}
+    location = response.headers.get("location")
+    if not location:
+        # Malformed 30x without Location — fall back to verbatim
+        # propagation so the caller still sees the upstream status.
+        return _propagate_upstream_response(response, source)
+    # Rewrite relative Location to absolute against the upstream URL.
+    # urljoin is a no-op when ``location`` is already absolute (the LFS
+    # ``cas-bridge.xethub.hf.co`` case), so this is safe for both
+    # patterns. Without this, hf_hub would walk the relative path back
+    # to its own ``endpoint`` (= our backend) and 404 because we don't
+    # serve /api/resolve-cache/.
+    upstream_url = str(response.request.url)
+    absolute_location = urljoin(upstream_url, location)
+    # Preserve the metadata huggingface_hub clients read off the redirect
+    # response (these are the same headers the HEAD-postprocess path
+    # surfaces; keeping GET symmetric ensures clients see consistent
+    # ETag / size info regardless of which method they used).
+    for h in ("etag", "x-repo-commit", "x-linked-etag", "x-linked-size"):
+        v = response.headers.get(h)
+        if v:
+            headers[h] = v
+    headers["location"] = absolute_location
+    # Presigned redirects expire — never let an intermediary cache a
+    # response whose target URL has a baked-in deadline.
+    headers["cache-control"] = "no-store"
+    strip_xet_response_headers(headers)
+    headers.update(add_source_headers(response, source["name"], source["url"]))
+    return Response(
+        status_code=response.status_code,
+        content=b"",
+        headers=headers,
+    )
+
 
 logger = get_logger("FALLBACK_OPS")
 
@@ -356,6 +452,7 @@ async def try_fallback_resolve(
     user_tokens: dict[str, str] | None = None,
     method: str = "GET",
     user=None,
+    client_headers: dict[str, str] | None = None,
 ) -> Optional[Response]:
     """Try to resolve file from fallback sources.
 
@@ -370,6 +467,12 @@ async def try_fallback_resolve(
         user: Authenticated user (or None for anonymous). Threaded
             through to the cache key as ``user_id`` for strict
             per-user binding isolation (#79).
+        client_headers: Client request headers to forward upstream.
+            Filtered through ``_filter_client_headers`` before any
+            outbound use, so callers may safely pass the raw
+            ``request.headers`` mapping — only Range / If-* survive
+            (Authorization / Cookie / Proxy-Authorization /
+            Accept-Encoding are dropped here).
 
     Returns:
         Response (redirect for GET, response with headers for HEAD) or None if not found
@@ -383,6 +486,10 @@ async def try_fallback_resolve(
 
     user_id = _resolve_user_id(user)
     tokens_hash = compute_tokens_hash(user_tokens)
+
+    # Defense-in-depth: drop everything that isn't on the resolve
+    # whitelist before it gets anywhere near the upstream chain.
+    safe_client_headers = _filter_client_headers(client_headers)
 
     # Construct KohakuHub path
     kohaku_path = f"/{repo_type}s/{namespace}/{name}/resolve/{revision}/{path}"
@@ -407,6 +514,7 @@ async def try_fallback_resolve(
             attempts,
             cache,
             gens,
+            client_headers=safe_client_headers,
         )
 
     return await _run_cached_then_chain(
@@ -433,6 +541,8 @@ async def _resolve_one_source(
     attempts: list[dict],
     cache,
     gens: tuple[int, int, int],
+    *,
+    client_headers: dict[str, str] | None = None,
 ) -> Optional[Response]:
     """Run a resolve probe (HEAD, then GET if method=GET) against one source.
 
@@ -544,10 +654,25 @@ async def _resolve_one_source(
     # the user gets. Falling through to another source here is the
     # cross-source mixing bug #75 fixes (HEAD-200 at A, GET-502 at A,
     # then sneak over to B's same-named-but-different repo).
+    #
+    # Plan A invariants enforced here:
+    #   • ``follow_redirects=False`` — never let httpx chase an upstream
+    #     30x into a CDN body fetch. A 1.5 GB safetensors must not pass
+    #     through the backend; the redirect Location is what we hand
+    #     back to the client (mirrors local ``resolve_file_get`` 302).
+    #   • ``headers=client_headers`` — forward the caller's whitelisted
+    #     Range / If-* headers so partial-content semantics survive.
+    #     The whitelist (Range, If-Match, If-None-Match,
+    #     If-Modified-Since, If-Unmodified-Since, If-Range) is built by
+    #     the ``with_repo_fallback`` decorator; Authorization / Cookie
+    #     are filtered there and never reach this call.
     get_t0 = time.monotonic()
     try:
         get_response = await client.get(
-            kohaku_path, repo_type, follow_redirects=True
+            kohaku_path,
+            repo_type,
+            follow_redirects=False,
+            headers=client_headers or None,
         )
     except httpx.TimeoutException as e:
         get_dt_ms = int((time.monotonic() - get_t0) * 1000)
@@ -594,6 +719,18 @@ async def _resolve_one_source(
         decision=classify_upstream(get_response),
         duration_ms=get_dt_ms,
     )
+
+    # Plan A primary path: 30x → forward Location to the client; the
+    # CDN/presigned target is the byte source, not this backend.
+    if (
+        300 <= get_response.status_code < 400
+        and get_response.headers.get("location")
+    ):
+        logger.info(
+            f"GET {get_response.status_code} → redirect-passthrough at "
+            f"{source['name']} (Location forwarded to client; no body buffer)"
+        )
+        return _propagate_upstream_redirect(get_response, source)
 
     if get_response.status_code == 200:
         # Proxy the content with original headers, stripping the
