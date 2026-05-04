@@ -133,11 +133,32 @@ async def _run_cached_then_chain(
        #77 fixes. The client can retry; retries within TTL hit the
        same source.
 
-    2. **Concurrent-binding lock.** When the cache misses and the
-       chain probe is needed, concurrent callers serialize on a
-       per-repo ``asyncio.Lock``. The first holder writes the cache;
-       subsequent holders re-check the cache after acquiring the lock
-       and use the now-bound source.
+    2. **Concurrent-binding lock — narrow critical section.** When
+       the cache misses and the chain probe is needed, concurrent
+       callers serialize on a per-repo ``asyncio.Lock``. The first
+       holder walks the chain and writes the cache; subsequent
+       holders re-check the cache after acquiring the lock and, if
+       they find a binding, **return the decision and call
+       ``attempt_fn`` AFTER releasing the lock** — so post-recheck
+       waiters fan out in parallel rather than serializing their
+       bound-source calls through the lock (issue #85).
+
+       The lock's only job is the first-bind race. Once the cache is
+       populated, the lock is released and never blocks I/O. The
+       post-lock recheck is pure decision: read cache, return tuple.
+
+    2a. **Lock supervisor (issue #85, option (c)).** The locked
+       region is wrapped in
+       ``asyncio.wait_for(timeout=fallback.timeout_seconds * (len(sources)+1))``
+       so a wedged ``attempt_fn`` (e.g. an httpx call that ignores
+       its own timeout under a misbehaving proxy) cannot hold the
+       lock forever. Cancellation propagates through ``async with
+       binding_lock:`` which guarantees the lock is released. On
+       supervisor timeout the caller receives a chain-exhausted
+       aggregate response; subsequent same-repo callers see a clean
+       lock and retry. Strict consistency is a *safety* invariant
+       conditional on stable upstream behaviour — it does not
+       require unbounded blocking under wedge.
 
     3. **Orphaned-cache invalidation only.** The single case that
        *does* invalidate the cache is when the cached source URL is
@@ -205,54 +226,125 @@ async def _run_cached_then_chain(
                 user_id, tokens_hash, repo_type, namespace, name
             )
 
-    # Strict-consistency rule #2: concurrent-binding lock.
+    # Strict-consistency rule #2 + 2a: concurrent-binding lock with
+    # narrow critical section + supervisor (issue #85).
     binding_lock = _binding_lock(repo_type, namespace, name)
-    async with binding_lock:
-        # Re-snapshot under the lock so the chain probe + safe_set
-        # see a fresh baseline (generations may have changed while
-        # we were waiting on the lock).
-        gens = cache.snapshot(user_id, repo_type, namespace, name)
-        # Re-check the cache after lock acquisition: another waiter may
-        # have already bound this repo while we were queued.
-        cached_entry = cache.get(
-            user_id, tokens_hash, repo_type, namespace, name
-        )
-        if cached_entry and cached_entry.get("exists"):
-            cached_url = cached_entry["source_url"]
-            cached_source = next(
-                (s for s in sources if s["url"] == cached_url), None
-            )
-            if cached_source:
-                result = await attempt_fn(cached_source, gens)
-                if result is not None:
-                    return result
-                return build_aggregate_failure_response(
-                    attempts, scope=aggregate_scope
-                )
-            # Concurrent waiter bound to a source we don't have in
-            # config — extremely rare (admin reconfig race between
-            # the binder's ``cache.set`` and the waiter's post-lock
-            # cache-recheck); treat as orphan and proceed to a
-            # fresh chain.
-            cache.invalidate(  # pragma: no cover
+
+    # Supervisor budget: per-source timeout × (chain length + 1)
+    # gives the binder enough room to walk every source at full
+    # httpx timeout, plus one slot of buffer for scheduling and
+    # cache I/O. The caller-visible worst case under wedge is one
+    # chain timeout — not unbounded — and the lock is released by
+    # cancellation either way so subsequent same-repo callers
+    # always see a clean lock.
+    supervisor_timeout = cfg.fallback.timeout_seconds * (len(sources) + 1)
+
+    async def _decide_under_lock():
+        """Run inside the binding lock. Returns one of:
+
+        - ``("cache_hit", source, gens)`` — a concurrent waiter
+          bound the repo while we queued. The outer caller invokes
+          ``attempt_fn`` against ``source`` AFTER releasing the
+          lock so post-recheck waiters fan out in parallel rather
+          than serializing through the lock (issue #85's primary
+          fix).
+        - ``("bound", result, None)`` — we are the first binder;
+          we walked the chain under the lock and produced a
+          successful result. ``safe_set`` (inside ``attempt_fn``)
+          has populated the cache so subsequent same-repo waiters
+          will hit the post-recheck branch.
+        - ``("exhausted", None, None)`` — chain walked under lock,
+          no source bound. Outer caller surfaces aggregate failure.
+
+        I/O happens inside this coroutine ONLY on the chain-walk
+        path (first-bind serialization is the lock's actual job).
+        Post-recheck cache hit is pure-decision: read cache,
+        return tuple, exit.
+        """
+        async with binding_lock:
+            # Re-snapshot under the lock so the chain probe + safe_set
+            # see a fresh baseline (generations may have changed while
+            # we were waiting on the lock).
+            gens_inner = cache.snapshot(user_id, repo_type, namespace, name)
+            # Re-check the cache after lock acquisition: another waiter
+            # may have already bound this repo while we were queued.
+            cached_entry_inner = cache.get(
                 user_id, tokens_hash, repo_type, namespace, name
             )
+            if cached_entry_inner and cached_entry_inner.get("exists"):
+                cached_url_inner = cached_entry_inner["source_url"]
+                cached_source_inner = next(
+                    (s for s in sources if s["url"] == cached_url_inner),
+                    None,
+                )
+                if cached_source_inner:
+                    # Pure decision — DO NOT call attempt_fn here.
+                    return ("cache_hit", cached_source_inner, gens_inner)
+                # Concurrent waiter bound to a source we don't have
+                # in config — extremely rare (admin reconfig race
+                # between the binder's ``cache.set`` and the
+                # waiter's post-lock cache-recheck); treat as orphan
+                # and proceed to a fresh chain.
+                cache.invalidate(  # pragma: no cover
+                    user_id, tokens_hash, repo_type, namespace, name
+                )
 
-        # Fresh chain probe: deterministic priority order, first
-        # BIND wins.
-        for source in sources:
-            result = await attempt_fn(source, gens)
-            if result is not None:
-                return result
+            # Fresh chain probe: deterministic priority order, first
+            # BIND wins. I/O is under the lock here because
+            # first-bind serialization is the lock's actual job —
+            # without it, two concurrent first-binders could pick
+            # different sources from the chain (the cross-source
+            # mixing #75/#77 prevent).
+            for source in sources:
+                result = await attempt_fn(source, gens_inner)
+                if result is not None:
+                    return ("bound", result, None)
 
-        if not attempts:  # pragma: no cover
-            # Defensive: caller already filtered out empty ``sources``.
-            return None
-        logger.debug(
-            f"Fallback MISS: aggregating {len(attempts)} source failure(s) "
-            f"for {repo_type}/{namespace}/{name}"
+            return ("exhausted", None, None)
+
+    try:
+        decision, payload, gens_used = await asyncio.wait_for(
+            _decide_under_lock(), timeout=supervisor_timeout
+        )
+    except asyncio.TimeoutError:
+        # Supervisor fired — locked region exceeded its budget.
+        # Cancellation propagated through ``async with binding_lock:``
+        # so the lock has been released and subsequent same-repo
+        # callers can proceed. Surface a chain-exhausted aggregate
+        # (typically empty attempts → 502 UpstreamFailure) to this
+        # caller.
+        logger.error(
+            f"Lock supervisor fired for {repo_type}/{namespace}/{name} "
+            f"after {supervisor_timeout}s — locked region took too "
+            f"long. Lock released by cancellation; surfacing "
+            f"aggregate failure to caller."
         )
         return build_aggregate_failure_response(attempts, scope=aggregate_scope)
+
+    if decision == "cache_hit":
+        # Bound source from concurrent waiter; call attempt_fn
+        # OUTSIDE the lock so all post-recheck waiters fan out in
+        # parallel. This is issue #85's primary liveness fix.
+        result = await attempt_fn(payload, gens_used)
+        if result is not None:
+            return result
+        # Strict-consistency rule #1: bound source's TRY_NEXT
+        # response surfaces as the caller-visible error WITHOUT
+        # invalidating. Within TTL the bound source stays bound.
+        return build_aggregate_failure_response(attempts, scope=aggregate_scope)
+
+    if decision == "bound":
+        return payload
+
+    # decision == "exhausted"
+    if not attempts:  # pragma: no cover
+        # Defensive: caller already filtered out empty ``sources``.
+        return None
+    logger.debug(
+        f"Fallback MISS: aggregating {len(attempts)} source failure(s) "
+        f"for {repo_type}/{namespace}/{name}"
+    )
+    return build_aggregate_failure_response(attempts, scope=aggregate_scope)
 
 
 async def try_fallback_resolve(
