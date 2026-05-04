@@ -2769,3 +2769,610 @@ async def test_paths_info_timeout_aggregates_to_502(monkeypatch):
     )
     assert result is not None
     assert result.status_code == 502
+
+
+# ===========================================================================
+# Issue #85 — binding-lock liveness regressions.
+#
+# These tests pin the two failure modes called out in #85:
+#
+#   1. ``test_post_recheck_cache_hit_releases_lock_before_attempt_fn`` —
+#      with the bug present, post-recheck waiters call ``attempt_fn``
+#      against the bound source while still holding the binding lock,
+#      so they fan out one-at-a-time. Peak concurrency for the bound-
+#      source's HTTP call is forced down to 1, which costs N×latency
+#      for N waiters. The fix shrinks the locked region to pure
+#      decision-making and runs ``attempt_fn`` outside the lock so the
+#      waiters' upstream calls run in parallel.
+#
+#   2. ``test_lock_supervisor_releases_lock_when_attempt_fn_wedges`` —
+#      with the bug present, an ``attempt_fn`` that hangs while
+#      holding the lock (e.g., httpx ignoring its timeout, an
+#      ``await`` that never resolves) blocks every same-repo caller
+#      forever. The fix wraps the locked region in
+#      ``asyncio.wait_for(timeout=...)`` so the lock is forcibly
+#      released after a bounded budget and queued waiters can proceed.
+#
+# Both tests were written first (RED) and watched to fail before the
+# implementation in ``operations.py`` was edited.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_post_recheck_cache_hit_releases_lock_before_attempt_fn(monkeypatch):
+    """Concurrent same-repo first-bind waiters must NOT serialize
+    their bound-source ``attempt_fn`` calls inside the binding lock.
+
+    Setup: one binder (caller 1) and three waiters (callers 2-4) race
+    on a fresh cache. Source A always TRY_NEXTs, source B binds. The
+    binder walks A then B, binds, releases. The three waiters then
+    each see the cache binding under the lock and need to call
+    ``attempt_fn(B)`` — but per the fixed contract, that call must
+    happen OUTSIDE the lock.
+
+    Assertion: peak in-flight HTTP calls to source B across all four
+    callers must be >= 2. With the locked-I/O bug the peak is 1
+    (waiters file in single-file behind the lock); after the fix the
+    waiters fan out and the peak is 3."""
+    import asyncio
+    fallback_ops._reset_binding_locks_for_tests()
+    from kohakuhub.api.fallback.cache import RepoSourceCache
+    cache = RepoSourceCache(ttl_seconds=60)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+
+    in_flight_b = 0
+    peak_in_flight_b = 0
+
+    class TrackingFakeFallbackClient(YieldingFakeFallbackClient):
+        async def _dispatch(self, method, path, **kwargs):
+            nonlocal in_flight_b, peak_in_flight_b
+            await asyncio.sleep(0)  # yield so waiters can interleave
+            if self.source_url == "https://b.local":
+                in_flight_b += 1
+                peak_in_flight_b = max(peak_in_flight_b, in_flight_b)
+                try:
+                    # Simulated upstream latency. With the bug, the
+                    # lock holds during this sleep, forcing serial
+                    # execution and capping peak_in_flight_b at 1.
+                    await asyncio.sleep(0.05)
+                    return await super(YieldingFakeFallbackClient, self)._dispatch(
+                        method, path, **kwargs
+                    )
+                finally:
+                    in_flight_b -= 1
+            return await super()._dispatch(method, path, **kwargs)
+
+    monkeypatch.setattr(fallback_ops, "FallbackClient", TrackingFakeFallbackClient)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: _two_sources(),
+    )
+
+    info_path = "/api/models/owner/concurrent"
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "GET",
+        info_path,
+        _content_response(
+            404, b"", headers={"x-error-code": "RepoNotFound"}
+        ),
+    )
+    # Four 200 responses from B: one for the binder, three for the
+    # post-recheck waiters.
+    FakeFallbackClient.queue(
+        "https://b.local",
+        "GET",
+        info_path,
+        _json_response(200, {"id": "owner/concurrent"}),
+        _json_response(200, {"id": "owner/concurrent"}),
+        _json_response(200, {"id": "owner/concurrent"}),
+        _json_response(200, {"id": "owner/concurrent"}),
+    )
+
+    async def _one():
+        return await fallback_ops.try_fallback_info(
+            "model", "owner", "concurrent"
+        )
+
+    results = await asyncio.gather(_one(), _one(), _one(), _one())
+    for r in results:
+        assert isinstance(r, dict) and r["id"] == "owner/concurrent"
+
+    assert peak_in_flight_b >= 2, (
+        f"Post-recheck waiters serialized: peak in-flight to bound source "
+        f"B was {peak_in_flight_b} (expected >= 2). attempt_fn is being "
+        f"called while still holding the binding lock — that's the "
+        f"liveness bug from issue #85. Fix: release the lock before the "
+        f"bound-source attempt_fn."
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_supervisor_releases_lock_when_attempt_fn_wedges(monkeypatch):
+    """A wedged ``attempt_fn`` (one that ``await``s on something that
+    never fires) must not block subsequent same-repo callers
+    indefinitely. The locked region needs an ``asyncio.wait_for``
+    supervisor that bounds total lock-hold time.
+
+    Setup: one source whose ``_dispatch`` awaits an ``Event`` that
+    we never set. Two same-repo callers fire concurrently. The
+    binder enters the lock, calls dispatch, blocks. The waiter
+    queues at the lock.
+
+    Without the supervisor: both callers block forever — the test
+    times out at the outer ``asyncio.wait_for`` and the test fails.
+
+    With the supervisor: the binder's locked region times out after
+    ``cfg.fallback.timeout_seconds * (len(sources) + 1)`` seconds,
+    the lock is released by the cancellation, and the waiter (which
+    will hit the same wedge) also times out cleanly. Both callers
+    return chain-exhausted aggregates within bounded time."""
+    import asyncio
+    import time as _time
+    fallback_ops._reset_binding_locks_for_tests()
+    from kohakuhub.api.fallback.cache import RepoSourceCache
+    cache = RepoSourceCache(ttl_seconds=60)
+    monkeypatch.setattr(fallback_ops, "get_cache", lambda: cache)
+
+    wedge_event = asyncio.Event()  # never set — pure wedge
+
+    class WedgingFakeFallbackClient(FakeFallbackClient):
+        async def _dispatch(self, method, path, **kwargs):
+            await wedge_event.wait()
+            # Unreachable in practice — kept for defensive shape.
+            return await super()._dispatch(method, path, **kwargs)
+
+    # Use a tight timeout so the test itself runs in a few seconds.
+    monkeypatch.setattr(fallback_ops.cfg.fallback, "timeout_seconds", 1)
+    monkeypatch.setattr(fallback_ops, "FallbackClient", WedgingFakeFallbackClient)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {
+                "url": "https://a.local",
+                "name": "A",
+                "source_type": "huggingface",
+            }
+        ],
+    )
+
+    info_path = "/api/models/owner/wedge"
+    # Queue is irrelevant — _dispatch wedges before consuming it.
+    FakeFallbackClient.queue(
+        "https://a.local",
+        "GET",
+        info_path,
+        _json_response(200, {"id": "owner/wedge"}),
+    )
+
+    async def _one():
+        return await fallback_ops.try_fallback_info(
+            "model", "owner", "wedge"
+        )
+
+    t0 = _time.monotonic()
+    try:
+        # Outer guard: if the supervisor isn't there, this fires and
+        # the test fails with a clear message rather than hanging the
+        # whole pytest session.
+        results = await asyncio.wait_for(
+            asyncio.gather(_one(), _one(), return_exceptions=True),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        wedge_event.set()  # wake any pending waiters so the loop tears down
+        pytest.fail(
+            "Same-repo callers blocked indefinitely on a wedged binder. "
+            "The locked region in _run_cached_then_chain must be wrapped "
+            "in asyncio.wait_for(...) so a hung attempt_fn cannot hold "
+            "the lock forever."
+        )
+    finally:
+        wedge_event.set()  # always wake any leftover awaiters
+    dt = _time.monotonic() - t0
+
+    # With supervisor=cfg.fallback.timeout_seconds*(len(sources)+1)=2s
+    # per locked region, two serialized callers should finish within
+    # ~5s (binder ~2s, waiter ~2s, plus scheduling slack). The 8-second
+    # ceiling leaves a comfortable margin without being so loose that
+    # a blocking-bug regression slips through.
+    assert dt < 8.0, (
+        f"Lock supervisor released too slowly ({dt:.1f}s) — even with "
+        f"two serialized callers under a 2s supervisor budget, total "
+        f"should be well under 8s."
+    )
+    # Both callers must have returned (not raised) — chain-exhausted is a
+    # legitimate response shape, not a hang.
+    for r in results:
+        assert not isinstance(r, asyncio.TimeoutError), (
+            f"Caller saw TimeoutError instead of a chain-exhausted "
+            f"response: {r!r}. The supervisor should surface a clean "
+            f"aggregate failure, not propagate the cancellation."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Plan A: resolve GET as redirect-passthrough.
+#
+# Background: before this change, ``_resolve_one_source`` GET path issued
+# ``client.get(..., follow_redirects=True)`` and proxied the upstream body
+# through ``response.content`` — meaning a 1.5 GB safetensors download was
+# fully buffered into backend RAM before any byte reached the client, AND
+# the client's ``Range`` / ``If-*`` headers were silently dropped because
+# the call site forwarded no headers. Two failure modes:
+#
+#   (1) OOM / DoS — n concurrent large-file fetches × full file size
+#   (2) ~20 s 502 — supervisor ``wait_for`` cancels the runaway download
+#       (because the per-source httpx ``read`` timeout is an idle timeout,
+#       not a total-time timeout, so it never trips while the proxy keeps
+#       trickling bytes)
+#
+# Plan A: never proxy bytes for GET. ``follow_redirects=False`` upstream;
+# if upstream replies with 30x → forward ``Location`` to the client (same
+# shape as the local presigned-URL redirect in ``api/files.py``); if
+# upstream replies 200 inline (small files like ``config.json``) the
+# existing ``.content`` path is kept.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_redirect_passthrough(monkeypatch):
+    """Bound source GET → 302 to a CDN: forward the redirect to the client
+    verbatim, do not chase ``Location`` from inside httpx, do not buffer
+    any redirect-target body."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    cdn_location = "https://cas-bridge.xethub.hf.co/object?sig=xyz"
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            302,
+            headers={
+                "location": cdn_location,
+                "etag": '"deadbeef"',
+                "x-repo-commit": "abc123",
+                "x-linked-size": "1519984962",
+            },
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors", method="GET",
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == cdn_location
+    assert response.headers["X-Source"] == "HF"
+    # Metadata HF clients read off the redirect must survive.
+    assert response.headers["x-repo-commit"] == "abc123"
+    assert response.headers["x-linked-size"] == "1519984962"
+    # ``follow_redirects=False`` was passed so httpx did not chase Location
+    # inside the client. No second GET against any source either.
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    assert len(get_calls) == 1, get_calls
+    assert get_calls[0][3].get("follow_redirects") is False
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_forwards_range_header(monkeypatch):
+    """Client's ``Range`` / ``If-*`` request headers must reach the upstream
+    so a partial-content client request stays partial. Before Plan A the
+    ``FallbackClient.get`` call site never passed any headers — Range was
+    silently dropped and HF returned the full body."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(302, headers={"location": "https://cdn/obj"}),
+    )
+
+    await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors",
+        method="GET",
+        client_headers={
+            "Range": "bytes=0-100000",
+            "If-None-Match": '"abc"',
+            # Not on the whitelist — must NOT propagate. Forwarding
+            # ``Accept-Encoding`` would also re-engage httpx's auto-decompression
+            # which is incompatible with redirect-passthrough.
+            "Accept-Encoding": "gzip",
+            "User-Agent": "kohakuhub/test",
+        },
+    )
+
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    assert len(get_calls) == 1
+    fwd = {k.lower(): v for k, v in (get_calls[0][3].get("headers") or {}).items()}
+    assert fwd.get("range") == "bytes=0-100000"
+    assert fwd.get("if-none-match") == '"abc"'
+    assert "accept-encoding" not in fwd
+    assert "user-agent" not in fwd
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_never_forwards_authorization_or_cookie(monkeypatch):
+    """Safety: client's ``Authorization`` / ``Cookie`` /
+    ``Proxy-Authorization`` MUST NEVER reach the upstream. The only
+    credential that may travel upstream is the admin-configured source
+    token, attached by ``FallbackClient`` itself."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(302, headers={"location": "https://cdn/obj"}),
+    )
+
+    await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors",
+        method="GET",
+        client_headers={
+            "Range": "bytes=0-100000",
+            "Authorization": "Bearer user-secret",
+            "Cookie": "session_id=secret-cookie",
+            "Proxy-Authorization": "Basic Zm9vOmJhcg==",
+        },
+    )
+
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    fwd = {k.lower(): v for k, v in (get_calls[0][3].get("headers") or {}).items()}
+    assert fwd.get("range") == "bytes=0-100000"
+    assert "authorization" not in fwd
+    assert "cookie" not in fwd
+    assert "proxy-authorization" not in fwd
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_redirect_rewrites_relative_location(monkeypatch):
+    """HF's non-LFS resolve-cache pattern returns a 307 with a *relative*
+    Location like ``/api/resolve-cache/...``. Plan A must rewrite that
+    to absolute against the upstream URL so the client follows the
+    redirect on the upstream itself — NOT back to KohakuHub which
+    does not serve ``/api/resolve-cache/``."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/pattern_a.txt"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            307,
+            headers={
+                "location": "/api/resolve-cache/models/owner/demo/sha/pattern_a.txt",
+                "x-repo-commit": "abc123",
+            },
+            url="https://hf.local/owner/demo/resolve/main/pattern_a.txt",
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "pattern_a.txt", method="GET",
+    )
+
+    assert response.status_code == 307
+    # urljoin against the upstream URL gives us the upstream-absolute
+    # path; the client now follows on the upstream rather than bouncing
+    # the relative path back to our own backend.
+    assert (
+        response.headers["location"]
+        == "https://hf.local/api/resolve-cache/models/owner/demo/sha/pattern_a.txt"
+    )
+    assert response.headers["x-repo-commit"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_inline_200_still_returns_body(monkeypatch):
+    """Plan A only changes the redirect path. A small inline 200 (e.g.
+    ``config.json``) still passes the body through verbatim with the
+    historical ``Content-Encoding`` / ``Content-Length`` /
+    ``Transfer-Encoding`` strip applied."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/config.json"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            200,
+            b'{"hello":"world"}',
+            headers={"content-type": "application/json"},
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "config.json", method="GET",
+    )
+
+    assert response.status_code == 200
+    assert response.body == b'{"hello":"world"}'
+    assert response.headers["X-Source"] == "HF"
+    # The GET upstream must still have been issued with redirect chasing
+    # disabled — the same ``follow_redirects=False`` invariant applies even
+    # when the response happens to be a direct 200.
+    get_calls = [c for c in FakeFallbackClient.calls if c[1] == "GET"]
+    assert get_calls[0][3].get("follow_redirects") is False
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_get_redirect_drops_xet_headers_from_upstream(monkeypatch):
+    """Plan A redirect-passthrough must NOT leak ``x-xet-*`` headers
+    upstream might attach. The output is built from an explicit
+    six-key whitelist (``etag`` / ``x-repo-commit`` / ``x-linked-etag``
+    / ``x-linked-size`` / ``location`` / ``cache-control``), so any
+    Xet-shaped key on the upstream response must not survive — even
+    if the (defensive) ``strip_xet_response_headers`` call is later
+    removed as redundant. This test locks the contract at the
+    response surface so that refactor stays safe."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue("https://hf.local", "HEAD", path, _content_response(200))
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "GET",
+        path,
+        _content_response(
+            302,
+            headers={
+                "location": "https://cas-bridge.xethub.hf.co/object?sig=xyz",
+                "etag": '"deadbeef"',
+                "x-repo-commit": "abc123",
+                "x-linked-size": "1519984962",
+                # Hostile / accidental upstream headers we must drop.
+                "x-xet-cas-url": "https://cas.xethub.hf.co",
+                "x-xet-hash": "shardhash",
+                "x-xet-cas-uid": "public",
+                "x-xet-something-future": "still-dropped",
+            },
+        ),
+    )
+
+    response = await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors", method="GET",
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://cas-bridge.xethub.hf.co/object?sig=xyz"
+    # Whitelist survivors.
+    assert response.headers["etag"] == '"deadbeef"'
+    assert response.headers["x-repo-commit"] == "abc123"
+    assert response.headers["x-linked-size"] == "1519984962"
+    # Xet hints must NOT be present — this enforces the contract at
+    # the OUTPUT regardless of how the curation logic is implemented.
+    lower_keys = {k.lower() for k in response.headers.keys()}
+    assert not any(k.startswith("x-xet-") for k in lower_keys), (
+        f"x-xet-* headers leaked into redirect response: "
+        f"{[k for k in lower_keys if k.startswith('x-xet-')]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_try_fallback_resolve_head_does_not_forward_client_headers(monkeypatch):
+    """HEAD path is intentionally asymmetric with GET on header
+    forwarding: ``client.head`` is invoked WITHOUT ``client_headers``.
+    Two reasons (kept here as the regression-guard for the next
+    refactor that's tempted to "make HEAD symmetric"):
+
+      1) ``huggingface_hub`` HEAD-on-resolve never carries Range — the
+         metadata probe is positional, partial-content semantics are a
+         GET-only concern.
+      2) ``apply_resolve_head_postprocess`` fires its own follow-HEAD
+         with ``Accept-Encoding: identity`` deliberately set so httpx
+         doesn't auto-decompress and silently strip Content-Length
+         (PR #21). Forwarding a client-supplied ``Accept-Encoding:
+         gzip`` upstream would re-engage that bug.
+
+    If a future PR wants ``If-None-Match`` 304 short-circuit on HEAD,
+    the right fix is a NARROWER whitelist forwarded to the binding
+    HEAD probe ONLY — never to the follow-HEAD inside
+    apply_resolve_head_postprocess. This test fails loudly if that
+    boundary is crossed (any client header reaches the binding
+    HEAD probe)."""
+    monkeypatch.setattr(fallback_ops, "get_cache", DummyCache)
+    monkeypatch.setattr(
+        fallback_ops,
+        "get_enabled_sources",
+        lambda namespace, user_tokens=None: [
+            {"url": "https://hf.local", "name": "HF", "source_type": "huggingface"},
+        ],
+    )
+    path = "/models/owner/demo/resolve/main/weights.safetensors"
+    FakeFallbackClient.queue(
+        "https://hf.local",
+        "HEAD",
+        path,
+        _content_response(
+            302,
+            headers={
+                "location": "https://cas-bridge.xethub.hf.co/object?sig=xyz",
+                "x-linked-size": "1519984962",
+                "x-linked-etag": '"deadbeef"',
+                "x-repo-commit": "abc123",
+            },
+        ),
+    )
+
+    await fallback_ops.try_fallback_resolve(
+        "model", "owner", "demo", "main", "weights.safetensors",
+        method="HEAD",
+        # Caller passes everything — Range, conditional, even
+        # Authorization (which the operations-layer filter normally
+        # drops anyway). The HEAD probe must receive none of it.
+        client_headers={
+            "Range": "bytes=0-100000",
+            "If-None-Match": '"abc"',
+            "Authorization": "Bearer secret",
+        },
+    )
+
+    head_calls = [c for c in FakeFallbackClient.calls if c[1] == "HEAD"]
+    assert len(head_calls) == 1
+    head_kwargs = head_calls[0][3]
+    # Two equivalent guards:
+    # (a) ``headers`` kwarg either absent or empty/None — the call
+    #     site does ``await client.head(kohaku_path, repo_type)`` with
+    #     no extra args.
+    fwd_headers = head_kwargs.get("headers") or {}
+    assert not fwd_headers, (
+        f"HEAD probe leaked client headers: {dict(fwd_headers)}. "
+        f"See PR #21 — Accept-Encoding propagation breaks Content-Length."
+    )
+    # (b) Specifically none of the whitelist or auth headers may
+    #     appear, even if a future implementation refactors how the
+    #     ``headers`` kwarg is shaped.
+    fwd_lower = {k.lower(): v for k, v in fwd_headers.items()}
+    for forbidden in ("range", "if-none-match", "authorization"):
+        assert forbidden not in fwd_lower

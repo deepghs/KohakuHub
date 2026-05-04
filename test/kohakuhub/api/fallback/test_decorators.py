@@ -141,16 +141,16 @@ async def test_with_repo_fallback_uses_resolve_operation_after_http_404(monkeypa
     hops = _decode_trace_header(result)
     assert any(h.get("decision") == "LOCAL_MISS" for h in hops)
     assert merged_inputs == [("owner-user", {"https://hf.local": "header-token"})]
-    assert resolve_calls == [
-        (
-            ("dataset", "owner", "demo", "main", "config.json"),
-            {
-                "user_tokens": {"https://hf.local": "token"},
-                "method": "HEAD",
-                "user": "owner-user",
-            },
-        )
-    ]
+    assert len(resolve_calls) == 1
+    args, kwargs = resolve_calls[0]
+    assert args == ("dataset", "owner", "demo", "main", "config.json")
+    assert kwargs["user_tokens"] == {"https://hf.local": "token"}
+    assert kwargs["method"] == "HEAD"
+    assert kwargs["user"] == "owner-user"
+    # Plan A: the decorator now also threads client_headers (raw
+    # request.headers) through; ``try_fallback_resolve`` is responsible
+    # for whitelisting Range/If-* and dropping everything else.
+    assert "client_headers" in kwargs
 
 
 @pytest.mark.asyncio
