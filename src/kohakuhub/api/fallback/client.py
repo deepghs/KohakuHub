@@ -107,7 +107,14 @@ class FallbackClient:
             httpx.HTTPError: On request failure
         """
         external_url = self.map_url(kohaku_path, repo_type)
-        headers = kwargs.pop("headers", {})
+        # ``dict.pop(key, default)`` returns the value when the key is
+        # present even if that value is ``None``; the default is only
+        # used when the key is absent. Callers (notably
+        # ``_resolve_one_source`` via ``client_headers or None``) may
+        # pass ``headers=None`` to mean "no extra headers" — coerce
+        # explicitly so the subsequent ``headers["Authorization"] = ...``
+        # cannot land on ``None``.
+        headers = kwargs.pop("headers", None) or {}
 
         # Add authentication if token available
         # IMPORTANT: Only use admin-configured token, NEVER user auth!
@@ -140,7 +147,14 @@ class FallbackClient:
             httpx.HTTPError: On request failure
         """
         external_url = self.map_url(kohaku_path, repo_type)
-        headers = kwargs.pop("headers", {})
+        # ``dict.pop(key, default)`` returns the value when the key is
+        # present even if that value is ``None``; the default is only
+        # used when the key is absent. Callers (notably
+        # ``_resolve_one_source`` via ``client_headers or None``) may
+        # pass ``headers=None`` to mean "no extra headers" — coerce
+        # explicitly so the subsequent ``headers["Authorization"] = ...``
+        # cannot land on ``None``.
+        headers = kwargs.pop("headers", None) or {}
 
         # Add authentication if token available
         if self.token:
@@ -189,7 +203,14 @@ class FallbackClient:
             httpx.HTTPError: On request failure
         """
         external_url = self.map_url(kohaku_path, repo_type)
-        headers = kwargs.pop("headers", {})
+        # ``dict.pop(key, default)`` returns the value when the key is
+        # present even if that value is ``None``; the default is only
+        # used when the key is absent. Callers (notably
+        # ``_resolve_one_source`` via ``client_headers or None``) may
+        # pass ``headers=None`` to mean "no extra headers" — coerce
+        # explicitly so the subsequent ``headers["Authorization"] = ...``
+        # cannot land on ``None``.
+        headers = kwargs.pop("headers", None) or {}
 
         # Add authentication if token available
         if self.token:
