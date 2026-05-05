@@ -52,7 +52,12 @@ from typing import Optional
 
 import pytest
 from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.errors import RepositoryNotFoundError
+
+# ``huggingface_hub.errors`` landed around v0.22; v0.20.3 (still in the CI
+# matrix) keeps these exceptions under ``huggingface_hub.utils``. The utils
+# path is the version-portable import that works against every client
+# version we target.
+from huggingface_hub.utils import RepositoryNotFoundError
 
 
 # ---------------------------------------------------------------------------

@@ -88,9 +88,25 @@ def test_hf_disabled_repo_dispatches_to_disabled_repo_error_in_huggingface_hub()
     """End-to-end: a real ``hf_raise_for_status`` against our wire shape
     must dispatch to ``DisabledRepoError``. This is what proves the
     helper's contract — without this assertion, we're just guessing at
-    HF's parsing rules."""
+    HF's parsing rules.
+
+    ``DisabledRepoError`` was added to ``huggingface_hub`` around
+    v0.21 / v0.22; CI still tests against v0.20.3 where the symbol is
+    not exported. Skip on those versions — the helper itself is still
+    valid (the unit tests above pin its on-the-wire shape); we just
+    can't assert the round-trip dispatch class on a client that
+    doesn't define the named exception.
+    """
     import httpx
-    from huggingface_hub.errors import DisabledRepoError
+
+    try:
+        # ``huggingface_hub.errors`` landed around v0.22; older versions
+        # keep these exceptions under ``huggingface_hub.utils``. Try the
+        # version-portable path, fall back to skip if unavailable.
+        from huggingface_hub.utils import DisabledRepoError
+    except ImportError:
+        pytest.skip("DisabledRepoError not exported by this hf_hub version")
+
     from huggingface_hub.utils._http import hf_raise_for_status
 
     response = hf_utils.hf_disabled_repo("acme-labs/private-dataset")
