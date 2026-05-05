@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from peewee import JOIN, fn
 
 from kohakuhub.config import cfg
@@ -219,12 +219,10 @@ async def get_repo_info(
         return hf_repo_not_found(repo_id, repo_type)
 
     # Hugging Face Hub hides private repos from unauthorized users.
-    try:
-        check_repo_read_permission(repo_row, user)
-    except HTTPException as exc:
-        if repo_row.private and exc.status_code in {401, 403}:
-            return hf_repo_not_found(repo_id, repo_type)
-        raise
+    # ``check_repo_read_permission`` raises ``RepoReadDeniedError`` for
+    # both anonymous-on-private and authed-no-access; the global handler
+    # in ``main.py`` converts that to ``hf_repo_not_found(...)``.
+    check_repo_read_permission(repo_row, user)
 
     # Get LakeFS info for default branch
     lakefs_repo = lakefs_repo_name(repo_type, repo_id)

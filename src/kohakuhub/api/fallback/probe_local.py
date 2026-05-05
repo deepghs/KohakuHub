@@ -318,8 +318,35 @@ async def probe_local(
         op, repo_type, namespace, name, revision, file_path, paths, request, user
     )
 
+    # ``RepoReadDeniedError`` is imported lazily here because the test
+    # harness reloads ``kohakuhub.auth.permissions`` between sessions
+    # (per-test backend isolation), giving the *route handler* and this
+    # module two different class objects with the same name —
+    # ``isinstance(exc, ImportedAtModuleLoad)`` then returns False even
+    # though they're "the same" exception. Re-resolving the class on the
+    # call path picks up whichever copy is currently bound to the
+    # handler chain.
+    from kohakuhub.auth.permissions import RepoReadDeniedError
+
     try:
         result = await inner(**kwargs)
+    except RepoReadDeniedError as e:
+        # ``RepoReadDeniedError`` propagates *past* ``with_repo_fallback``
+        # in production (the decorator only catches ``HTTPException``); the
+        # global FastAPI handler in ``main.py`` then converts it to
+        # ``404 + X-Error-Code: RepoNotFound``. The chain-tester probe
+        # bypasses both surfaces (we call the unwrapped inner directly),
+        # so we have to reproduce the conversion here to keep the
+        # simulate output in lockstep with what production would emit.
+        return _attempt_from_response(
+            method=method,
+            upstream_path=upstream_path,
+            started=started,
+            status=404,
+            x_error_code="RepoNotFound",
+            x_error_message=f"Repository '{e.repo_id}' ({e.repo_type}) not found",
+            body_preview=None,
+        )
     except HTTPException as e:
         x_code = (e.headers or {}).get("X-Error-Code") or (e.headers or {}).get(
             "x-error-code"

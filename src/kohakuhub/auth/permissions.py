@@ -9,6 +9,38 @@ from kohakuhub.constants import ERROR_USER_AUTH_REQUIRED
 from kohakuhub.db_operations import get_organization, get_user_organization
 
 
+class RepoReadDeniedError(Exception):
+    """Raised when a caller cannot read a repository.
+
+    Used by ``check_repo_read_permission`` for both anonymous-on-private
+    and authed-no-access cases. Distinct from ``HTTPException`` so the
+    fallback decorator's ``except HTTPException`` does **not** catch it
+    (we want the request to bypass the fallback chain — emitting a
+    privacy-preserving ``RepoNotFound`` to the caller is the local layer's
+    final answer; we shouldn't probe upstream sources for a repo we
+    deliberately want to mask).
+
+    A global FastAPI exception handler (registered in ``main.py``)
+    converts this exception into ``404 + X-Error-Code: RepoNotFound``,
+    aligning hkub's wire shape with HuggingFace's authed-style answer
+    for "repo doesn't exist (to you)" — which ``huggingface_hub.utils
+    ._http.hf_raise_for_status`` dispatches to ``RepositoryNotFoundError``.
+
+    Picking this over the anonymous 401-anti-enum shape (issue #76
+    Option A): privacy-preserving (anon and authed-no-access become
+    indistinguishable on the wire), simpler, and matches the
+    authenticated-caller shape HF returns.
+    """
+
+    def __init__(self, repo: Repository):
+        self.repo = repo
+        self.repo_id = repo.full_id
+        self.repo_type = repo.repo_type
+        super().__init__(
+            f"Read access denied to {self.repo_type} '{self.repo_id}'"
+        )
+
+
 def check_namespace_permission(
     namespace: str,
     user: Optional[User],
@@ -92,11 +124,14 @@ def check_repo_read_permission(
     if not repo.private:
         return True
 
-    # Private repos require authentication
+    # Private repos: anonymous-on-private and authed-no-access both
+    # collapse to ``RepoReadDeniedError`` so the wire shape is identical
+    # for both callers (privacy-preserving Option A from #76 — hides the
+    # private-repo enumeration leak that distinct 401-vs-403 responses
+    # would otherwise expose, and maps cleanly through hf_raise_for_status
+    # to ``RepositoryNotFoundError`` on the client).
     if not user:
-        raise HTTPException(
-            401, detail="Authentication required to access private repository"
-        )
+        raise RepoReadDeniedError(repo)
 
     # Check if user is the creator (namespace matches username)
     if repo.namespace == user.username:
@@ -109,9 +144,7 @@ def check_repo_read_permission(
         if membership:
             return True
 
-    raise HTTPException(
-        403, detail=f"You don't have access to private repository '{repo.full_id}'"
-    )
+    raise RepoReadDeniedError(repo)
 
 
 def check_repo_write_permission(
