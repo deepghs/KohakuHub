@@ -114,7 +114,7 @@ def test_hf_disabled_repo_dispatches_to_disabled_repo_error_in_huggingface_hub()
         # ``huggingface_hub.errors`` landed around v0.22; older versions
         # keep these exceptions under ``huggingface_hub.utils``. Try the
         # version-portable path, fall back to skip if unavailable.
-        from huggingface_hub.utils import DisabledRepoError
+        from huggingface_hub.utils import DisabledRepoError, HfHubHTTPError
     except ImportError:
         pytest.skip("DisabledRepoError not exported by this hf_hub version")
 
@@ -138,15 +138,21 @@ def test_hf_disabled_repo_dispatches_to_disabled_repo_error_in_huggingface_hub()
 
     # Probe whether this hf_hub version actually wires the
     # disabled-message dispatch. v0.30 / v0.36 export DisabledRepoError
-    # but the dispatch branch in hf_raise_for_status only landed ~v1.0,
-    # so older versions raise a non-DisabledRepoError on the same wire.
+    # but the dispatch branch in hf_raise_for_status only landed ~v1.0;
+    # those older versions raise either ``httpx.HTTPStatusError`` (the
+    # raw httpx 4xx default) or a generic ``HfHubHTTPError``. Catch
+    # exactly those two families so a future hf_hub version that
+    # dispatches the same wire shape to a *different* specific
+    # exception (an unlikely but possible API drift) surfaces as a
+    # genuine pytest failure instead of being swallowed by an
+    # over-broad ``except Exception``.
     try:
         hf_raise_for_status(_build_fake())
     except DisabledRepoError:
         # Already proved the round-trip works; the assertion below would
         # have raised on the next call if we let it.
         return
-    except Exception:
+    except (httpx.HTTPStatusError, HfHubHTTPError):
         pytest.skip(
             "hf_raise_for_status in this version does not dispatch the "
             "X-Error-Message=='Access to this resource is disabled.' "
