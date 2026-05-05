@@ -47,6 +47,31 @@ OperationType = Literal["resolve", "tree", "info", "revision", "paths_info"]
 UserOperationType = Literal["profile", "repos", "avatar"]
 
 
+def _resolve_repo_read_denied_error() -> type:
+    """Resolve ``RepoReadDeniedError`` lazily.
+
+    The test harness in ``test/kohakuhub/support/bootstrap.py`` clears
+    every ``kohakuhub.*`` module from ``sys.modules`` and re-imports
+    them at session start, then returns a fresh ``app`` instance. Tests
+    that exercise the wrapper after the reload may end up with this
+    decorator module bound to a *previous* ``RepoReadDeniedError``
+    class object — different ``id()`` from the one the live
+    ``check_repo_read_permission`` raises. ``isinstance()`` then
+    silently returns False even on legitimate raises, and the generic
+    ``except Exception`` branch below converts the masked-private-repo
+    raise into a 500. The chain-tester probe (``probe_local.py``) hit
+    the same gotcha and uses the same lazy-resolve trick.
+
+    Re-resolving from ``sys.modules`` on every call binds whichever
+    copy is currently live, so the ``except`` clause matches at
+    request time regardless of any reload that happened between
+    decorator import and the route call.
+    """
+    from kohakuhub.auth.permissions import RepoReadDeniedError
+
+    return RepoReadDeniedError
+
+
 def _repo_sort_key(item: dict) -> tuple[str, str, str]:
     return (
         item.get("lastModified") or "",
@@ -358,6 +383,27 @@ def with_repo_fallback(operation: OperationType):
                 # swallow these. No trace recorded (the request itself
                 # is being aborted; the chain tester won't see this
                 # response anyway).
+                raise
+
+            except _resolve_repo_read_denied_error():
+                # ``RepoReadDeniedError`` is the privacy-preserving raise
+                # from ``check_repo_read_permission`` for masked private
+                # repos (post-#76). It must reach the FastAPI global
+                # handler in ``main.py`` to be converted to
+                # ``404 + X-Error-Code: RepoNotFound`` with an empty
+                # body — getting absorbed into the ``except Exception``
+                # branch below would degrade it into a 500 and silently
+                # break the wire-shape contract. Skip the chain probe
+                # entirely (we don't want to leak the existence of a
+                # private local repo by lighting up upstream traffic
+                # for it) and re-raise so the global handler runs.
+                #
+                # The class is resolved lazily because the test harness
+                # reloads ``kohakuhub.auth.permissions`` between
+                # sessions; a module-level import would freeze a stale
+                # class identity and ``isinstance()`` would silently
+                # miss legitimate raises (same gotcha the
+                # ``fallback/probe_local.py`` lazy import documents).
                 raise
 
             except Exception as e:

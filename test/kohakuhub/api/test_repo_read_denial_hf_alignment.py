@@ -113,6 +113,40 @@ async def test_info_anon_on_private_dataset_returns_repo_not_found(client):
     _assert_repo_not_found(response)
 
 
+async def test_info_anon_on_private_dataset_returns_repo_not_found_with_fallback_enabled(
+    client, monkeypatch
+):
+    """Production-shape regression guard for the fallback-decorator
+    interaction.
+
+    Other tests in this module pass ``?fallback=false`` to isolate the
+    *local* response shape from any chain-probe behavior. This test
+    deliberately does not — it pins the wire shape on the actual
+    production code path where ``cfg.fallback.enabled=True`` (the
+    production default) and the decorator wraps the endpoint with its
+    full try/except machinery.
+
+    The decorator catches generic ``Exception`` to route LakeFS / DB /
+    timeout failures to ``LOCAL_OTHER_ERROR`` + 500. A naive
+    ``RepoReadDeniedError`` design would be swallowed by that branch and
+    re-raised as a 500 — letting the global handler in ``main.py``
+    never run, and silently regressing this PR's wire-shape promise
+    for every fallback-enabled deployment. Pin the contract so a
+    future refactor of the decorator can't unwire the privacy
+    translation invisibly.
+    """
+    from kohakuhub.config import cfg
+
+    monkeypatch.setattr(cfg.fallback, "enabled", True)
+
+    response = await client.get(
+        "/api/datasets/acme-labs/private-dataset",
+        # NOTE: deliberately no ``?fallback=false`` — we want the
+        # wrapper's full code path.
+    )
+    _assert_repo_not_found(response)
+
+
 async def test_info_outsider_on_private_dataset_returns_repo_not_found(outsider_client):
     response = await outsider_client.get(
         "/api/datasets/acme-labs/private-dataset",
