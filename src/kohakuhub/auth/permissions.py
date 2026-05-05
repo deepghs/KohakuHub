@@ -13,12 +13,19 @@ class RepoReadDeniedError(Exception):
     """Raised when a caller cannot read a repository.
 
     Used by ``check_repo_read_permission`` for both anonymous-on-private
-    and authed-no-access cases. Distinct from ``HTTPException`` so the
-    fallback decorator's ``except HTTPException`` does **not** catch it
-    (we want the request to bypass the fallback chain — emitting a
-    privacy-preserving ``RepoNotFound`` to the caller is the local layer's
-    final answer; we shouldn't probe upstream sources for a repo we
-    deliberately want to mask).
+    and authed-no-access cases. Inheriting from ``Exception`` (not
+    ``HTTPException``) keeps the fallback decorator's ``except
+    HTTPException`` from absorbing it — but on its own that is **not
+    sufficient** to preserve propagation, because ``with_repo_fallback``
+    also has a generic ``except Exception`` block that converts
+    LakeFS / DB / timeout failures into a 500. Propagation past the
+    decorator depends on the *explicit* ``except RepoReadDeniedError:
+    raise`` clause sitting between the cancellation handler and the
+    generic catch (``api/fallback/decorators.py``). Both pieces — the
+    inheritance choice **and** the decorator's explicit re-raise — are
+    load-bearing. Skipping the chain probe is the intended outcome:
+    we don't want to leak the existence of a masked private local repo
+    by emitting upstream traffic for it.
 
     A global FastAPI exception handler (registered in ``main.py``)
     converts this exception into ``404 + X-Error-Code: RepoNotFound``,
@@ -27,9 +34,18 @@ class RepoReadDeniedError(Exception):
     ._http.hf_raise_for_status`` dispatches to ``RepositoryNotFoundError``.
 
     Picking this over the anonymous 401-anti-enum shape (issue #76
-    Option A): privacy-preserving (anon and authed-no-access become
-    indistinguishable on the wire), simpler, and matches the
-    authenticated-caller shape HF returns.
+    Option A): the **wire shape** is identical for anonymous-on-private
+    and authed-no-access, simpler than mirroring HF's anon-vs-authed
+    branch, and matches what HF returns to authenticated callers. Note
+    that "wire-shape identical" is **not the same as** "fully
+    indistinguishable": the authed-no-access path executes additional
+    DB lookups (``get_organization``, ``get_user_organization``) that
+    the anon path doesn't, leaving a sub-millisecond timing-side-channel
+    that could in principle be exploited at scale. Treating that as
+    out-of-scope for now — HF's own backend has the equivalent
+    asymmetry, and a constant-time path would mean adding 2 always-
+    needless DB hits to every anon read. Document the gap honestly
+    rather than overclaim equivalence.
     """
 
     def __init__(self, repo: Repository):

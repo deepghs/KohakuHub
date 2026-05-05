@@ -133,10 +133,17 @@ async def _repo_read_denied_handler(request: Request, exc: RepoReadDeniedError):
     downstream libraries (``transformers``, ``datasets``, …) key off for
     actionable error messages.
 
-    See ``RepoReadDeniedError``'s docstring for why this is a non-
-    ``HTTPException`` exception class — keeping the fallback decorator's
-    ``except HTTPException`` from catching it is what makes the chain
-    skip upstream lookups for masked private repos.
+    See ``RepoReadDeniedError``'s docstring for the full propagation
+    story. Short version: the inheritance choice (``Exception``, not
+    ``HTTPException``) keeps the fallback decorator's ``except
+    HTTPException`` from translating it into a 4xx, **and** an explicit
+    ``except RepoReadDeniedError: raise`` in
+    ``api/fallback/decorators.py`` keeps the generic ``except
+    Exception`` from collapsing it into a 500. Both are needed; missing
+    either degrades the wire shape silently. The chain probe is
+    intentionally not entered for this case — the strict-consistency
+    "local namespace wins absolutely" rule applies even when the local
+    layer is hiding the repo.
     """
     return hf_repo_not_found(exc.repo_id, exc.repo_type)
 

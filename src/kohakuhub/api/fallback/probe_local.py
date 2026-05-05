@@ -331,13 +331,18 @@ async def probe_local(
     try:
         result = await inner(**kwargs)
     except RepoReadDeniedError as e:
-        # ``RepoReadDeniedError`` propagates *past* ``with_repo_fallback``
-        # in production (the decorator only catches ``HTTPException``); the
-        # global FastAPI handler in ``main.py`` then converts it to
-        # ``404 + X-Error-Code: RepoNotFound``. The chain-tester probe
-        # bypasses both surfaces (we call the unwrapped inner directly),
-        # so we have to reproduce the conversion here to keep the
-        # simulate output in lockstep with what production would emit.
+        # ``RepoReadDeniedError`` propagates past ``with_repo_fallback``
+        # in production: the decorator's ``except HTTPException`` skips
+        # it (wrong base class) **and** an explicit ``except
+        # RepoReadDeniedError: raise`` re-raises it past the generic
+        # ``except Exception`` catch — see
+        # ``api/fallback/decorators.py``. The global FastAPI handler in
+        # ``main.py`` then converts it to ``404 + X-Error-Code:
+        # RepoNotFound``. The chain-tester probe here bypasses both the
+        # decorator and the global handler (we call the unwrapped inner
+        # directly), so we have to reproduce the conversion locally to
+        # keep the simulate output in lockstep with what production
+        # actually emits for this case.
         return _attempt_from_response(
             method=method,
             upstream_path=upstream_path,
