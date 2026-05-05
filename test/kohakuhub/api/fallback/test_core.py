@@ -971,3 +971,98 @@ async def test_probe_full_chain_exhaust_with_sources_uses_aggregate(
     assert body["detail"] == "No fallback source serves this repository."
     assert body["sources"][0]["name"] == "hf"
     assert body["sources"][0]["status"] == 401
+
+
+# ---------------------------------------------------------------------------
+# _build_chain_exhausted_aggregate — NETWORK_ERROR transport branch
+# (mirrors the TIMEOUT test above; both are transport-level failures
+# that production routes through ``build_aggregate_failure_response``
+# with status=None and the per-decision category retained.)
+# ---------------------------------------------------------------------------
+
+
+def test_build_chain_exhausted_aggregate_network_error_attempts_use_network_category():
+    """Per-source ``NETWORK_ERROR`` (e.g. DNS failure, connection
+    refused, TLS error) keeps the ``network`` category through
+    aggregate reconstruction — paired with the existing TIMEOUT test
+    above so the simulate's transport-failure branches are both
+    pinned. Without this, production-parity for "all sources network-
+    failed" simulate output silently regresses."""
+    out = core._build_chain_exhausted_aggregate(
+        "info",
+        [_attempt(
+            status_code=None, decision="NETWORK_ERROR",
+            error="dns lookup failed: no such host",
+        )],
+    )
+    assert out["status_code"] == 502
+    body = json.loads(out["body_preview"])
+    assert body["sources"][0]["category"] == "network"
+    assert body["sources"][0]["status"] is None
+    assert "dns lookup failed" in body["sources"][0]["message"]
+
+
+def test_build_chain_exhausted_aggregate_network_error_falls_back_to_default_message():
+    """When ``error`` is unset on a NETWORK_ERROR attempt, the helper
+    fills in ``"network error"`` so the per-source message field is
+    never empty in the simulate JSON."""
+    out = core._build_chain_exhausted_aggregate(
+        "info",
+        [_attempt(status_code=None, decision="NETWORK_ERROR", error=None)],
+    )
+    body = json.loads(out["body_preview"])
+    assert body["sources"][0]["message"] == "network error"
+
+
+# ---------------------------------------------------------------------------
+# _extract_message_from_preview — branches not reached on the happy path
+#
+# The helper is called via ``_build_chain_exhausted_aggregate`` to mirror
+# production's ``extract_error_message``. Most production-shape JSON
+# uses a top-level string ``error`` field (covered above); these tests
+# pin the less-common payload shapes so the simulate doesn't crash on
+# (or silently mishandle) responses outside that shape.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_message_from_preview_truncation_only_returns_none():
+    """When the preview is *only* the truncation marker (caller
+    captured zero bytes before truncation kicked in), stripping the
+    marker leaves an empty string. Returning ``None`` lets the caller
+    fall back to ``HTTP {status}`` rather than emitting an empty
+    message — production's ``extract_error_message`` does the same."""
+    assert core._extract_message_from_preview(
+        "\n…[truncated, total 9999 bytes]"
+    ) is None
+
+
+def test_extract_message_from_preview_handles_nested_dict_message():
+    """Some upstream APIs return ``{"detail": {"message": "..."}}``
+    instead of a flat ``{"detail": "..."}``. The extractor descends one
+    level so the user-facing message field still surfaces. Pin this
+    so a future "flat-only" simplification doesn't silently lose the
+    nested-dict payload that some HF mirrors / proxies emit."""
+    assert core._extract_message_from_preview(
+        '{"detail": {"message": "real cause", "code": 42}}'
+    ) == "real cause"
+
+
+def test_extract_message_from_preview_dict_without_known_fields_returns_str():
+    """Dict payload with none of the
+    ``error/message/detail/msg`` fields — the extractor falls back to
+    ``str(parsed)`` rather than returning ``None`` so the operator
+    still sees the raw payload (debugging aid). The simulate JSON's
+    ``message`` field then carries the stringified dict, capped at
+    ``MAX_ATTEMPT_MESSAGE_LEN`` by the caller."""
+    out = core._extract_message_from_preview('{"unrelated": "value", "n": 7}')
+    # Python's str(dict) ordering is insertion-stable since 3.7.
+    assert out == "{'unrelated': 'value', 'n': 7}"
+
+
+def test_extract_message_from_preview_top_level_non_dict_returns_str():
+    """Valid JSON, but the top level is a list / number / string
+    rather than a dict (rare on HF but happens on some proxies that
+    return bare arrays). Falls through to ``str(parsed)`` so the
+    payload still appears in the simulate."""
+    assert core._extract_message_from_preview("[1, 2, 3]") == "[1, 2, 3]"
+    assert core._extract_message_from_preview("42") == "42"
