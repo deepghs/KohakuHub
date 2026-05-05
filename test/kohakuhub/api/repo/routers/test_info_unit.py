@@ -339,17 +339,25 @@ async def test_get_repo_info_covers_invalid_type_not_found_siblings_and_storage_
 
     repo_row.private = True
 
-    def _raise_unauthorized(repo, user):
-        raise HTTPException(status_code=401, detail="auth required")
+    # Privacy translation now lives in main.py's global handler post-#76;
+    # ``get_repo_info`` itself just propagates ``RepoReadDeniedError``.
+    # The on-the-wire 404 + RepoNotFound shape is integration-tested in
+    # ``test_repo_read_denial_hf_alignment.py``.
+    from kohakuhub.auth.permissions import RepoReadDeniedError
 
-    monkeypatch.setattr(repo_info, "check_repo_read_permission", _raise_unauthorized)
-    hidden_private = await repo_info.get_repo_info.__wrapped__(
-        "alice",
-        "demo",
-        request=_request("/api/models/alice/demo"),
-        user=None,
-    )
-    assert hidden_private.status_code == 404
+    def _raise_read_denied(repo, user):
+        raise RepoReadDeniedError(
+            SimpleNamespace(full_id="alice/demo", repo_type="model")
+        )
+
+    monkeypatch.setattr(repo_info, "check_repo_read_permission", _raise_read_denied)
+    with pytest.raises(RepoReadDeniedError):
+        await repo_info.get_repo_info.__wrapped__(
+            "alice",
+            "demo",
+            request=_request("/api/models/alice/demo"),
+            user=None,
+        )
 
     def _raise_conflict(repo, user):
         raise HTTPException(status_code=409, detail="unexpected")
