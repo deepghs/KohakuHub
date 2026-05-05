@@ -1,6 +1,7 @@
 import { defineStore, acceptHMRUpdate } from "pinia";
 import { ref, computed } from "vue";
 import { verifyAdminToken } from "@/utils/api";
+import { resetChainTesterState } from "@/composables/useChainTesterState";
 
 /**
  * Admin store - manages admin token in memory only (no persistence)
@@ -37,6 +38,11 @@ export const useAdminStore = defineStore("admin", () => {
   function logout() {
     token.value = "";
     isAuthenticated.value = false;
+    // Reset module-level chain tester state so the next operator's
+    // session starts clean (the state survives SPA route switches
+    // intentionally — see useChainTesterState for the rationale —
+    // but a logout should always wipe it).
+    resetChainTesterState();
   }
 
   return {
