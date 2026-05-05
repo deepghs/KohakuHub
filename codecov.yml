@@ -7,21 +7,8 @@ coverage:
           - frontend
           - frontend-admin
         paths:
-          # Orchestration-heavy Vue / admin-API surfaces that don't have
-          # a clean unit-test surface (dialog wiring, breadcrumb glue,
-          # composable lifecycle, dozens of router+API method wrappers).
-          # Each file has dedicated component / page-level tests covering
-          # the new behaviour; the structural gap is the same pattern
-          # ``RepoViewer.vue`` already documents below — gating on
-          # 100% coverage here would punish landings even when every
-          # added behaviour is exhaustively tested.
           - "!src/kohaku-hub-ui/src/components/repo/RepoViewer.vue"
           - "!src/components/repo/RepoViewer.vue"
-          - "!src/kohaku-hub-ui/src/components/repo/preview/TarBrowserPanel.vue"
-          - "!src/kohaku-hub-admin/src/utils/api.js"
-          - "!src/kohaku-hub-admin/src/pages/credentials.vue"
-          - "!src/kohaku-hub-admin/src/pages/fallback-sources.vue"
-          - "!src/kohaku-hub-admin/src/pages/health.vue"
         # Allow a small drop from base. New large modules with
         # hard-to-test canvas / composable lifecycle paths (e.g.
         # tar-thumbnail.js's decoder + IO subscribe) genuinely
@@ -45,20 +32,7 @@ coverage:
         # (RepoViewer paths, tar-browser, thumbnails) cover the new
         # logic; project gating already tolerates the structural
         # gap, so patch should not gate on it either.
-        #
-        # The same logic applies to the admin SPA surfaces and the
-        # admin API client — each has dedicated page / utility tests
-        # that exercise the new behaviour, but the orchestration
-        # plumbing (dozens of method wrappers, tab-state composables,
-        # autocomplete debouncers) lands below 100% without
-        # representing a real coverage regression. Aligning the
-        # patch-side exclusion list with the project-side one above.
         paths:
           - "!src/kohaku-hub-ui/src/components/repo/RepoViewer.vue"
           - "!src/components/repo/RepoViewer.vue"
-          - "!src/kohaku-hub-ui/src/components/repo/preview/TarBrowserPanel.vue"
-          - "!src/kohaku-hub-admin/src/utils/api.js"
-          - "!src/kohaku-hub-admin/src/pages/credentials.vue"
-          - "!src/kohaku-hub-admin/src/pages/fallback-sources.vue"
-          - "!src/kohaku-hub-admin/src/pages/health.vue"
         threshold: 1%
