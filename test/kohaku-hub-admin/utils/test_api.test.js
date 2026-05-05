@@ -863,4 +863,29 @@ describe("admin API client", () => {
     expect(api.parseSize("unlimited")).toBeNull();
     expect(api.parseSize("broken")).toBeNull();
   });
+
+  it("getCacheStats and resetCacheMetrics route through the admin client", async () => {
+    // Two cache-monitoring helpers exposed for the admin SPA's
+    // cache page (post-#74). Plain admin-token-headed wrappers
+    // around ``GET /cache/stats`` and ``POST /cache/metrics/reset``;
+    // worth pinning so a refactor that renames the endpoints (or
+    // accidentally drops the admin-token header) gets caught.
+    const api = await loadModule();
+
+    client.get.mockResolvedValueOnce({
+      data: { metrics: { hits: 100, misses: 5 }, memory: { used_bytes: 1234 } },
+    });
+    client.post.mockResolvedValueOnce({ data: { reset: true } });
+
+    const stats = await api.getCacheStats("admin-token");
+    expect(stats).toEqual({
+      metrics: { hits: 100, misses: 5 },
+      memory: { used_bytes: 1234 },
+    });
+    expect(client.get).toHaveBeenCalledWith("/cache/stats");
+
+    const reset = await api.resetCacheMetrics("admin-token");
+    expect(reset).toEqual({ reset: true });
+    expect(client.post).toHaveBeenCalledWith("/cache/metrics/reset");
+  });
 });

@@ -373,4 +373,50 @@ describe("admin credentials page", () => {
     expect(mocks.dialogs.showError).toHaveBeenCalled();
     expect(mocks.adminStore.logout).not.toHaveBeenCalled();
   });
+
+  it("returns silently when the bulk-revoke confirm dialog is cancelled", async () => {
+    // ``confirmDialog`` rejects (per the project's helper contract) when
+    // the user clicks Cancel. The inner ``catch { return; }`` at
+    // credentials.vue:215-217 must short-circuit *before* the API call,
+    // never showWarning the user (they explicitly chose to cancel).
+    mocks.dialogs.confirmDialog.mockRejectedValueOnce(new Error("cancelled"));
+
+    const wrapper = mountPage();
+    await flushPromises();
+
+    wrapper.vm.bulkRevokeForm = { user: "outsider", beforeTs: "" };
+    await wrapper.vm.submitBulkRevoke();
+    await flushPromises();
+
+    expect(mocks.api.revokeAdminSessionsBulk).not.toHaveBeenCalled();
+    // No warning toast — cancellation is a clean exit, not an error.
+    expect(mocks.dialogs.showWarning).not.toHaveBeenCalled();
+    // Dialog stays open so the operator can re-attempt without
+    // re-typing the form.
+    expect(wrapper.vm.bulkRevokeOpen).toBe(false);
+  });
+
+  it("surfaces a backend error via handleApiError when bulk revoke API fails", async () => {
+    // Pin the error-path branch at credentials.vue:224-226 — the bulk
+    // revoke API throws AFTER the operator confirmed; we route it
+    // through ``handleApiError`` which (for non-401/403 failures) calls
+    // ``showError`` with a friendly message. Existing
+    // "surfaces backend errors via showError when revoke fails with
+    // 5xx" covers the *single*-revoke path; this is the bulk variant.
+    mocks.dialogs.confirmDialog.mockResolvedValueOnce(undefined);
+    const failure = new Error("bulk failed");
+    failure.response = { status: 500, data: {} };
+    mocks.api.revokeAdminSessionsBulk.mockRejectedValueOnce(failure);
+
+    const wrapper = mountPage();
+    await flushPromises();
+
+    wrapper.vm.bulkRevokeForm = { user: "outsider", beforeTs: "" };
+    await wrapper.vm.submitBulkRevoke();
+    await flushPromises();
+
+    expect(mocks.api.revokeAdminSessionsBulk).toHaveBeenCalledTimes(1);
+    expect(mocks.dialogs.showError).toHaveBeenCalled();
+    expect(mocks.adminStore.logout).not.toHaveBeenCalled();
+  });
 });

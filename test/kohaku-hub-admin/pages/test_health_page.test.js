@@ -50,6 +50,17 @@ vi.mock("element-plus", async () => {
 
 import HealthPage from "@/pages/health.vue";
 
+// Resolved at runtime via the vi.mock above. ``vi.importActual`` goes
+// through Vitest's resolver (which respects the vite alias inherited
+// from the admin workspace's vitest.config.js), not Vite's
+// static-analysis pass, so element-plus loads from
+// ``src/kohaku-hub-admin/node_modules`` even though this test file
+// lives outside that workspace. We resolve once and cache for use in
+// each test that needs to spy on ``ElMessage``.
+async function getElMessage() {
+  return (await vi.importActual("element-plus")).ElMessage;
+}
+
 const SAMPLE_PAYLOAD = {
   overall_status: "ok",
   checked_at_ms: 1_700_000_000_000,
@@ -246,5 +257,103 @@ describe("admin health page", () => {
     await flushPromises();
     // The interval was cancelled by onBeforeUnmount; no further refreshes.
     expect(mocks.api.getDependencyHealth).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a non-auth backend error via ElMessage and lastError when not silent", async () => {
+    // Drives the catch-block branch at health.vue:77-84 — non-401/403
+    // failure must (a) prefer ``error.response.data.detail.error`` for
+    // the human-readable detail, (b) fall through ``ElMessage.error``
+    // since this is a manual reload (silent=false). Existing tests
+    // cover the 401/403 logout paths but stop at the early ``return``
+    // — those branches never reach the detail-extraction or
+    // toast-emission below.
+    const ElMessage = await getElMessage();
+    const errorSpy = vi.spyOn(ElMessage, "error").mockImplementation(noop);
+
+    const failure = new Error("boom");
+    failure.response = {
+      status: 500,
+      data: { detail: { error: "upstream probe is down" } },
+    };
+    mocks.api.getDependencyHealth.mockRejectedValueOnce(failure);
+
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(mocks.adminStore.logout).not.toHaveBeenCalled();
+    expect(wrapper.vm.lastError).toBe("upstream probe is down");
+    expect(errorSpy).toHaveBeenCalledWith("upstream probe is down");
+
+    errorSpy.mockRestore();
+  });
+
+  it("falls back to error.message when the response carries no detail.error", async () => {
+    // Same catch-block as above but with no structured detail —
+    // exercises the ``error.message`` middle term of the
+    // ``detail = ... || ... || ...`` chain.
+    const ElMessage = await getElMessage();
+    const errorSpy = vi.spyOn(ElMessage, "error").mockImplementation(noop);
+
+    const failure = new Error("network fell over");
+    failure.response = { status: 502, data: {} };
+    mocks.api.getDependencyHealth.mockRejectedValueOnce(failure);
+
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(wrapper.vm.lastError).toBe("network fell over");
+    expect(errorSpy).toHaveBeenCalledWith("network fell over");
+
+    errorSpy.mockRestore();
+  });
+
+  it("uses the default detail when both response.detail and error.message are missing", async () => {
+    // Exercises the third (final-fallback) term of the detail chain.
+    const ElMessage = await getElMessage();
+    const errorSpy = vi.spyOn(ElMessage, "error").mockImplementation(noop);
+
+    // Construct an error with NO .message and NO .response — the chain
+    // collapses to the hard-coded fallback string.
+    const failure = Object.assign(Object.create(null), {});
+    mocks.api.getDependencyHealth.mockRejectedValueOnce(failure);
+
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(wrapper.vm.lastError).toBe("Failed to load dependency health");
+    expect(errorSpy).toHaveBeenCalledWith("Failed to load dependency health");
+
+    errorSpy.mockRestore();
+  });
+
+  it("does NOT emit ElMessage.error when the failure happens during a silent auto-refresh", async () => {
+    // Pin the ``if (!silent)`` gate at health.vue:82. Auto-refresh
+    // ticks pass ``{ silent: true }`` so a flaky probe doesn't
+    // toast-spam every 30 seconds; only ``lastError`` should update.
+    const ElMessage = await getElMessage();
+    const errorSpy = vi.spyOn(ElMessage, "error").mockImplementation(noop);
+
+    // First load succeeds so the page renders normally.
+    mocks.api.getDependencyHealth.mockResolvedValueOnce(SAMPLE_PAYLOAD);
+    const wrapper = mountPage();
+    await flushPromises();
+
+    // Switch to a 30s auto-refresh interval; the next tick errors out.
+    const select = wrapper.get('[data-el-select="true"]');
+    await select.setValue(30);
+    await flushPromises();
+
+    const failure = new Error("transient");
+    failure.response = { status: 502, data: {} };
+    mocks.api.getDependencyHealth.mockRejectedValueOnce(failure);
+
+    vi.advanceTimersByTime(30_000);
+    await flushPromises();
+
+    expect(wrapper.vm.lastError).toBe("transient");
+    // Critically: no toast — silent=true path.
+    expect(errorSpy).not.toHaveBeenCalled();
+
+    errorSpy.mockRestore();
   });
 });
