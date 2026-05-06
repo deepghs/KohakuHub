@@ -776,6 +776,66 @@ async def test_entry_not_found_raises_named_error_on_download(
         )
 
 
+async def test_create_repo_private_flag_is_honored_across_hf_versions(
+    live_server_url, hf_api_token, outsider_hf_api_token
+):
+    """``HfApi.create_repo(repo_id, private=True)`` must produce a real
+    private repo regardless of which on-the-wire shape the installed
+    client uses.
+
+    Two shapes exist in the wild and the backend must accept both:
+
+    * ``huggingface_hub<1`` — the client sends ``{"private": true}`` in
+      the create_repo body.
+    * ``huggingface_hub>=1.x`` — the client resolves ``private=True`` via
+      ``_resolve_repo_visibility`` into ``payload["visibility"] = "private"``
+      and *no longer sends* the legacy ``private`` field.
+
+    The end-to-end shape of "private" matters here, not just a single
+    metadata field. This test drives the whole loop through the real
+    ``huggingface_hub`` client (no raw HTTP) so a regression in any link
+    of the chain — wire parsing, DB column write, owner read-back,
+    outsider hidden-private semantics — surfaces as a single failure:
+
+    1. owner ``create_repo(private=True)`` succeeds;
+    2. owner ``repo_info`` reports ``private=True``;
+    3. owner ``repo_exists`` is ``True``;
+    4. outsider ``repo_exists`` is ``False`` (hidden-private);
+    5. outsider ``repo_info`` raises ``RepositoryNotFoundError``
+       (no 401/403 existence leak — same contract as
+       ``test_hidden_private_repo_is_invisible_to_outsider``).
+
+    The same dual-shape handling already lives in
+    ``update_repo_settings`` (commit 19c2a5c); this extends it to
+    ``create_repo``.
+    """
+    owner_api = _api(live_server_url, hf_api_token)
+    outsider_api = _api(live_server_url, outsider_hf_api_token)
+    repo_id = "owner/hf-deep-create-private"
+
+    await _run(owner_api.create_repo, repo_id, private=True)
+
+    # 1. Owner sees the repo as private through repo_info.
+    info = await _run(owner_api.repo_info, repo_id)
+    assert info.private is True, (
+        "create_repo(private=True) produced a public repo — the backend "
+        "likely dropped the visibility/private field sent by this client "
+        "version. v0 sends 'private', v1 sends 'visibility'; the create "
+        "endpoint must accept both."
+    )
+
+    # 2. Owner can confirm existence.
+    assert await _run(owner_api.repo_exists, repo_id) is True
+
+    # 3. Outsider must get the hidden-private response shape: existence
+    # check returns False and direct info raises 404 — proving the
+    # ``private=True`` flag is enforced by the access-control layer, not
+    # just stamped onto a metadata field.
+    assert await _run(outsider_api.repo_exists, repo_id) is False
+    with pytest.raises(RepositoryNotFoundError):
+        await _run(outsider_api.repo_info, repo_id)
+
+
 async def test_update_repo_settings_visibility_field_is_honored(
     live_server_url, hf_api_token
 ):

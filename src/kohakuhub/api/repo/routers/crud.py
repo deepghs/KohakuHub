@@ -92,12 +92,23 @@ def _repo_exists_response(
 
 
 class CreateRepoPayload(BaseModel):
-    """Payload for repository creation."""
+    """Payload for repository creation.
+
+    Accepts the two on-the-wire shapes ``huggingface_hub`` clients use:
+
+    * ``huggingface_hub<1`` sends ``{"private": true}`` directly.
+    * ``huggingface_hub>=1.x`` resolves ``private=True`` into
+      ``{"visibility": "private"}`` and no longer sends the legacy
+      ``private`` field. The same dual-shape handling lives in the
+      ``update_repo_settings`` payload (commit 19c2a5c); this mirror
+      keeps the create endpoint compatible with both client versions.
+    """
 
     type: RepoType = "model"
     name: str
     organization: Optional[str] = None
-    private: bool = False
+    private: Optional[bool] = None
+    visibility: Optional[str] = None
     sdk: Optional[str] = None
 
 
@@ -202,6 +213,34 @@ async def _cleanup_orphan_namespace_if_safe(
     return deleted_count > 0
 
 
+def _resolve_create_repo_private(payload: CreateRepoPayload) -> bool:
+    """Collapse ``private`` and ``visibility`` into a single bool.
+
+    Mirrors the resolution used by ``update_repo_settings`` so the create
+    endpoint is compatible with both ``huggingface_hub<1`` (sends
+    ``private``) and ``huggingface_hub>=1.x`` (sends ``visibility``).
+    Explicit ``private`` takes precedence; ``visibility`` is only consulted
+    when ``private`` was not sent. Defaults to public when neither is set.
+    """
+    if payload.private is not None:
+        return bool(payload.private)
+    if payload.visibility is None:
+        return False
+    if payload.visibility == "private":
+        return True
+    if payload.visibility == "public":
+        return False
+    raise HTTPException(
+        400,
+        detail={
+            "error": (
+                "Unsupported repository visibility. "
+                "Only 'public' and 'private' are supported."
+            )
+        },
+    )
+
+
 @router.post("/repos/create")
 async def create_repo(
     payload: CreateRepoPayload, user: User = Depends(get_current_user)
@@ -218,6 +257,7 @@ async def create_repo(
     logger.info(
         f"Creating repository: {payload.organization or user.username}/{payload.name}"
     )
+    resolved_private = _resolve_create_repo_private(payload)
     namespace = payload.organization or user.username
 
     # Check if user has permission to use this namespace
@@ -305,7 +345,7 @@ async def create_repo(
         namespace=namespace,
         name=payload.name,
         full_id=full_id,
-        defaults={"private": payload.private, "owner": user},
+        defaults={"private": resolved_private, "owner": user},
     )
 
     # Strict-freshness invalidation (#79): a fallback ghost binding for
