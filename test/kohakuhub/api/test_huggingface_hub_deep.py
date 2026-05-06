@@ -836,6 +836,72 @@ async def test_create_repo_private_flag_is_honored_across_hf_versions(
         await _run(outsider_api.repo_info, repo_id)
 
 
+async def test_create_repo_private_false_round_trips_as_public(
+    live_server_url, hf_api_token
+):
+    """``HfApi.create_repo(repo_id, private=False)`` must produce a
+    public repo on every client version.
+
+    The two on-the-wire shapes are also asymmetric on the public side:
+
+    * ``huggingface_hub<1`` sends ``{"private": false}`` directly,
+      hitting the explicit-``private`` branch of the backend resolver.
+    * ``huggingface_hub>=1.x`` resolves ``private=False`` into
+      ``{"visibility": "public"}`` (see ``_resolve_repo_visibility`` in
+      ``hf_api.py``), hitting the ``visibility=="public"`` branch
+      instead.
+
+    Routing through the real client on the matrix exercises *both*
+    branches across the CI matrix — v0 cells cover ``private``
+    resolution and v1 cells cover ``visibility`` resolution — so a
+    regression in either branch surfaces here.
+    """
+    api = _api(live_server_url, hf_api_token)
+    repo_id = "owner/hf-deep-create-public"
+    await _run(api.create_repo, repo_id, private=False)
+
+    info = await _run(api.repo_info, repo_id)
+    assert info.private is False, (
+        "create_repo(private=False) produced a private repo — the "
+        "backend mis-resolved the public path. v0 sends 'private=False' "
+        "and v1 sends 'visibility=public'; both must collapse to public."
+    )
+
+
+async def test_create_repo_rejects_unknown_visibility_value(
+    live_server_url, hf_api_token
+):
+    """The visibility resolver must reject values it cannot map to a
+    private bool with a 400 (and a stable error message).
+
+    The real ``huggingface_hub`` client validates ``visibility``
+    client-side (``RepoVisibility_T = Literal["public", "private",
+    "protected"]`` in ``hf_api.py``) and refuses to send a typo like
+    ``"hidden"`` over the wire — so the only way to drive this
+    server-side branch is a direct HTTP request alongside the
+    hf-client e2e flow. Without this guard a typo would silently
+    produce a public repo, masking client-side bugs and breaking
+    symmetry with the same guard in ``update_repo_settings``.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            f"{live_server_url}/api/repos/create",
+            json={
+                "type": "model",
+                "name": "hf-deep-create-bogus-visibility",
+                "visibility": "hidden",
+            },
+            headers={"Authorization": f"Bearer {hf_api_token}"},
+        )
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    detail = body.get("detail") if isinstance(body, dict) else None
+    error_text = detail.get("error", "") if isinstance(detail, dict) else str(body)
+    assert "visibility" in error_text.lower()
+    assert "public" in error_text and "private" in error_text
+
+
 async def test_update_repo_settings_visibility_field_is_honored(
     live_server_url, hf_api_token
 ):

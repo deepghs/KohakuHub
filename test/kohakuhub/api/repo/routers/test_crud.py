@@ -24,41 +24,6 @@ async def test_create_repository_and_reject_normalized_duplicate(owner_client):
     assert body["repo_id"] == "owner/sandbox-repo"
 
 
-async def test_create_repo_visibility_public_creates_public_repo(owner_client):
-    """``visibility="public"`` (huggingface_hub>=1.x shape with
-    ``private=False``) must round-trip as a public repo. Pairs with the
-    ``visibility="private"`` path covered through the live hf-client e2e
-    test in ``test_huggingface_hub_deep.py`` — together they exercise
-    both branches of the visibility resolver in ``crud.py`` so the
-    patch-coverage gate stays clean."""
-    response = await owner_client.post(
-        "/api/repos/create",
-        json={"type": "model", "name": "visibility-public-repo", "visibility": "public"},
-    )
-    assert response.status_code == 200
-    assert response.json()["repo_id"] == "owner/visibility-public-repo"
-
-    info = await owner_client.get("/api/models/owner/visibility-public-repo")
-    assert info.status_code == 200
-    assert info.json()["private"] is False
-
-
-async def test_create_repo_unknown_visibility_returns_400(owner_client):
-    """The resolver must reject visibility values it cannot map to a
-    private bool. Without this guard a typo like ``"hidden"`` would be
-    silently treated as public — masking client-side bugs and breaking
-    HF API symmetry with ``update_repo_settings``."""
-    response = await owner_client.post(
-        "/api/repos/create",
-        json={"type": "model", "name": "visibility-bogus-repo", "visibility": "hidden"},
-    )
-    assert response.status_code == 400
-    body = response.json()
-    error_text = body.get("detail", {}).get("error", "") if isinstance(body.get("detail"), dict) else str(body)
-    assert "visibility" in error_text.lower()
-    assert "public" in error_text and "private" in error_text
-
-
 async def test_admin_can_delete_empty_org_repository(admin_client, owner_client):
     create_response = await owner_client.post(
         "/api/repos/create",
