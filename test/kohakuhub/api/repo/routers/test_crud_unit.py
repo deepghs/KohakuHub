@@ -394,6 +394,15 @@ async def test_move_repo_covers_validation_quota_success_and_nonfatal_cleanup(mo
     monkeypatch.setattr(repo_crud, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(repo_crud, "cleanup_repository_storage", lambda **kwargs: _async_return({"repo_objects_deleted": 1, "lfs_objects_deleted": 0, "lfs_history_deleted": 0}))
     monkeypatch.setattr(repo_crud.cfg.app, "base_url", "https://hub.example.com")
+    # move_repo allocates the destination id, which probes LakeFS. Stub both the
+    # client and the allocator so this stays a unit test - without it the probe
+    # reaches whatever LakeFS the environment happens to point at.
+    monkeypatch.setattr(repo_crud, "get_lakefs_client", lambda: _FakeClient())
+    monkeypatch.setattr(
+        repo_crud,
+        "allocate_lakefs_repo_name",
+        lambda client, repo_type, repo_id: _async_return(f"{repo_type}:{repo_id}#alloc"),
+    )
 
     bad_source = await repo_crud.move_repo(
         repo_crud.MoveRepoPayload(fromRepo="bad", toRepo="owner/to", type="model"),
@@ -438,6 +447,9 @@ async def test_move_repo_covers_validation_quota_success_and_nonfatal_cleanup(mo
     )
     assert success["success"] is True
     assert atomic_state["updated"]
+    # The allocated destination id must reach the DB row, otherwise the moved
+    # repository would resolve back to a derived name that is not its own.
+    assert atomic_state["updated"][-1]["to_lakefs_repo"] == "model:other/to#alloc"
 
     monkeypatch.setattr(repo_crud, "cleanup_repository_storage", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("cleanup failed")))
     success = await repo_crud.move_repo(
