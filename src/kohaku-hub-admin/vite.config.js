@@ -136,6 +136,27 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:48888',
         changeOrigin: true
+      },
+      // KohakuHub public hf_hub-compatible URLs (no ``/api`` prefix).
+      // The chain tester's Live real probe hits
+      // ``/<repo_type>s/<ns>/<name>/resolve/...`` to mirror the exact
+      // wire shape an hf_hub client uses. Without these rules vite
+      // returns 404 (no SPA route matches, no proxy forwards), the
+      // probe never reaches the backend, and the timeline reports
+      // CHAIN_EXHAUSTED for non-existent reasons. Production (nginx →
+      // backend, same origin) doesn't need this — the SPA shares
+      // origin with the backend so requests arrive there directly.
+      '/models': {
+        target: 'http://localhost:48888',
+        changeOrigin: true
+      },
+      '/datasets': {
+        target: 'http://localhost:48888',
+        changeOrigin: true
+      },
+      '/spaces': {
+        target: 'http://localhost:48888',
+        changeOrigin: true
       }
     }
   }

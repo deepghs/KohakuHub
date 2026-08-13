@@ -87,11 +87,16 @@ python scripts/generate_docker_compose.py
 # Edit docker-compose.yml to change credentials and secrets
 
 # Build frontend and start services
-npm install --prefix ./src/kohaku-hub-ui
-npm install --prefix ./src/kohaku-hub-admin
-npm run build --prefix ./src/kohaku-hub-ui
-npm run build --prefix ./src/kohaku-hub-admin
+pnpm install
+pnpm run build
 docker-compose up -d --build
+```
+
+For local frontend development from the repository root:
+
+```bash
+pnpm run dev:ui
+pnpm run dev:admin
 ```
 
 **Access:**
@@ -282,8 +287,7 @@ uvicorn kohakuhub.main:app --host 0.0.0.0 --port 48888 --workers 4
 **Frontend:**
 ```bash
 # Install deps for both apps once
-npm install --prefix ./src/kohaku-hub-ui
-npm install --prefix ./src/kohaku-hub-admin
+pnpm install
 
 # Recommended: run main UI + admin together on one origin.
 # Main UI on http://localhost:5173, admin mounted at http://localhost:5173/admin.
