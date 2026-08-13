@@ -164,7 +164,6 @@ async def test_create_repo_covers_conflicts_lakefs_failure_and_success(monkeypat
     monkeypatch.setattr(repo_crud, "Repository", _FakeRepositoryModel)
     monkeypatch.setattr(repo_crud, "check_namespace_permission", lambda namespace, user, is_admin=False: None)
     monkeypatch.setattr(repo_crud, "get_lakefs_client", lambda: client)
-    monkeypatch.setattr(repo_crud, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(repo_crud.cfg.s3, "bucket", "hub-storage")
     monkeypatch.setattr(repo_crud.cfg.app, "base_url", "https://hub.example.com")
     monkeypatch.setattr(repo_crud, "get_repository", lambda *_args: None)

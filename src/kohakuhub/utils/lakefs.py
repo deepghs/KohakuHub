@@ -233,6 +233,11 @@ def resolve_lakefs_repo(repo) -> str:
     whose LakeFS repository was allocated at generation > 0 does not derive back
     to its own id, so deriving would silently address the wrong repository.
 
+    The row must come from a full `Repository.select()`. Peewee returns None for
+    a column that was not selected, which is indistinguishable here from a
+    pre-migration row and would quietly fall back to the derived name. No query
+    feeding this function selects a subset today; keep it that way.
+
     Args:
         repo: Repository row (needs `repo_type`, `full_id`, and optionally
             `lakefs_repo`).
