@@ -107,6 +107,13 @@ def apply_service_test_env() -> None:
         lakefs_credentials = _read_env_file(DEV_LAKEFS_CREDENTIALS_FILE)
 
     forced_env = {
+        # This server declares XET_ENABLE = False and implements no Xet upload
+        # endpoints, so the client must not route byte payloads through Xet
+        # storage. huggingface_hub >= 1.0 does so whenever hf_xet is installed,
+        # which otherwise fails uploads with a 404 on xet-write-token. Read at
+        # huggingface_hub import time, which is why it is set here rather than in
+        # individual tests. Older clients have no Xet support and ignore it.
+        "HF_HUB_DISABLE_XET": "1",
         "KOHAKU_HUB_BASE_URL": "http://testserver",
         "KOHAKU_HUB_INTERNAL_BASE_URL": "http://testserver",
         "KOHAKU_HUB_API_BASE": "/api",
