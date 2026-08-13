@@ -40,6 +40,11 @@ container_exists() {
   docker ps -a --format '{{.Names}}' | grep -Fxq "$1"
 }
 
+docker_is_rootless() {
+  docker info --format '{{range .SecurityOptions}}{{.}} {{end}}' 2>/dev/null |
+    grep -q 'name=rootless'
+}
+
 container_running() {
   docker ps --format '{{.Names}}' | grep -Fxq "$1"
 }
@@ -127,10 +132,40 @@ ensure_lakefs() {
   fi
 
   # Match the host user so LakeFS can write to the persisted metadata directory.
+  # That uid has no /etc/passwd entry in the image, so Docker falls back to
+  # HOME=/ and the config's "~/lakefs/data/cache" lands on the cache bind mount.
+  #
+  # Rootless Docker cannot use the host ids: they sit outside the container's id
+  # mapping and runc aborts with "setgroups: invalid argument". There, container
+  # root is already mapped to the invoking host user, so run as root and set
+  # HOME explicitly to keep the cache path pointing at the same bind mount
+  # (the image default user would be lakefs/uid 100, which can write neither).
+  local -a user_args=()
+  if docker_is_rootless; then
+    echo "Rootless Docker detected; running ${LAKEFS_CONTAINER} as container root"
+    user_args=(--user 0:0 -e HOME=/)
+  else
+    user_args=(--user "$(id -u):$(id -g)")
+  fi
+
+  # A Docker client with a "proxies" block in ~/.docker/config.json injects
+  # HTTP_PROXY/NO_PROXY into every container. LakeFS reaches MinIO by container
+  # name, and NO_PROXY is matched against the hostname rather than the resolved
+  # address, so the container-network CIDRs listed there do not exempt it: the
+  # S3 calls get routed to the host proxy, which cannot resolve an internal
+  # container name, and repository creation fails with a 503. Keep this
+  # container-to-container hop direct.
+  local no_proxy_value="${MINIO_CONTAINER},localhost,127.0.0.1,::1"
+  if [[ -n "${NO_PROXY:-${no_proxy:-}}" ]]; then
+    no_proxy_value="${MINIO_CONTAINER},${NO_PROXY:-${no_proxy}}"
+  fi
+
   docker run -d \
     --name "${LAKEFS_CONTAINER}" \
     --network "${NETWORK_NAME}" \
-    --user "$(id -u):$(id -g)" \
+    ${user_args[@]+"${user_args[@]}"} \
+    -e "NO_PROXY=${no_proxy_value}" \
+    -e "no_proxy=${no_proxy_value}" \
     -p 28000:28000 \
     -e LAKEFS_DATABASE_TYPE=local \
     -e LAKEFS_DATABASE_LOCAL_PATH=/var/lakefs/data/metadata.db \
