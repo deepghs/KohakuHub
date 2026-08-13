@@ -506,7 +506,9 @@ async def test_hf_move_repo_frees_the_old_name_for_immediate_reuse(
     recreated = await asyncio.to_thread(
         lambda: api.repo_info(repo_id=source_id, repo_type="dataset")
     )
-    recreated_files = {sibling.rfilename for sibling in recreated.siblings}
+    # `siblings` is None rather than [] for an empty repo on huggingface_hub
+    # < 1.0, and an empty repo is exactly what this asserts.
+    recreated_files = {sibling.rfilename for sibling in (recreated.siblings or [])}
     assert "README.md" not in recreated_files, (
         "the recreated repo must be empty, not aliased onto the renamed one's data"
     )
@@ -516,7 +518,7 @@ async def test_hf_move_repo_frees_the_old_name_for_immediate_reuse(
     renamed = await asyncio.to_thread(
         lambda: api.repo_info(repo_id=renamed_id, repo_type="dataset")
     )
-    renamed_files = {sibling.rfilename for sibling in renamed.siblings}
+    renamed_files = {sibling.rfilename for sibling in (renamed.siblings or [])}
     assert {"README.md", "table.parquet"} <= renamed_files
 
     # The two repos must be backed by different LakeFS repositories, otherwise
@@ -540,4 +542,4 @@ async def test_hf_move_repo_frees_the_old_name_for_immediate_reuse(
     renamed_after = await asyncio.to_thread(
         lambda: api.repo_info(repo_id=renamed_id, repo_type="dataset")
     )
-    assert "NEW.md" not in {s.rfilename for s in renamed_after.siblings}
+    assert "NEW.md" not in {s.rfilename for s in (renamed_after.siblings or [])}
