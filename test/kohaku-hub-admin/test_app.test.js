@@ -1,4 +1,5 @@
 import { mount } from "@vue/test-utils";
+import { defineComponent, h } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -43,10 +44,15 @@ describe("App shell", () => {
     return mount(App, {
       global: {
         stubs: {
-          RouterView: {
+          RouterView: defineComponent({
+            // Render function, not a `template:` string: vitest.config.js
+            // aliases `vue` to the runtime-only build, which cannot compile
+            // templates at runtime, so a template stub renders nothing.
             name: "RouterView",
-            template: '<main data-router-view="true" />',
-          },
+            setup() {
+              return () => h("main", { "data-router-view": "true" });
+            },
+          }),
         },
       },
     });
