@@ -10,18 +10,26 @@ const routeState = ref({
   path: "/models/mai_lin/lineart-caption-base",
 });
 
+// Render functions, not `template:` strings: vitest.config.js aliases `vue` to
+// the runtime-only build, which cannot compile templates at runtime. A
+// `template` stub silently renders nothing there, so the assertions below would
+// fail on the stub rather than on App.vue. Matches RepoViewerStub below.
 vi.mock("@/components/layout/TheHeader.vue", () => ({
-  default: {
+  default: defineComponent({
     name: "TheHeader",
-    template: '<header data-header="true">Header</header>',
-  },
+    setup() {
+      return () => h("header", { "data-header": "true" }, "Header");
+    },
+  }),
 }));
 
 vi.mock("@/components/layout/TheFooter.vue", () => ({
-  default: {
+  default: defineComponent({
     name: "TheFooter",
-    template: '<footer data-footer="true">Footer</footer>',
-  },
+    setup() {
+      return () => h("footer", { "data-footer": "true" }, "Footer");
+    },
+  }),
 }));
 
 const RepoViewerStub = defineComponent({

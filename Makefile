@@ -63,8 +63,7 @@ install-backend:
 	fi
 
 install-frontend:
-	npm install --prefix src/kohaku-hub-ui
-	npm install --prefix src/kohaku-hub-admin
+	pnpm install
 
 install: install-backend install-frontend
 
@@ -101,18 +100,19 @@ ui:
 	@# Run admin and main UI together. They share this recipe shell's process
 	@# group (no `set -m`), so SIGINT from the terminal — and the explicit
 	@# `kill 0` on exit — propagate to both vite servers cleanly.
-	@# Use `exec ./node_modules/.bin/vite` instead of `npm run dev` because
-	@# `npm` does not reliably forward SIGINT/SIGTERM to its child process.
+	@# Use `exec ./node_modules/.bin/vite` instead of `pnpm dev` because
+	@# the package manager process does not reliably forward SIGINT/SIGTERM
+	@# to its child process in every shell environment.
 	@trap 'kill 0 2>/dev/null' EXIT INT TERM; \
 	( cd src/kohaku-hub-admin && exec ./node_modules/.bin/vite ) & \
 	( cd src/kohaku-hub-ui    && exec ./node_modules/.bin/vite ) & \
 	wait
 
 ui-only:
-	npm run dev --prefix src/kohaku-hub-ui
+	pnpm run dev:ui
 
 admin:
-	npm run dev --prefix src/kohaku-hub-admin
+	pnpm run dev:admin
 
 test-backend:
 	@if [[ ! -e "$(TEST_RANGE)" ]]; then \
@@ -134,7 +134,7 @@ test-ui:
 		echo "Missing UI test directory: $(UI_TEST_ROOT)" >&2; \
 		exit 1; \
 	fi
-	npm run test --prefix $(UI_DIR)
+	pnpm run test:ui
 
 test-ui-admin:
 	@if [[ ! -d "$(UI_ADMIN_DIR)" ]]; then \
@@ -145,7 +145,7 @@ test-ui-admin:
 		echo "Missing admin UI test directory: $(UI_ADMIN_TEST_ROOT)" >&2; \
 		exit 1; \
 	fi
-	npm run test --prefix $(UI_ADMIN_DIR)
+	pnpm run test:admin
 
 test: test-backend test-ui test-ui-admin
 

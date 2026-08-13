@@ -493,10 +493,112 @@ async def probe_smtp(
     )
 
 
+async def probe_redis(
+    timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Probe the L2 cache (Redis-protocol; works with Valkey too).
+
+    The probe is a single PING + INFO server, with a tight timeout so a
+    flaky cache never blocks the dependency dashboard. The cache itself
+    is allowed to fail silently (the API stays correct without it), but
+    operators still want a glanceable signal here when they suspect the
+    cache is the cause of a latency spike.
+
+    Surfaces the underlying server identity in ``version`` ("Valkey
+    8.0.1" vs "Redis 7.4.0") because that's the one place the admin UI
+    distinguishes them — everywhere else we call it "Redis" since the
+    protocol is what matters operationally.
+    """
+    if not cfg.cache.enabled:
+        return _disabled(
+            "redis",
+            detail="Cache is disabled in configuration (cache.enabled = false)",
+        )
+
+    endpoint = _strip_password(cfg.cache.url)
+    start = time.perf_counter()
+
+    # Local import keeps the cache layer optional for downstream consumers
+    # that vendor this codebase without redis-py installed.
+    import redis.asyncio as aioredis
+
+    client = aioredis.from_url(
+        cfg.cache.url,
+        socket_timeout=timeout,
+        socket_connect_timeout=timeout,
+        decode_responses=True,
+    )
+    try:
+        try:
+            pong = await asyncio.wait_for(client.ping(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return _down(
+                "redis",
+                endpoint=endpoint,
+                detail=f"timeout after {int(timeout * 1000)}ms",
+                latency_ms=_ms_since(start),
+            )
+        except Exception as exc:
+            logger.warning(f"redis probe failed (PING): {exc}")
+            return _down(
+                "redis",
+                endpoint=endpoint,
+                detail=str(exc) or exc.__class__.__name__,
+                latency_ms=_ms_since(start),
+            )
+
+        if not pong:
+            return _down(
+                "redis",
+                endpoint=endpoint,
+                detail="server did not return PONG",
+                latency_ms=_ms_since(start),
+            )
+
+        try:
+            info = await asyncio.wait_for(
+                client.info("server"), timeout=timeout
+            )
+        except Exception as exc:
+            # Server is reachable but INFO failed — still ``ok``, just
+            # without version metadata. Surface the cause in detail.
+            return _ok(
+                "redis",
+                start=start,
+                version=None,
+                endpoint=endpoint,
+                detail=f"INFO server failed: {exc}",
+            )
+
+        if isinstance(info, dict):
+            redis_version = info.get("redis_version")
+            # Valkey >= 7.2 advertises itself in ``server_name`` (e.g. "valkey").
+            # Pre-rename Valkey forks and Redis itself report ``redis_version``
+            # only — fall back to that when ``server_name`` is missing.
+            server_name = info.get("server_name") or "redis"
+            label = "Valkey" if "valkey" in str(server_name).lower() else "Redis"
+            version = f"{label} {redis_version}" if redis_version else label
+        else:
+            version = None
+
+        return _ok(
+            "redis",
+            start=start,
+            version=version,
+            endpoint=endpoint,
+        )
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
 PROBES = (
     probe_postgres,
     probe_minio,
     probe_lakefs,
+    probe_redis,
     probe_smtp,
 )
 

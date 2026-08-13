@@ -1,4 +1,5 @@
 import { mount } from "@vue/test-utils";
+import { defineComponent, h } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RouterLinkStub } from "../helpers/vue";
@@ -19,21 +20,41 @@ vi.mock("vue-router/auto", () => ({
   useRoute: () => mocks.route,
 }));
 
+// Render functions, not `template:` strings: vitest.config.js aliases `vue` to
+// the runtime-only build, which cannot compile templates at runtime, so a
+// `template` stub renders nothing and the prop assertions below would compare
+// against an empty node instead of the routed props.
 vi.mock("@/components/pages/RepoListPage.vue", () => ({
-  default: {
+  default: defineComponent({
     name: "RepoListPage",
     props: ["repoType"],
-    template: '<div data-repo-list-page="true">{{ repoType }}</div>',
-  },
+    setup(props) {
+      return () =>
+        h("div", { "data-repo-list-page": "true" }, props.repoType);
+    },
+  }),
 }));
 
 vi.mock("@/components/repo/RepoViewer.vue", () => ({
-  default: {
+  default: defineComponent({
     name: "RepoViewer",
     props: ["repoType", "namespace", "name", "tab", "branch", "currentPath"],
-    template:
-      '<div data-repo-viewer="true">{{ repoType }}|{{ namespace }}|{{ name }}|{{ tab }}|{{ branch || "" }}|{{ currentPath || "" }}</div>',
-  },
+    setup(props) {
+      return () =>
+        h(
+          "div",
+          { "data-repo-viewer": "true" },
+          [
+            props.repoType,
+            props.namespace,
+            props.name,
+            props.tab,
+            props.branch || "",
+            props.currentPath || "",
+          ].join("|"),
+        );
+    },
+  }),
 }));
 
 import DatasetPage from "@/pages/datasets.vue";
