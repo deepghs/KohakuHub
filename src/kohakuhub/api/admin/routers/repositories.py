@@ -8,7 +8,7 @@ from kohakuhub.db_operations import get_file
 from kohakuhub.logger import get_logger
 from kohakuhub.api.admin.utils import verify_admin_token
 from kohakuhub.api.quota.util import get_repo_storage_info
-from kohakuhub.utils.lakefs import get_lakefs_client, lakefs_repo_name
+from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 
 logger = get_logger("ADMIN")
 router = APIRouter()
@@ -204,7 +204,7 @@ async def get_repository_files_admin(
         )
 
     # Get file tree from LakeFS
-    lakefs_repo = lakefs_repo_name(repo_type, f"{namespace}/{name}")
+    lakefs_repo = resolve_lakefs_repo(repo)
     client = get_lakefs_client()
 
     try:

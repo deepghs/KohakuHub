@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 
 from kohakuhub.db import User
 from kohakuhub.logger import get_logger
-from kohakuhub.utils.lakefs import get_lakefs_client, lakefs_repo_name
+from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 from kohakuhub.utils.s3 import generate_download_presigned_url, parse_s3_uri
 from kohakuhub.auth.dependencies import get_optional_user
 from kohakuhub.api.xet.utils.file_lookup import (
@@ -60,7 +60,7 @@ async def get_reconstruction(
     check_file_read_permission(repo, user)
 
     # Get LakeFS repository name
-    lakefs_repo = lakefs_repo_name(repo.repo_type, repo.full_id)
+    lakefs_repo = resolve_lakefs_repo(repo)
 
     # Get file from LakeFS (use main branch to get latest physical address)
     client = get_lakefs_client()

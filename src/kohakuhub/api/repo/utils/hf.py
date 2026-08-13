@@ -34,6 +34,10 @@ class HFErrorCode:
 
     # KohakuHub custom error codes (not in official HF Hub)
     REPO_EXISTS = "RepoExists"
+    # A repo id whose LakeFS repository is still being deleted. Informational
+    # only: hf_raise_for_status has no 409 branch, so HF clients key off the
+    # response body instead (see LAKEFS_CONFLICT_RETRY_MESSAGE).
+    REPO_NAME_RECYCLING = "RepoNameRecycling"
     BAD_REQUEST = "BadRequest"
     INVALID_REPO_TYPE = "InvalidRepoType"
     INVALID_REPO_ID = "InvalidRepoId"
@@ -320,9 +324,9 @@ async def collect_hf_siblings(
 ) -> list[dict]:
     """Collect repository files using the schema expected by `huggingface_hub`."""
     from kohakuhub.db_operations import get_file, should_use_lfs
-    from kohakuhub.utils.lakefs import get_lakefs_client, lakefs_repo_name
+    from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
     all_results = []
     after = ""

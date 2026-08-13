@@ -132,7 +132,7 @@ async def test_preupload_and_revision_cover_validation_quota_and_resolution_erro
     monkeypatch.setattr(files_api, "check_repo_write_permission", lambda repo_row, user: None)
     monkeypatch.setattr(files_api, "get_organization", lambda namespace: None)
     monkeypatch.setattr(files_api, "get_effective_lfs_threshold", lambda repo_row: 1024)
-    monkeypatch.setattr(files_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(files_api, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(
         files_api,
         "process_preupload_file",
@@ -323,7 +323,7 @@ async def test_metadata_and_resolve_routes_cover_storage_backend_fallback_and_xe
 
     monkeypatch.setattr(files_api, "get_repository", lambda repo_type, namespace, name: repo)
     monkeypatch.setattr(files_api, "check_repo_read_permission", lambda repo_row, user: None)
-    monkeypatch.setattr(files_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(files_api, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(files_api, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(files_api, "parse_s3_uri", lambda uri: ("bucket", "key/path.txt"))
     monkeypatch.setattr(

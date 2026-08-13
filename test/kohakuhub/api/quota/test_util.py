@@ -180,7 +180,7 @@ def _patch_models(monkeypatch):
     monkeypatch.setattr(quota_util, "File", _FakeFileModel)
     monkeypatch.setattr(quota_util, "LFSObjectHistory", _FakeLFSObjectHistoryModel)
     monkeypatch.setattr(quota_util, "User", _FakeUserModel)
-    monkeypatch.setattr(quota_util, "lakefs_repo_name", lambda repo_type, full_id: f"{repo_type}-{full_id}")
+    monkeypatch.setattr(quota_util, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}-{repo.full_id}")
 
 
 @pytest.mark.asyncio

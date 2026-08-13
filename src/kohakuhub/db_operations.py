@@ -195,10 +195,16 @@ def create_repository(
     full_id: str,
     private: bool,
     owner: User,
+    lakefs_repo: str | None = None,
 ) -> Repository:
     """Create a new repository with ForeignKey to owner (User or Org).
 
     NOTE: Wrap in db.atomic() if checking existence first.
+
+    Pass `lakefs_repo` with the id returned by
+    `kohakuhub.utils.lakefs.allocate_lakefs_repo_name`. Leaving it None means
+    "derive the generation-0 name", which is only correct while that name is
+    actually free - see issue #93.
     """
     return Repository.create(
         repo_type=repo_type,
@@ -207,6 +213,7 @@ def create_repository(
         full_id=full_id,
         private=private,
         owner=owner,  # ForeignKey to User (can be user or org)
+        lakefs_repo=lakefs_repo,
     )
 
 

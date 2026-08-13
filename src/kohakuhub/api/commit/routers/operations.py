@@ -24,7 +24,7 @@ from kohakuhub.db_operations import (
 from kohakuhub.logger import get_logger
 from kohakuhub.auth.dependencies import get_current_user
 from kohakuhub.auth.permissions import check_repo_write_permission
-from kohakuhub.utils.lakefs import get_lakefs_client, lakefs_repo_name
+from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 from kohakuhub.utils.s3 import get_object_metadata, object_exists
 from kohakuhub.api.quota.util import update_namespace_storage, update_repository_storage
 from kohakuhub.api.repo.utils.gc import run_gc_for_file, track_lfs_object
@@ -734,7 +734,7 @@ async def commit(
 
     check_repo_write_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type.value, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     # Parse NDJSON payload

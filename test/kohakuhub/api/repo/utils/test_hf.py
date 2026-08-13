@@ -80,7 +80,7 @@ def test_format_hf_datetime_and_lakefs_error_classifiers(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_collect_hf_siblings_handles_pagination_and_lfs_metadata(monkeypatch):
-    repo_row = SimpleNamespace()
+    repo_row = SimpleNamespace(repo_type="model", full_id="alice/demo")
     calls = []
 
     class _FakeClient:
@@ -123,8 +123,8 @@ async def test_collect_hf_siblings_handles_pagination_and_lfs_metadata(monkeypat
 
     monkeypatch.setattr("kohakuhub.utils.lakefs.get_lakefs_client", lambda: _FakeClient())
     monkeypatch.setattr(
-        "kohakuhub.utils.lakefs.lakefs_repo_name",
-        lambda repo_type, repo_id: f"{repo_type}:{repo_id}",
+        "kohakuhub.utils.lakefs.resolve_lakefs_repo",
+        lambda repo: f"{repo.repo_type}:{repo.full_id}",
     )
     monkeypatch.setattr(
         "kohakuhub.db_operations.should_use_lfs",
@@ -192,13 +192,13 @@ async def test_collect_hf_siblings_accepts_list_payload_without_pagination(monke
 
     monkeypatch.setattr("kohakuhub.utils.lakefs.get_lakefs_client", lambda: _FakeClient())
     monkeypatch.setattr(
-        "kohakuhub.utils.lakefs.lakefs_repo_name",
-        lambda repo_type, repo_id: f"{repo_type}:{repo_id}",
+        "kohakuhub.utils.lakefs.resolve_lakefs_repo",
+        lambda repo: f"{repo.repo_type}:{repo.full_id}",
     )
     monkeypatch.setattr("kohakuhub.db_operations.should_use_lfs", lambda repo, path, size: False)
 
     siblings = await hf_utils.collect_hf_siblings(
-        SimpleNamespace(),
+        SimpleNamespace(repo_type="dataset", full_id="alice/data"),
         "dataset",
         "alice/data",
         "dev",
@@ -228,13 +228,13 @@ async def test_collect_hf_siblings_stops_when_pagination_cursor_is_missing(monke
 
     monkeypatch.setattr("kohakuhub.utils.lakefs.get_lakefs_client", lambda: _FakeClient())
     monkeypatch.setattr(
-        "kohakuhub.utils.lakefs.lakefs_repo_name",
-        lambda repo_type, repo_id: f"{repo_type}:{repo_id}",
+        "kohakuhub.utils.lakefs.resolve_lakefs_repo",
+        lambda repo: f"{repo.repo_type}:{repo.full_id}",
     )
     monkeypatch.setattr("kohakuhub.db_operations.should_use_lfs", lambda repo, path, size: False)
 
     siblings = await hf_utils.collect_hf_siblings(
-        SimpleNamespace(),
+        SimpleNamespace(repo_type="model", full_id="alice/demo"),
         "model",
         "alice/demo",
         "main",

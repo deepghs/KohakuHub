@@ -352,7 +352,7 @@ async def test_process_lfs_file_covers_same_content_new_content_and_failures(mon
 
 @pytest.mark.asyncio
 async def test_process_deleted_file_and_folder_cover_success_partial_failures_and_exceptions(monkeypatch):
-    repo = SimpleNamespace(full_id="owner/repo")
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     client = _FakeLakeFSClient()
     monkeypatch.setattr(commit_ops, "File", _FakeFileModel)
     monkeypatch.setattr(commit_ops, "get_lakefs_client", lambda: client)
@@ -421,7 +421,7 @@ async def test_commit_route_covers_parse_dispatch_noop_and_success_paths(monkeyp
 
     monkeypatch.setattr(commit_ops.Repository, "get_or_none", lambda *args: repo)
     monkeypatch.setattr(commit_ops, "check_repo_write_permission", lambda repo_arg, user_arg: None)
-    monkeypatch.setattr(commit_ops, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(commit_ops, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(commit_ops, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(commit_ops.cfg.app, "base_url", "https://hub.example.com")
     monkeypatch.setattr(commit_ops.cfg.app, "debug_log_payloads", False)

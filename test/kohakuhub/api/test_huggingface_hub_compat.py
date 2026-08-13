@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from pathlib import Path
 
 import pytest
@@ -415,3 +416,130 @@ async def test_hf_api_likes_visibility_move_delete_and_list_liked_repos(
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #93: renaming a repo must free its name immediately.
+# ---------------------------------------------------------------------------
+
+
+def test_hf_client_still_retries_on_our_conflict_sentence():
+    """Pin our retry sentence to the one huggingface_hub actually looks for.
+
+    `HfApi.create_repo` wraps its POST in `while True` and retries only when the
+    response body contains this exact sentence. If a future huggingface_hub
+    reworded it, our 409 would stop being retryable and - worse - would start
+    being swallowed by `create_repo(exist_ok=True)` as "already exists". This
+    runs against every version in the CI matrix, so it fails loudly if that
+    happens rather than silently degrading.
+    """
+    import inspect
+
+    from huggingface_hub import hf_api as hf_api_module
+
+    from kohakuhub.api.repo.routers.crud import LAKEFS_CONFLICT_RETRY_MESSAGE
+
+    source = inspect.getsource(hf_api_module)
+    assert LAKEFS_CONFLICT_RETRY_MESSAGE in source, (
+        "huggingface_hub no longer contains the conflict sentence we emit; "
+        "create_repo will not retry our recycling 409 anymore"
+    )
+
+
+async def test_hf_move_repo_frees_the_old_name_for_immediate_reuse(
+    live_server_url,
+    hf_api_token,
+):
+    """End-to-end reproduction of issue #93.
+
+    Renaming a dataset and immediately recreating the original name used to fail
+    with a 500 wrapping LakeFS's `409 not unique`, because the LakeFS repository
+    id is derived from the repo id and LakeFS deletes asynchronously. It must now
+    succeed straight away, with the renamed repo left intact.
+    """
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+    source_id = "owner/issue93-index"
+    renamed_id = "owner/issue93-index-deprecate"
+
+    await asyncio.to_thread(
+        lambda: api.create_repo(repo_id=source_id, repo_type="dataset", private=True)
+    )
+
+    # A regular file and an LFS-sized one, so the rename exercises both the
+    # re-upload and the physical-address linking paths (the test profile sets the
+    # LFS threshold to 1 KiB).
+    #
+    # Both are passed as file-like objects rather than raw bytes on purpose:
+    # huggingface_hub >= 1.0 routes byte payloads through Xet storage when
+    # hf_xet is installed, and this server does not implement the Xet upload
+    # endpoints. A buffer is explicitly unsupported by Xet, so the client falls
+    # back to the plain HTTP/LFS path this test means to exercise.
+    await asyncio.to_thread(
+        lambda: api.upload_file(
+            path_or_fileobj=io.BytesIO(b"# issue 93\n"),
+            path_in_repo="README.md",
+            repo_id=source_id,
+            repo_type="dataset",
+        )
+    )
+    await asyncio.to_thread(
+        lambda: api.upload_file(
+            path_or_fileobj=io.BytesIO(b"x" * 4096),
+            path_in_repo="table.parquet",
+            repo_id=source_id,
+            repo_type="dataset",
+        )
+    )
+
+    await asyncio.to_thread(
+        lambda: api.move_repo(
+            from_id=source_id, to_id=renamed_id, repo_type="dataset"
+        )
+    )
+
+    # The freed name must be usable right away. Pre-fix this raised
+    # HfHubHTTPError(500).
+    await asyncio.to_thread(
+        lambda: api.create_repo(repo_id=source_id, repo_type="dataset", private=True)
+    )
+
+    recreated = await asyncio.to_thread(
+        lambda: api.repo_info(repo_id=source_id, repo_type="dataset")
+    )
+    # `siblings` is None rather than [] for an empty repo on huggingface_hub
+    # < 1.0, and an empty repo is exactly what this asserts.
+    recreated_files = {sibling.rfilename for sibling in (recreated.siblings or [])}
+    assert "README.md" not in recreated_files, (
+        "the recreated repo must be empty, not aliased onto the renamed one's data"
+    )
+    assert "table.parquet" not in recreated_files
+
+    # And the renamed repo keeps its content.
+    renamed = await asyncio.to_thread(
+        lambda: api.repo_info(repo_id=renamed_id, repo_type="dataset")
+    )
+    renamed_files = {sibling.rfilename for sibling in (renamed.siblings or [])}
+    assert {"README.md", "table.parquet"} <= renamed_files
+
+    # The two repos must be backed by different LakeFS repositories, otherwise
+    # writing to one would corrupt the other.
+    from kohakuhub.db_operations import get_repository
+    from kohakuhub.utils.lakefs import resolve_lakefs_repo
+
+    recreated_row = get_repository("dataset", "owner", "issue93-index")
+    renamed_row = get_repository("dataset", "owner", "issue93-index-deprecate")
+    assert resolve_lakefs_repo(recreated_row) != resolve_lakefs_repo(renamed_row)
+
+    # Writing to the recreated repo must not touch the renamed one.
+    await asyncio.to_thread(
+        lambda: api.upload_file(
+            path_or_fileobj=io.BytesIO(b"fresh\n"),
+            path_in_repo="NEW.md",
+            repo_id=source_id,
+            repo_type="dataset",
+        )
+    )
+    renamed_after = await asyncio.to_thread(
+        lambda: api.repo_info(repo_id=renamed_id, repo_type="dataset")
+    )
+    assert "NEW.md" not in {s.rfilename for s in (renamed_after.siblings or [])}

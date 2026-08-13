@@ -108,13 +108,13 @@ def _response_error_message(response) -> str:
 
 @pytest.mark.asyncio
 async def test_create_branch_and_tag_routes_cover_success_and_error_paths(monkeypatch):
-    repo = SimpleNamespace(full_id="owner/repo")
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
 
     monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(branches_api, "check_repo_delete_permission", lambda repo_arg, user_arg: None)
-    monkeypatch.setattr(branches_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(branches_api, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(branches_api, "get_lakefs_client", lambda: client)
 
     create_branch_response = await branches_api.create_branch(
@@ -201,13 +201,13 @@ async def test_create_branch_and_tag_routes_cover_success_and_error_paths(monkey
 
 @pytest.mark.asyncio
 async def test_delete_branch_and_tag_cover_success_not_found_and_guardrails(monkeypatch):
-    repo = SimpleNamespace(full_id="owner/repo")
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
 
     monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(branches_api, "check_repo_delete_permission", lambda repo_arg, user_arg: None)
-    monkeypatch.setattr(branches_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(branches_api, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(branches_api, "get_lakefs_client", lambda: client)
 
     main_response = await branches_api.delete_branch("model", "owner", "repo", "main", user=user)
@@ -234,7 +234,7 @@ async def test_delete_branch_and_tag_cover_success_not_found_and_guardrails(monk
 
 @pytest.mark.asyncio
 async def test_reference_helpers_and_list_repo_refs_cover_pagination_and_fallback(monkeypatch):
-    repo = SimpleNamespace(full_id="owner/repo")
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     client = _FakeClient()
     warnings = []
 
@@ -255,7 +255,7 @@ async def test_reference_helpers_and_list_repo_refs_cover_pagination_and_fallbac
 
     monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(branches_api, "check_repo_read_permission", lambda repo_arg, user: None)
-    monkeypatch.setattr(branches_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(branches_api, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(branches_api, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(branches_api.logger, "warning", lambda message: warnings.append(message))
 
@@ -281,14 +281,14 @@ async def test_reference_helpers_and_list_repo_refs_cover_pagination_and_fallbac
 
 @pytest.mark.asyncio
 async def test_revert_branch_covers_not_found_conflict_success_and_tracking_failure(monkeypatch):
-    repo = SimpleNamespace(full_id="owner/repo")
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
     created_commits = []
 
     monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(branches_api, "check_repo_write_permission", lambda repo_arg, user_arg: None)
-    monkeypatch.setattr(branches_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(branches_api, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(branches_api, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(branches_api, "track_commit_lfs_objects", lambda **kwargs: _async_return(2))
     monkeypatch.setattr(branches_api, "create_commit", lambda **kwargs: created_commits.append(kwargs))
@@ -380,14 +380,14 @@ def _async_return(value):
 
 @pytest.mark.asyncio
 async def test_merge_branches_covers_not_found_conflict_success_and_tracking_paths(monkeypatch):
-    repo = SimpleNamespace(full_id="owner/repo")
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
     created_commits = []
 
     monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(branches_api, "check_repo_write_permission", lambda repo_arg, user_arg: None)
-    monkeypatch.setattr(branches_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(branches_api, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(branches_api, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(branches_api, "track_commit_lfs_objects", lambda **kwargs: _async_return(1))
     monkeypatch.setattr(branches_api, "create_commit", lambda **kwargs: created_commits.append(kwargs))
@@ -440,7 +440,7 @@ async def test_merge_branches_covers_not_found_conflict_success_and_tracking_pat
 
 @pytest.mark.asyncio
 async def test_reset_branch_covers_guardrails_recoverability_success_and_failures(monkeypatch):
-    repo = SimpleNamespace(full_id="owner/repo")
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
     created_commits = []
@@ -448,7 +448,7 @@ async def test_reset_branch_covers_guardrails_recoverability_success_and_failure
 
     monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(branches_api, "check_repo_write_permission", lambda repo_arg, user_arg: None)
-    monkeypatch.setattr(branches_api, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(branches_api, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(branches_api, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(branches_api, "check_commit_range_recoverability", lambda **kwargs: _async_return((True, [], [])))
     monkeypatch.setattr(branches_api, "sync_file_table_with_commit", lambda **kwargs: synced_refs.append(kwargs) or _async_return(3))
