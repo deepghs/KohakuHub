@@ -241,7 +241,7 @@ async def test_get_repo_info_covers_invalid_type_not_found_siblings_and_storage_
         lambda repo_id, repo_type: SimpleNamespace(status_code=404),
     )
     monkeypatch.setattr(repo_info, "check_repo_read_permission", lambda repo, user: None)
-    monkeypatch.setattr(repo_info, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(repo_info, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(repo_info, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(repo_info, "format_hf_datetime", lambda value: "2024-01-02T00:00:00.000000Z")
 
@@ -387,7 +387,7 @@ async def test_list_routes_cover_trending_invalid_path_and_user_repo_error_paths
     # below.
     monkeypatch.setattr(repo_info, "_latest_main_commits", lambda repo_ids: {})
     monkeypatch.setattr(repo_info, "get_lakefs_client", lambda: client)
-    monkeypatch.setattr(repo_info, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(repo_info, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(
         repo_info,
         "safe_strftime",

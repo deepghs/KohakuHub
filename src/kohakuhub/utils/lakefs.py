@@ -136,7 +136,7 @@ def _sanitize_repo_id(repo_id: str) -> str:
     return safe
 
 
-def lakefs_repo_name(repo_type: str, repo_id: str) -> str:
+def lakefs_repo_name(repo_type: str, repo_id: str, generation: int = 0) -> str:
     """Generate LakeFS repository name from HuggingFace repo ID.
 
     LakeFS naming requirements: ^[a-z0-9][a-z0-9-]{2,62}$
@@ -162,9 +162,26 @@ def lakefs_repo_name(repo_type: str, repo_id: str) -> str:
         Hash: SHA3-224 (224 bits) → XOR folding → 112 bits
         Uses numpy.base_repr for C-optimized performance
 
+    Generations:
+        A repo ID can outlive the LakeFS repository it maps to: renaming a repo
+        deletes the old LakeFS repository, and LakeFS deletes asynchronously, so
+        the derived name stays taken for a while afterwards (issue #93). The
+        layout above is exactly 63 chars - the LakeFS maximum - so there is no
+        room to append a generation token. The generation goes into the *hash
+        input* instead:
+
+            generation 0 -> hash(repo_id)            (legacy value, unchanged)
+            generation N -> hash(f"{repo_id}#{N}")
+
+        Generation 0 must stay byte-identical to the pre-generation scheme:
+        existing rows are backfilled with it by migration 016, and any drift
+        would point stored ids at LakeFS repositories that do not exist.
+
     Args:
         repo_type: Repository type (model/dataset/space)
         repo_id: Full repository ID (e.g., "org/repo-name")
+        generation: Which incarnation of this repo ID to name. Allocate it with
+            `allocate_lakefs_repo_name` rather than guessing.
 
     Returns:
         LakeFS-safe repository name (always 63 chars)
@@ -183,7 +200,10 @@ def lakefs_repo_name(repo_type: str, repo_id: str) -> str:
 
     # ALWAYS generate hash of ORIGINAL repo_id (before sanitization)
     # This ensures uniqueness even when sanitization causes collisions
-    hash_int = _hash_to_112bit(repo_id)  # Hash ORIGINAL, not sanitized!
+    # Generation 0 hashes the bare repo_id so the name matches the pre-generation
+    # scheme exactly; later generations salt it to get a distinct repository.
+    hash_input = repo_id if generation == 0 else f"{repo_id}#{generation}"
+    hash_int = _hash_to_112bit(hash_input)  # Hash ORIGINAL, not sanitized!
 
     # Encode to base36 using numpy (C-optimized)
     hash_b36 = _base36_encode(hash_int)
@@ -195,6 +215,75 @@ def lakefs_repo_name(repo_type: str, repo_id: str) -> str:
     basename = f"{type_char}-{safe_id}-{hash_suffix}"
 
     return basename
+
+
+# How many generations to probe before giving up. Each generation costs one
+# LakeFS HEAD-style lookup, and reaching even generation 2 requires a repo id to
+# have been recycled twice while a deletion was still pending.
+MAX_LAKEFS_REPO_GENERATIONS = 16
+
+
+def resolve_lakefs_repo(repo) -> str:
+    """Return the LakeFS repository id backing a Repository row.
+
+    Prefers the id stored on the row, falling back to the generation-0
+    derivation for rows written before migration 016 added the column.
+
+    Always use this instead of calling `lakefs_repo_name` with a repo id: a row
+    whose LakeFS repository was allocated at generation > 0 does not derive back
+    to its own id, so deriving would silently address the wrong repository.
+
+    Args:
+        repo: Repository row (needs `repo_type`, `full_id`, and optionally
+            `lakefs_repo`).
+
+    Returns:
+        LakeFS repository id.
+    """
+    stored = getattr(repo, "lakefs_repo", None)
+    if stored:
+        return stored
+    return lakefs_repo_name(repo.repo_type, repo.full_id)
+
+
+async def allocate_lakefs_repo_name(
+    client,
+    repo_type: str,
+    repo_id: str,
+    max_generations: int = MAX_LAKEFS_REPO_GENERATIONS,
+) -> str:
+    """Pick a LakeFS repository id for `repo_id` that LakeFS does not already hold.
+
+    Generation 0 is the legacy derived name and is used whenever it is free, so
+    the common case is unchanged. It is *not* free while a previous incarnation
+    of the same repo id is still being deleted (LakeFS deletes asynchronously,
+    see issue #93); allocation then steps to the next generation instead of
+    colliding with `409 not unique`.
+
+    The caller must persist the result on `Repository.lakefs_repo`, otherwise a
+    generation > 0 repository becomes unreachable.
+
+    Args:
+        client: LakeFS client exposing `repository_exists`.
+        repo_type: Repository type (model/dataset/space).
+        repo_id: Full repository ID (e.g., "org/repo-name").
+        max_generations: How many generations to probe before giving up.
+
+    Returns:
+        A LakeFS repository id that was free at probe time.
+
+    Raises:
+        RuntimeError: If every probed generation is taken.
+    """
+    for generation in range(max_generations):
+        candidate = lakefs_repo_name(repo_type, repo_id, generation=generation)
+        if not await client.repository_exists(candidate):
+            return candidate
+
+    raise RuntimeError(
+        f"No free LakeFS repository id for {repo_type}:{repo_id} "
+        f"after {max_generations} generations"
+    )
 
 
 if __name__ == "__main__":

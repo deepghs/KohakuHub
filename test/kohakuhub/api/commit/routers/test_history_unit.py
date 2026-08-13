@@ -120,7 +120,7 @@ async def test_list_commits_covers_not_found_empty_parse_failure_and_server_erro
         lambda message: SimpleNamespace(status_code=500, message=message),
     )
     monkeypatch.setattr(commit_history, "check_repo_read_permission", lambda repo, user: None)
-    monkeypatch.setattr(commit_history, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(commit_history, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(commit_history, "get_lakefs_rest_client", lambda: client)
 
     monkeypatch.setattr(commit_history, "get_repository", lambda repo_type, namespace, name: None)
@@ -194,7 +194,7 @@ async def test_list_commits_sets_link_header_and_formatted_expand(monkeypatch):
     )
 
     monkeypatch.setattr(commit_history, "check_repo_read_permission", lambda repo, user: None)
-    monkeypatch.setattr(commit_history, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(commit_history, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(commit_history, "get_lakefs_rest_client", lambda: client)
     monkeypatch.setattr(commit_history, "get_repository", lambda repo_type, namespace, name: repo_row)
 
@@ -253,7 +253,7 @@ async def test_list_commits_skips_link_when_cursor_missing_and_propagates_read_e
         ]
     )
 
-    monkeypatch.setattr(commit_history, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(commit_history, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(commit_history, "get_lakefs_rest_client", lambda: client)
     monkeypatch.setattr(commit_history, "get_repository", lambda repo_type, namespace, name: repo_row)
 
@@ -301,7 +301,7 @@ async def test_get_commit_detail_covers_not_found_fallback_author_and_server_err
         lambda message: SimpleNamespace(status_code=500, message=message),
     )
     monkeypatch.setattr(commit_history, "check_repo_read_permission", lambda repo, user: None)
-    monkeypatch.setattr(commit_history, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(commit_history, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(commit_history, "get_lakefs_rest_client", lambda: client)
     monkeypatch.setattr(commit_history, "get_repository", lambda repo_type, namespace, name: None)
 
@@ -360,7 +360,7 @@ async def test_get_commit_diff_covers_parentless_diff_generation_skips_and_error
         lambda message: SimpleNamespace(status_code=500, message=message),
     )
     monkeypatch.setattr(commit_history, "check_repo_read_permission", lambda repo, user: None)
-    monkeypatch.setattr(commit_history, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(commit_history, "resolve_lakefs_repo", lambda repo: "model:owner/repo")
     monkeypatch.setattr(commit_history, "get_lakefs_rest_client", lambda: client)
     monkeypatch.setattr(
         commit_history,

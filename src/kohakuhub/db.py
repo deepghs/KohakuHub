@@ -158,6 +158,11 @@ class Repository(BaseModel):
     namespace = CharField(index=True)
     name = CharField(index=True)
     full_id = CharField(index=True)  # Not unique - same full_id can exist across types
+    # LakeFS repository backing this row. NULL means "derive from repo_type +
+    # full_id" (rows written before migration 016). Always read it through
+    # `kohakuhub.utils.lakefs.resolve_lakefs_repo`: a repository allocated at
+    # generation > 0 does not derive back to its own id.
+    lakefs_repo = CharField(null=True, index=True)
     private = BooleanField(default=False)
     owner = ForeignKeyField(
         User, backref="owned_repos", on_delete="CASCADE", index=True

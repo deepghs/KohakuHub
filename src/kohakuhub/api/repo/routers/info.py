@@ -20,7 +20,7 @@ from kohakuhub.auth.permissions import (
     check_repo_read_permission,
     check_repo_write_permission,
 )
-from kohakuhub.utils.lakefs import get_lakefs_client, lakefs_repo_name
+from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 from kohakuhub.api.fallback import (
     with_list_aggregation,
     with_repo_fallback,
@@ -227,7 +227,7 @@ async def get_repo_info(
         raise
 
     # Get LakeFS info for default branch
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     # Get default branch info
@@ -408,7 +408,7 @@ async def _list_repos_internal(
             sha, last_at = head
             last_modified = safe_strftime(last_at, DATETIME_FORMAT_ISO)
         else:
-            lakefs_repo = lakefs_repo_name(rt, r.full_id)
+            lakefs_repo = resolve_lakefs_repo(r)
             sha, last_modified = await _resolve_main_head_via_lakefs(
                 client, lakefs_repo
             )
@@ -570,7 +570,7 @@ async def list_user_repos(
                 sha, last_at = head
                 last_modified = safe_strftime(last_at, DATETIME_FORMAT_ISO)
             else:
-                lakefs_repo = lakefs_repo_name(repo_type, r.full_id)
+                lakefs_repo = resolve_lakefs_repo(r)
                 sha, last_modified = await _resolve_main_head_via_lakefs(
                     client, lakefs_repo
                 )

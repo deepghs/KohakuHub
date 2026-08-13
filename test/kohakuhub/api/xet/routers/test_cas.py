@@ -40,7 +40,7 @@ async def test_get_reconstruction_returns_chunked_response(monkeypatch):
 
     monkeypatch.setattr(cas_router, "lookup_file_by_sha256", lambda file_id: (repo, file_record))
     monkeypatch.setattr(cas_router, "check_file_read_permission", lambda repo_arg, user: seen.setdefault("permission", (repo_arg, user)))
-    monkeypatch.setattr(cas_router, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(cas_router, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(cas_router, "get_lakefs_client", lambda: FakeClient())
     monkeypatch.setattr(cas_router, "parse_s3_uri", lambda uri: ("bucket", "path/to/object"))
 
@@ -79,7 +79,7 @@ async def test_get_reconstruction_raises_not_found_when_lakefs_lookup_fails(monk
 
     monkeypatch.setattr(cas_router, "lookup_file_by_sha256", lambda file_id: (repo, file_record))
     monkeypatch.setattr(cas_router, "check_file_read_permission", lambda repo_arg, user: None)
-    monkeypatch.setattr(cas_router, "lakefs_repo_name", lambda repo_type, repo_id: f"{repo_type}:{repo_id}")
+    monkeypatch.setattr(cas_router, "resolve_lakefs_repo", lambda repo: f"{repo.repo_type}:{repo.full_id}")
     monkeypatch.setattr(cas_router, "get_lakefs_client", lambda: FakeClient())
 
     with pytest.raises(HTTPException) as exc_info:

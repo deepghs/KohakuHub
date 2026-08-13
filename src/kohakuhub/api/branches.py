@@ -16,7 +16,7 @@ from kohakuhub.auth.permissions import (
 )
 from kohakuhub.utils.lakefs import (
     get_lakefs_client,
-    lakefs_repo_name,
+    resolve_lakefs_repo,
     resolve_revision,
 )
 from kohakuhub.api.repo.utils.gc import (
@@ -81,7 +81,7 @@ async def create_branch(
     # Check if user has permission
     check_repo_delete_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     try:
@@ -182,7 +182,7 @@ async def delete_branch(
             "Cannot delete main branch",
         )
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     try:
@@ -269,7 +269,7 @@ async def create_tag(
     # Check if user has permission
     check_repo_delete_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     try:
@@ -349,7 +349,7 @@ async def delete_tag(
     # Check if user has permission
     check_repo_delete_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     try:
@@ -415,7 +415,7 @@ async def list_repo_refs(
 
     check_repo_read_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
     branches: list[dict[str, str]] = []
     tags: list[dict[str, str]] = []
@@ -514,7 +514,7 @@ async def revert_branch(
     # Check if user has write permission
     check_repo_write_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     # Resolve the ref to a commit ID (for logging/validation)
@@ -658,7 +658,7 @@ async def merge_branches(
     # Check if user has write permission
     check_repo_write_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     # Perform the merge
@@ -800,7 +800,7 @@ async def reset_branch(
             },
         )
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     # Resolve the ref to a commit ID

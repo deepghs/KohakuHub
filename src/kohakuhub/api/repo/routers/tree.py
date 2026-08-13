@@ -18,7 +18,7 @@ from kohakuhub.lakefs_rest_client import get_lakefs_rest_client
 from kohakuhub.logger import get_logger
 from kohakuhub.utils.lakefs import (
     get_lakefs_client,
-    lakefs_repo_name,
+    resolve_lakefs_repo,
     resolve_revision,
 )
 from kohakuhub.api.fallback import with_repo_fallback
@@ -472,7 +472,7 @@ async def list_repo_tree(
 
     check_repo_read_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     clean_path = _normalize_repo_path(path)
     base_prefix = f"{clean_path}/" if clean_path else ""
 
@@ -614,7 +614,7 @@ async def get_paths_info(
             f"Too many paths requested. Maximum supported paths per request is {PATHS_INFO_MAX_PATHS}."
         )
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     try:
         resolved_revision, _ = await resolve_revision(
             get_lakefs_client(), lakefs_repo, revision

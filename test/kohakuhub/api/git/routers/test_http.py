@@ -70,7 +70,7 @@ def test_get_user_from_git_auth_handles_missing_invalid_and_active_users(monkeyp
 
 @pytest.mark.asyncio
 async def test_git_info_refs_handles_upload_and_receive_services(monkeypatch):
-    repo = SimpleNamespace(repo_type="dataset", private=False)
+    repo = SimpleNamespace(repo_type="dataset", full_id="owner/repo", private=False)
     user = SimpleNamespace(username="owner")
     seen = {"handlers": []}
 
@@ -84,8 +84,11 @@ async def test_git_info_refs_handles_upload_and_receive_services(monkeypatch):
     monkeypatch.setattr(git_http, "check_repo_write_permission", lambda repo_arg, user_arg: seen.setdefault("write", []).append((repo_arg, user_arg)))
 
     class FakeBridge:
-        def __init__(self, repo_type, namespace, name):
+        def __init__(self, repo_type, namespace, name, lakefs_repo=None):
+            # The route resolves the LakeFS id from the Repository row and hands
+            # it over, instead of letting the bridge re-derive it.
             seen["bridge_args"] = (repo_type, namespace, name)
+            seen["bridge_lakefs_repo"] = lakefs_repo
 
         async def get_refs(self, branch="main"):
             seen["branch"] = branch
@@ -118,6 +121,9 @@ async def test_git_info_refs_handles_upload_and_receive_services(monkeypatch):
     assert upload_response.media_type == "application/x-git-upload-pack-advertisement"
     assert receive_response.body == b"receive-info"
     assert seen["bridge_args"] == ("dataset", "owner", "repo")
+    assert seen["bridge_lakefs_repo"], (
+        "the route must pass the row's resolved LakeFS id to the bridge"
+    )
     assert seen["read"] == [(repo, user)]
     assert seen["write"] == [(repo, user)]
 
@@ -131,7 +137,7 @@ async def test_git_info_refs_rejects_missing_repo_unknown_service_and_unauthenti
 
     assert not_found.value.status_code == 404
 
-    repo = SimpleNamespace(repo_type="model", private=False)
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo", private=False)
     monkeypatch.setattr(git_http, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(git_http, "get_user_from_git_auth", lambda authorization: None)
     monkeypatch.setattr(git_http, "check_repo_read_permission", lambda repo_arg, user_arg: None)
@@ -149,7 +155,7 @@ async def test_git_info_refs_rejects_missing_repo_unknown_service_and_unauthenti
 
 @pytest.mark.asyncio
 async def test_git_upload_pack_receive_pack_and_head_use_expected_handlers(monkeypatch):
-    repo = SimpleNamespace(repo_type="space", private=False)
+    repo = SimpleNamespace(repo_type="space", full_id="owner/repo", private=False)
     user = SimpleNamespace(username="owner")
     seen = {}
 
@@ -163,8 +169,11 @@ async def test_git_upload_pack_receive_pack_and_head_use_expected_handlers(monke
     monkeypatch.setattr(git_http, "check_repo_write_permission", lambda repo_arg, user_arg: seen.setdefault("write", []).append((repo_arg, user_arg)))
 
     class FakeBridge:
-        def __init__(self, repo_type, namespace, name):
+        def __init__(self, repo_type, namespace, name, lakefs_repo=None):
+            # The route resolves the LakeFS id from the Repository row and hands
+            # it over, instead of letting the bridge re-derive it.
             seen["bridge_args"] = (repo_type, namespace, name)
+            seen["bridge_lakefs_repo"] = lakefs_repo
 
     class FakeUploadHandler:
         def __init__(self, repo_id, bridge):
@@ -206,11 +215,14 @@ async def test_git_upload_pack_receive_pack_and_head_use_expected_handlers(monke
     assert seen["upload_body"] == b"want main"
     assert seen["receive_body"] == b"push refs"
     assert seen["bridge_args"] == ("space", "owner", "repo")
+    assert seen["bridge_lakefs_repo"], (
+        "the route must pass the row's resolved LakeFS id to the bridge"
+    )
 
 
 @pytest.mark.asyncio
 async def test_git_receive_pack_requires_authentication(monkeypatch):
-    repo = SimpleNamespace(repo_type="model", private=False)
+    repo = SimpleNamespace(repo_type="model", full_id="owner/repo", private=False)
     monkeypatch.setattr(git_http, "get_repository", lambda *_args: repo)
     monkeypatch.setattr(git_http, "get_user_from_git_auth", lambda authorization: None)
 

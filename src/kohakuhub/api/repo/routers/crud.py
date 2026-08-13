@@ -31,7 +31,11 @@ from kohakuhub.auth.permissions import (
     check_namespace_permission,
     check_repo_delete_permission,
 )
-from kohakuhub.utils.lakefs import get_lakefs_client, lakefs_repo_name
+from kohakuhub.utils.lakefs import (
+    allocate_lakefs_repo_name,
+    get_lakefs_client,
+    resolve_lakefs_repo,
+)
 from kohakuhub.utils.s3 import copy_s3_folder, delete_objects_with_prefix, get_s3_client
 from kohakuhub.lakefs_rest_client import StagingLocation, StagingMetadata
 from kohakuhub.api.repo.utils.hf import (
@@ -111,6 +115,120 @@ def _is_lakefs_namespace_in_use_error(error: Exception, storage_namespace: str) 
             "_lakefs/dummy" in error_text,
         )
     )
+
+
+# Verbatim sentence that `huggingface_hub.HfApi.create_repo` matches against the
+# response *body* to decide that a conflict is transient and worth retrying. The
+# check has been present unchanged from 0.20.3 through 1.x:
+#
+#     while True:
+#         r = get_session().post(path, headers=headers, json=payload)
+#         if r.status_code == 409 and "Cannot create repo: another conflicting
+#                                      operation is in progress" in r.text:
+#             continue
+#         break
+#
+# Getting the wording wrong is not a cosmetic issue: a 409 *without* it is
+# treated as "repo already exists" by `create_repo(exist_ok=True)`, which then
+# returns successfully and leaves the caller uploading into a repo that does not
+# exist.
+LAKEFS_CONFLICT_RETRY_MESSAGE = (
+    "Cannot create repo: another conflicting operation is in progress"
+)
+
+# hf_hub's retry loop has no sleep and no attempt limit, so a client would spin
+# at full request rate for as long as the conflict lasts. Holding the response
+# briefly is the only way to pace it without changing the client.
+LAKEFS_RECYCLING_HOLD_SECONDS = 2.0
+
+# Bound for waiting out an asynchronous LakeFS repository deletion. LakeFS acks
+# DELETE /repositories/{id} before the record is actually gone, and the cleanup
+# scales with how much metadata the repository had, so this cannot be unbounded:
+# the wait happens inside a request.
+LAKEFS_DELETION_WAIT_MAX_ATTEMPTS = 20
+LAKEFS_DELETION_WAIT_INTERVAL_SECONDS = 0.5
+
+
+def _is_lakefs_repo_id_taken_error(error: Exception) -> bool:
+    """Return True for the LakeFS 409 raised while an id is still held.
+
+    LakeFS answers `409 {"message":"error creating repository: not unique"}` when
+    the repository id already exists in its KV store - including for a
+    repository whose asynchronous deletion has not finished yet (issue #93).
+
+    This is deliberately distinct from `_is_lakefs_namespace_in_use_error`: that
+    one is a leftover S3 marker we can clean up and retry immediately, while
+    this one only clears when LakeFS finishes its own cleanup.
+    """
+    lowered = str(error).lower()
+    if "not unique" not in lowered:
+        return False
+
+    # `LakeFSRestClient._check_response` raises `httpx.HTTPStatusError`, so the
+    # status is available structurally; prefer it over matching "409" in the
+    # message, which could also appear inside a repository name or URL.
+    status_code = getattr(getattr(error, "response", None), "status_code", None)
+    if status_code is not None:
+        return status_code == 409
+
+    return "409" in lowered
+
+
+def _repo_recycling_response(repo_type: str, full_id: str) -> Response:
+    """Build the retryable 409 for a repo id LakeFS has not released yet.
+
+    The body carries `LAKEFS_CONFLICT_RETRY_MESSAGE` so huggingface_hub retries
+    on its own. `X-Error-Code` is informational: `hf_raise_for_status` has no 409
+    branch, so no HF client consumes it for this status.
+    """
+    body = json.dumps(
+        {
+            "error": LAKEFS_CONFLICT_RETRY_MESSAGE,
+            "repo_id": full_id,
+            "repo_type": repo_type,
+        }
+    )
+    return Response(
+        status_code=409,
+        content=body,
+        media_type="application/json",
+        headers={
+            "X-Error-Code": HFErrorCode.REPO_NAME_RECYCLING,
+            "X-Error-Message": LAKEFS_CONFLICT_RETRY_MESSAGE,
+            # Ignored by hf_hub (its create_repo bypasses http_backoff), but
+            # correct for any client that does honour it.
+            "Retry-After": str(int(LAKEFS_RECYCLING_HOLD_SECONDS) or 1),
+        },
+    )
+
+
+async def _wait_for_lakefs_repo_deletion(client, lakefs_repo: str) -> bool:
+    """Wait, bounded, for LakeFS to finish deleting `lakefs_repo`.
+
+    Returns True if the repository is gone, False if it was still present when
+    the bound was reached. Callers treat False as non-fatal: the id simply stays
+    unusable a little longer, which `_is_lakefs_repo_id_taken_error` turns into a
+    retryable response for clients.
+    """
+    for attempt in range(LAKEFS_DELETION_WAIT_MAX_ATTEMPTS):
+        try:
+            if not await client.repository_exists(lakefs_repo):
+                return True
+        except Exception as e:
+            # Never let a probe failure fail the move: the data has already been
+            # migrated by this point.
+            logger.debug(f"repository_exists check failed for {lakefs_repo}: {e}")
+            return False
+
+        if attempt + 1 < LAKEFS_DELETION_WAIT_MAX_ATTEMPTS:
+            await asyncio.sleep(LAKEFS_DELETION_WAIT_INTERVAL_SECONDS)
+
+    logger.warning(
+        f"LakeFS repository {lakefs_repo} still present after "
+        f"{LAKEFS_DELETION_WAIT_MAX_ATTEMPTS} checks; its id stays reserved until "
+        f"LakeFS finishes deleting it"
+    )
+    return False
 
 
 def _has_only_internal_lakefs_markers(
@@ -223,7 +341,6 @@ async def create_repo(
     check_namespace_permission(namespace, user)
 
     full_id = f"{namespace}/{payload.name}"
-    lakefs_repo = lakefs_repo_name(payload.type, full_id)
 
     # Check for exact match.
     # `huggingface_hub` only honors `exist_ok=True` when the server returns 409 (see
@@ -250,8 +367,14 @@ async def create_repo(
                 message=f"Repository name conflicts with existing repository: {repo.name}",
             )
 
-    # Create LakeFS repository
+    # Create LakeFS repository.
+    # The id is allocated rather than derived: a repo id whose previous
+    # incarnation is still being deleted by LakeFS cannot reuse the derived
+    # (generation 0) name yet, so allocation steps to the next generation. The
+    # result is persisted below - deriving it again later would address the wrong
+    # repository.
     client = get_lakefs_client()
+    lakefs_repo = await allocate_lakefs_repo_name(client, payload.type, full_id)
     storage_namespace = f"s3://{cfg.s3.bucket}/{lakefs_repo}"
 
     try:
@@ -261,6 +384,17 @@ async def create_repo(
             default_branch="main",
         )
     except Exception as e:
+        if _is_lakefs_repo_id_taken_error(e):
+            # Allocation raced with LakeFS: the id was free when we probed and
+            # taken by the time we created. Hand the client a conflict it knows
+            # to retry, after a short hold to pace hf_hub's sleepless retry loop.
+            logger.warning(
+                f"LakeFS repository id {lakefs_repo} for {full_id} is still held "
+                f"(async deletion in progress); returning retryable conflict"
+            )
+            await asyncio.sleep(LAKEFS_RECYCLING_HOLD_SECONDS)
+            return _repo_recycling_response(payload.type, full_id)
+
         namespace_in_use = _is_lakefs_namespace_in_use_error(e, storage_namespace)
         logger.warning(
             f"LakeFS create_repository failed for {full_id}; "
@@ -298,13 +432,19 @@ async def create_repo(
             logger.exception(f"LakeFS repository creation failed for {full_id}", e)
             return hf_server_error(f"LakeFS repository creation failed: {str(e)}")
 
-    # Store in database for listing/metadata
+    # Store in database for listing/metadata.
+    # `lakefs_repo` records which LakeFS repository this row owns; every read
+    # path resolves through it (see `resolve_lakefs_repo`).
     Repository.get_or_create(
         repo_type=payload.type,
         namespace=namespace,
         name=payload.name,
         full_id=full_id,
-        defaults={"private": payload.private, "owner": user},
+        defaults={
+            "private": payload.private,
+            "owner": user,
+            "lakefs_repo": lakefs_repo,
+        },
     )
 
     return {
@@ -353,13 +493,14 @@ async def delete_repo(
         namespace = payload.organization or user.username
 
     full_id = f"{namespace}/{payload.name}"
-    lakefs_repo = lakefs_repo_name(repo_type, full_id)
 
     # 1. Check if repository exists in database
     repo_row = get_repository(repo_type, namespace, payload.name)
 
     if not repo_row:
         return hf_repo_not_found(full_id, repo_type)
+
+    lakefs_repo = resolve_lakefs_repo(repo_row)
 
     # 2. Check if user has permission to delete this repository (admin bypasses)
     check_repo_delete_permission(repo_row, user, is_admin=is_admin)
@@ -429,7 +570,14 @@ class SquashRepoPayload(BaseModel):
     type: str = "model"
 
 
-async def _migrate_lakefs_repository(repo_type: str, from_id: str, to_id: str) -> None:
+async def _migrate_lakefs_repository(
+    repo_type: str,
+    from_id: str,
+    to_id: str,
+    *,
+    from_lakefs_repo: str,
+    to_lakefs_repo: str,
+) -> None:
     """Migrate LakeFS repository with proper LFS handling using File table.
 
     Strategy:
@@ -448,13 +596,15 @@ async def _migrate_lakefs_repository(repo_type: str, from_id: str, to_id: str) -
         repo_type: Repository type (model/dataset/space)
         from_id: Source repository ID (namespace/name)
         to_id: Target repository ID (namespace/name)
+        from_lakefs_repo: LakeFS repository currently backing `from_id`, resolved
+            by the caller from the DB row (never re-derived here - a row created
+            at generation > 0 does not derive back to its own id).
+        to_lakefs_repo: LakeFS repository to create for `to_id`, allocated by the
+            caller so it cannot collide with a pending deletion.
 
     Raises:
         HTTPException: If migration fails
     """
-    from_lakefs_repo = lakefs_repo_name(repo_type, from_id)
-    to_lakefs_repo = lakefs_repo_name(repo_type, to_id)
-
     if from_lakefs_repo == to_lakefs_repo:
         # No migration needed (e.g., just renaming within namespace)
         return
@@ -614,12 +764,23 @@ async def _migrate_lakefs_repository(repo_type: str, from_id: str, to_id: str) -
             logger.success("Committed all objects to new repository")
 
         # 5. Delete old LakeFS repository
+        deleted = False
         try:
             await client.delete_repository(repository=from_lakefs_repo, force=True)
             logger.info(f"Deleted old LakeFS repository: {from_lakefs_repo}")
+            deleted = True
         except Exception as e:
             if not is_lakefs_not_found_error(e):
                 logger.warning(f"Failed to delete old LakeFS repo: {e}")
+
+        # 5b. LakeFS acks the DELETE before the repository record is gone, and
+        # until it is, the id cannot be reused - which is what made a rename
+        # followed by recreating the old name fail (issue #93). Waiting here,
+        # bounded, means the common case never surfaces a conflict at all.
+        # Timing out is not an error: the move itself already succeeded, and a
+        # later create against the same id degrades to a retryable 409.
+        if deleted:
+            await _wait_for_lakefs_repo_deletion(client, from_lakefs_repo)
 
         # 6. Delete old S3 folder to free up the name
         deleted_count = await delete_objects_with_prefix(cfg.s3.bucket, from_s3_prefix)
@@ -657,6 +818,7 @@ def _update_repository_database_records(
     to_name: str,
     moving_namespace: bool,
     repo_size: int,
+    to_lakefs_repo: str,
     preserve_quota: bool = True,
 ) -> None:
     """Update database records for repository move (must be called within db.atomic()).
@@ -670,6 +832,9 @@ def _update_repository_database_records(
         to_name: Target repository name
         moving_namespace: Whether namespace is changing
         repo_size: Repository size in bytes
+        to_lakefs_repo: LakeFS repository the migration created for `to_id`. The
+            row must point at it explicitly, since the destination may have been
+            allocated at generation > 0 and would not derive back to this id.
         preserve_quota: Whether to preserve repository quota settings (default: True)
     """
     # Preserve current quota settings before update
@@ -688,6 +853,7 @@ def _update_repository_database_records(
         namespace=to_namespace,
         name=to_name,
         full_id=to_id,
+        lakefs_repo=to_lakefs_repo,
         quota_bytes=current_quota_bytes,
         used_bytes=current_used_bytes,
     ).where(Repository.id == repo_row.id).execute()
@@ -825,12 +991,20 @@ async def move_repo(
 
     # Migrate LakeFS repository FIRST (before updating DB)
     # This ensures File table queries use correct from_id
-    from_lakefs_repo = lakefs_repo_name(repo_type, from_id)
+    from_lakefs_repo = resolve_lakefs_repo(repo_row)
+    # Allocate the destination id instead of deriving it: if the destination name
+    # was used before and its LakeFS repository is still being deleted, the
+    # derived name is not available yet.
+    to_lakefs_repo = await allocate_lakefs_repo_name(
+        get_lakefs_client(), repo_type, to_id
+    )
 
     await _migrate_lakefs_repository(
         repo_type=repo_type,
         from_id=from_id,
         to_id=to_id,
+        from_lakefs_repo=from_lakefs_repo,
+        to_lakefs_repo=to_lakefs_repo,
     )
 
     # Update database records AFTER successful LakeFS migration
@@ -844,6 +1018,7 @@ async def move_repo(
             to_name=to_name,
             moving_namespace=moving_namespace,
             repo_size=repo_size,
+            to_lakefs_repo=to_lakefs_repo,
         )
 
     # Clean up old S3 storage after successful migration
@@ -929,11 +1104,19 @@ async def squash_repo(
         logger.info(f"Step 1: Moving {repo_id} to temporary {temp_id}")
 
         # Use internal move logic
-        from_lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+        client = get_lakefs_client()
+        from_lakefs_repo = resolve_lakefs_repo(repo_row)
+        temp_lakefs_repo = await allocate_lakefs_repo_name(
+            client, repo_type, temp_id
+        )
 
         # Migrate LakeFS FIRST (before updating DB)
         await _migrate_lakefs_repository(
-            repo_type=repo_type, from_id=repo_id, to_id=temp_id
+            repo_type=repo_type,
+            from_id=repo_id,
+            to_id=temp_id,
+            from_lakefs_repo=from_lakefs_repo,
+            to_lakefs_repo=temp_lakefs_repo,
         )
 
         # Update DB AFTER successful migration
@@ -947,6 +1130,7 @@ async def squash_repo(
                 to_name=temp_name,
                 moving_namespace=False,  # Same namespace
                 repo_size=0,  # No quota change
+                to_lakefs_repo=temp_lakefs_repo,
             )
 
         # Clean up old storage
@@ -959,40 +1143,26 @@ async def squash_repo(
 
         logger.success(f"Moved to temporary repository: {temp_id}")
 
-        # Wait for old LakeFS repo to be fully deleted (with exponential backoff)
-        # This ensures we can reuse the name immediately
-        client = get_lakefs_client()
-        old_deleted = False
-        max_attempts = 20
-        for attempt in range(max_attempts):
-            if not await client.repository_exists(from_lakefs_repo):
-                old_deleted = True
-                logger.info(
-                    f"Confirmed old repository {from_lakefs_repo} deleted after {attempt + 1} check(s)"
-                )
-                break
-            # Exponential backoff: 0.05s, 0.1s, 0.2s, 0.4s, ...
-            wait_time = 0.05 * (2 ** min(attempt, 5))
-            logger.debug(
-                f"Old repository still exists, waiting {wait_time:.2f}s... (attempt {attempt + 1}/{max_attempts})"
-            )
-            await asyncio.sleep(wait_time)
-
-        if not old_deleted:
-            logger.warning(
-                f"Old repository {from_lakefs_repo} still exists after {max_attempts} checks"
-            )
-            # Continue anyway - the 409 error will be caught and handled
+        # `_migrate_lakefs_repository` already waited for the old repository's
+        # asynchronous deletion, so the original id is free to reuse below. If it
+        # timed out, allocation picks the next generation instead of colliding.
 
         # Step 2: Move back to original name
         logger.info(f"Step 2: Moving {temp_id} back to {repo_id}")
 
         # Reload repo row (it was updated to temp name)
         repo_row = get_repository(repo_type, namespace, temp_name)
+        final_lakefs_repo = await allocate_lakefs_repo_name(
+            client, repo_type, repo_id
+        )
 
         # Migrate LakeFS FIRST (before updating DB)
         await _migrate_lakefs_repository(
-            repo_type=repo_type, from_id=temp_id, to_id=repo_id
+            repo_type=repo_type,
+            from_id=temp_id,
+            to_id=repo_id,
+            from_lakefs_repo=resolve_lakefs_repo(repo_row),
+            to_lakefs_repo=final_lakefs_repo,
         )
 
         # Update DB AFTER successful migration
@@ -1006,10 +1176,10 @@ async def squash_repo(
                 to_name=name,
                 moving_namespace=False,  # Same namespace
                 repo_size=0,  # No quota change
+                to_lakefs_repo=final_lakefs_repo,
             )
 
         # Clean up temp storage
-        temp_lakefs_repo = lakefs_repo_name(repo_type, temp_id)
         await cleanup_repository_storage(
             repo_type=repo_type,
             namespace=namespace,
@@ -1017,22 +1187,8 @@ async def squash_repo(
             lakefs_repo=temp_lakefs_repo,
         )
 
-        # Wait for temp LakeFS repo to be fully deleted
-        temp_deleted = False
-        for attempt in range(20):
-            if not await client.repository_exists(temp_lakefs_repo):
-                temp_deleted = True
-                logger.info(
-                    f"Confirmed temp repository {temp_lakefs_repo} deleted after {attempt + 1} check(s)"
-                )
-                break
-            wait_time = 0.05 * (2 ** min(attempt, 5))
-            await asyncio.sleep(wait_time)
-
-        if not temp_deleted:
-            logger.warning(
-                f"Temp repository {temp_lakefs_repo} still exists after cleanup"
-            )
+        # The temp id is never reused, so its deletion only needs to be observed
+        # for logging; `_migrate_lakefs_repository` already waited for it.
 
         # Step 3: Recalculate repository storage after squashing
         # Storage might have changed after clearing history
@@ -1062,7 +1218,9 @@ async def squash_repo(
             temp_repo = get_repository(repo_type, namespace, temp_name)
             if temp_repo:
                 logger.info(f"Attempting to recover from temp repository: {temp_id}")
-                # Move back from temp
+                # Move back from temp. Only the DB row is renamed here - the data
+                # still lives in the temp LakeFS repository, so the row must keep
+                # pointing at it rather than at the original id's derived name.
                 with db.atomic():
                     _update_repository_database_records(
                         repo_row=temp_repo,
@@ -1073,6 +1231,7 @@ async def squash_repo(
                         to_name=name,
                         moving_namespace=False,
                         repo_size=0,
+                        to_lakefs_repo=resolve_lakefs_repo(temp_repo),
                     )
                 logger.info("Recovery attempt completed")
         except Exception as recovery_error:

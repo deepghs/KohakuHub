@@ -12,7 +12,7 @@ from kohakuhub.config import cfg
 from kohakuhub.db import File, LFSObjectHistory, Repository, User
 from kohakuhub.db_operations import get_organization
 from kohakuhub.logger import get_logger
-from kohakuhub.utils.lakefs import get_lakefs_client, lakefs_repo_name
+from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 
 logger = get_logger("QUOTA")
 
@@ -39,7 +39,7 @@ async def calculate_repository_storage(repo: Repository) -> dict[str, int]:
         - lfs_total_bytes: Total LFS storage (all versions)
         - lfs_unique_bytes: Unique LFS storage (deduplicated by SHA256)
     """
-    lakefs_repo = lakefs_repo_name(repo.repo_type, repo.full_id)
+    lakefs_repo = resolve_lakefs_repo(repo)
     client = get_lakefs_client()
 
     # Bulk-load LFS flag for every active file in this repo *once* up front,

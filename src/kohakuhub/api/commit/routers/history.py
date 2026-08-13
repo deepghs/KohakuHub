@@ -15,7 +15,7 @@ from kohakuhub.lakefs_rest_client import get_lakefs_rest_client
 from kohakuhub.logger import get_logger
 from kohakuhub.auth.dependencies import get_optional_user
 from kohakuhub.auth.permissions import check_repo_read_permission
-from kohakuhub.utils.lakefs import lakefs_repo_name
+from kohakuhub.utils.lakefs import resolve_lakefs_repo
 from kohakuhub.api.repo.utils.hf import (
     format_hf_datetime,
     hf_repo_not_found,
@@ -88,7 +88,7 @@ async def list_commits(
     # Check read permission
     check_repo_read_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
 
     try:
         # Get commits from LakeFS using REST API
@@ -212,7 +212,7 @@ async def get_commit_detail(
     # Check read permission
     check_repo_read_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
 
     try:
         # Get commit from LakeFS
@@ -283,7 +283,7 @@ async def get_commit_diff(
     # Check read permission
     check_repo_read_permission(repo_row, user)
 
-    lakefs_repo = lakefs_repo_name(repo_type, repo_id)
+    lakefs_repo = resolve_lakefs_repo(repo_row)
 
     try:
         # Get commit from LakeFS
