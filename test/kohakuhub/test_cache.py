@@ -677,17 +677,31 @@ async def test_bootstrap_flush_two_workers_only_one_flushes(raw_client, cache_se
 
     # Speed up the wait-loop inside _bootstrap_flush by collapsing its
     # ``asyncio.sleep(0.1)`` polls. Capture the real sleep first so the
-    # patched lambda doesn't recurse into itself.
+    # patched sleep doesn't recurse into itself.
+    #
+    # The patched sleep also signals when worker B has reached that loop. That
+    # is the only sleep in play here, and reaching it proves B already lost the
+    # ``SET NX`` race — which is what this test is about. Yielding a fixed
+    # number of times instead would be an assumption about scheduling: B has to
+    # complete two Valkey round-trips (GET marker, SET NX lock) before it gets
+    # there, and if the lock below is released first, B wins it and performs the
+    # flush, wiping the planted key.
     real_sleep = asyncio.sleep
-    monkeypatch.setattr(asyncio, "sleep", lambda *_a, **_kw: real_sleep(0))
+    entered_wait_loop = asyncio.Event()
+
+    async def fast_sleep(*_args, **_kwargs):
+        entered_wait_loop.set()
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
 
     async def worker_b():
         await cache_mod._bootstrap_flush()
 
     task_b = asyncio.create_task(worker_b())
 
-    # Let worker B enter its wait loop, then update the marker as if A finished.
-    await real_sleep(0)
+    # Wait until worker B is provably waiting, then finish A's work.
+    await asyncio.wait_for(entered_wait_loop.wait(), timeout=10)
     info = await raw_client.info("server")
     live_run_id = info["run_id"]
     await raw_client.set(cache_mod._prefixed(BOOTSTRAP_RUN_ID_KEY), live_run_id)
