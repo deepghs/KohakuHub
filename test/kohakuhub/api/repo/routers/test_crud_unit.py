@@ -1322,3 +1322,63 @@ async def test_move_repo_reports_allocation_failure_as_http_500(monkeypatch):
         )
 
     assert allocation_error.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_create_repo_reports_a_concurrent_winner_as_exists_not_retry(monkeypatch):
+    """A lost create race is "already exists", not "retry shortly".
+
+    Two parallel creates both find generation 0 free, so the loser gets the same
+    LakeFS `409 not unique` as the recycling case. But the name is now taken for
+    good, not transiently: answering with the retryable sentence would make the
+    client spin (and cost it the pacing hold) before it eventually learns the
+    repo exists. Distinguish the two by re-checking the DB.
+    """
+    user = SimpleNamespace(username="owner")
+    sleeps = []
+
+    class _IdTakenClient(_FakeClient):
+        async def create_repository(self, **kwargs):
+            self.calls.append(("create_repository", kwargs))
+            raise RuntimeError(
+                "LakeFS API error 409 Conflict: "
+                '{"message":"error creating repository: not unique"}'
+            )
+
+    # Absent on the pre-flight check, present by the time the create fails -
+    # exactly what a concurrent winner looks like.
+    lookups = {"count": 0}
+
+    def fake_get_repository(*_args):
+        lookups["count"] += 1
+        return None if lookups["count"] == 1 else SimpleNamespace()
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(repo_crud.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(repo_crud, "Repository", _FakeRepositoryModel)
+    monkeypatch.setattr(
+        repo_crud, "check_namespace_permission", lambda namespace, user, is_admin=False: None
+    )
+    monkeypatch.setattr(repo_crud, "get_lakefs_client", lambda: _IdTakenClient())
+    monkeypatch.setattr(
+        repo_crud, "allocate_lakefs_repo_name", lambda *a, **k: _async_return("m-owner-demo")
+    )
+    monkeypatch.setattr(repo_crud.cfg.s3, "bucket", "hub-storage")
+    monkeypatch.setattr(repo_crud.cfg.app, "base_url", "https://hub.example.com")
+    monkeypatch.setattr(repo_crud, "get_repository", fake_get_repository)
+    monkeypatch.setattr(repo_crud, "normalize_name", lambda name: name.lower())
+
+    response = await repo_crud.create_repo(
+        repo_crud.CreateRepoPayload(type="model", name="demo-model"), user=user
+    )
+
+    assert response.status_code == 409
+    assert response.headers.get("x-error-code") == repo_crud.HFErrorCode.REPO_EXISTS
+    body = json.loads(bytes(response.body))
+    assert body["url"], "create_repo(exist_ok=True) reads url off the 409 body"
+    assert repo_crud.LAKEFS_CONFLICT_RETRY_MESSAGE not in bytes(response.body).decode(), (
+        "a permanently taken name must not be advertised as retryable"
+    )
+    assert sleeps == [], "no need to pace a client that should stop retrying"

@@ -393,9 +393,22 @@ async def create_repo(
         )
     except Exception as e:
         if _is_lakefs_repo_id_taken_error(e):
-            # Allocation raced with LakeFS: the id was free when we probed and
-            # taken by the time we created. Hand the client a conflict it knows
-            # to retry, after a short hold to pace hf_hub's sleepless retry loop.
+            # The id was free when we probed and taken by the time we created.
+            # Two different things look like this, and they need opposite
+            # answers, so re-check the DB to tell them apart.
+            if get_repository(payload.type, namespace, payload.name):
+                # A concurrent create won the race. The name is taken for good,
+                # so telling the client to retry would only make it spin before
+                # learning the same thing.
+                logger.info(
+                    f"Concurrent create won the race for {full_id}; "
+                    f"reporting it as an existing repository"
+                )
+                return _repo_exists_response(payload.type, full_id)
+
+            # Nobody owns the name here: LakeFS is still deleting a previous
+            # incarnation of it. Hand the client a conflict it knows to retry,
+            # after a short hold to pace hf_hub's sleepless retry loop.
             logger.warning(
                 f"LakeFS repository id {lakefs_repo} for {full_id} is still held "
                 f"(async deletion in progress); returning retryable conflict"
