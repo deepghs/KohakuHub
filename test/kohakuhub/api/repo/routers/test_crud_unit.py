@@ -1200,7 +1200,9 @@ def test_is_lakefs_repo_id_taken_error_prefers_the_structured_status_code():
 
 
 @pytest.mark.asyncio
-async def test_wait_for_lakefs_repo_deletion_reports_states_and_survives_probe_errors():
+async def test_wait_for_lakefs_repo_deletion_reports_states_and_survives_probe_errors(
+    monkeypatch,
+):
     sleeps = []
 
     class _Client:
@@ -1218,30 +1220,26 @@ async def test_wait_for_lakefs_repo_deletion_reports_states_and_survives_probe_e
     async def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    import kohakuhub.api.repo.routers.crud as module
+    monkeypatch.setattr(repo_crud.asyncio, "sleep", fake_sleep)
 
-    original_sleep = module.asyncio.sleep
-    module.asyncio.sleep = fake_sleep
-    try:
-        gone = await repo_crud._wait_for_lakefs_repo_deletion(
-            _Client([True, False]), "old-repo"
-        )
-        assert gone is True
+    gone = await repo_crud._wait_for_lakefs_repo_deletion(
+        _Client([True, False]), "old-repo"
+    )
+    assert gone is True
 
-        # A probe failure must not fail the move; the data is already migrated.
-        survived = await repo_crud._wait_for_lakefs_repo_deletion(
-            _Client([RuntimeError("lakefs unreachable")]), "old-repo"
-        )
-        assert survived is False
+    # A probe failure must not fail the move; the data is already migrated.
+    survived = await repo_crud._wait_for_lakefs_repo_deletion(
+        _Client([RuntimeError("lakefs unreachable")]), "old-repo"
+    )
+    assert survived is False
 
-        never = _Client([True] * repo_crud.LAKEFS_DELETION_WAIT_MAX_ATTEMPTS)
-        timed_out = await repo_crud._wait_for_lakefs_repo_deletion(never, "old-repo")
-        assert timed_out is False
-        assert never.calls == repo_crud.LAKEFS_DELETION_WAIT_MAX_ATTEMPTS
-        # No sleep after the final attempt.
-        assert len(sleeps) == repo_crud.LAKEFS_DELETION_WAIT_MAX_ATTEMPTS
-    finally:
-        module.asyncio.sleep = original_sleep
+    never = _Client([True] * repo_crud.LAKEFS_DELETION_WAIT_MAX_ATTEMPTS)
+    timed_out = await repo_crud._wait_for_lakefs_repo_deletion(never, "old-repo")
+    assert timed_out is False
+    assert never.calls == repo_crud.LAKEFS_DELETION_WAIT_MAX_ATTEMPTS
+    # One sleep between attempts, none after the final one: 1 for the first
+    # client (it sleeps once, then sees the repo gone) plus MAX - 1 here.
+    assert len(sleeps) == 1 + (repo_crud.LAKEFS_DELETION_WAIT_MAX_ATTEMPTS - 1)
 
 
 @pytest.mark.asyncio
