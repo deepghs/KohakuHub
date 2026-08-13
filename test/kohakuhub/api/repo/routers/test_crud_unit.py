@@ -1242,3 +1242,74 @@ async def test_wait_for_lakefs_repo_deletion_reports_states_and_survives_probe_e
         assert len(sleeps) == repo_crud.LAKEFS_DELETION_WAIT_MAX_ATTEMPTS
     finally:
         module.asyncio.sleep = original_sleep
+
+
+@pytest.mark.asyncio
+async def test_create_repo_reports_allocation_failure_as_a_shaped_server_error(
+    monkeypatch,
+):
+    """A LakeFS outage during id allocation must keep the HF error shape.
+
+    Allocation probes LakeFS before creating anything, so it is a new place the
+    request can fail. Letting that exception escape would return a bare 500 with
+    no X-Error-Code, losing the header protocol the rest of the API follows.
+    """
+    user = SimpleNamespace(username="owner")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("lakefs unreachable")
+
+    monkeypatch.setattr(repo_crud, "Repository", _FakeRepositoryModel)
+    monkeypatch.setattr(
+        repo_crud, "check_namespace_permission", lambda namespace, user, is_admin=False: None
+    )
+    monkeypatch.setattr(repo_crud, "get_lakefs_client", lambda: _FakeClient())
+    monkeypatch.setattr(repo_crud, "allocate_lakefs_repo_name", _boom)
+    monkeypatch.setattr(repo_crud.cfg.s3, "bucket", "hub-storage")
+    monkeypatch.setattr(repo_crud.cfg.app, "base_url", "https://hub.example.com")
+    monkeypatch.setattr(repo_crud, "get_repository", lambda *_args: None)
+    monkeypatch.setattr(repo_crud, "normalize_name", lambda name: name.lower())
+
+    response = await repo_crud.create_repo(
+        repo_crud.CreateRepoPayload(type="model", name="demo-model"), user=user
+    )
+
+    assert response.status_code == 500
+    assert response.headers.get("x-error-code") == repo_crud.HFErrorCode.SERVER_ERROR
+    assert not _FakeRepositoryModel.get_or_create_calls
+
+
+@pytest.mark.asyncio
+async def test_move_repo_reports_allocation_failure_as_http_500(monkeypatch):
+    """Same for move: an allocation failure must not escape as an unhandled error."""
+    repo_row = SimpleNamespace(
+        private=False,
+        repo_type="model",
+        full_id="owner/from",
+        lakefs_repo="m-owner-from",
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("lakefs unreachable")
+
+    monkeypatch.setattr(
+        repo_crud, "check_repo_delete_permission", lambda repo, user, is_admin=False: None
+    )
+    monkeypatch.setattr(
+        repo_crud, "check_namespace_permission", lambda namespace, user, is_admin=False: None
+    )
+    monkeypatch.setattr(
+        repo_crud,
+        "get_repository",
+        lambda repo_type, namespace, name: repo_row if (namespace, name) == ("owner", "from") else None,
+    )
+    monkeypatch.setattr(repo_crud, "get_lakefs_client", lambda: _FakeClient())
+    monkeypatch.setattr(repo_crud, "allocate_lakefs_repo_name", _boom)
+
+    with pytest.raises(HTTPException) as allocation_error:
+        await repo_crud.move_repo(
+            repo_crud.MoveRepoPayload(fromRepo="owner/from", toRepo="owner/to", type="model"),
+            auth=(SimpleNamespace(username="owner"), False),
+        )
+
+    assert allocation_error.value.status_code == 500

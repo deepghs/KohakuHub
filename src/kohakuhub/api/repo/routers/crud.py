@@ -374,7 +374,15 @@ async def create_repo(
     # result is persisted below - deriving it again later would address the wrong
     # repository.
     client = get_lakefs_client()
-    lakefs_repo = await allocate_lakefs_repo_name(client, payload.type, full_id)
+    try:
+        lakefs_repo = await allocate_lakefs_repo_name(client, payload.type, full_id)
+    except Exception as e:
+        # Allocation probes LakeFS, so it is a new place this request can fail.
+        # Keep the header-based error shape the rest of the API uses rather than
+        # letting the exception escape as a bare 500.
+        logger.exception(f"LakeFS repository allocation failed for {full_id}", e)
+        return hf_server_error(f"LakeFS repository allocation failed: {str(e)}")
+
     storage_namespace = f"s3://{cfg.s3.bucket}/{lakefs_repo}"
 
     try:
@@ -995,9 +1003,18 @@ async def move_repo(
     # Allocate the destination id instead of deriving it: if the destination name
     # was used before and its LakeFS repository is still being deleted, the
     # derived name is not available yet.
-    to_lakefs_repo = await allocate_lakefs_repo_name(
-        get_lakefs_client(), repo_type, to_id
-    )
+    try:
+        to_lakefs_repo = await allocate_lakefs_repo_name(
+            get_lakefs_client(), repo_type, to_id
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"LakeFS repository allocation failed for {to_id}", e)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": f"Failed to allocate LakeFS repository: {str(e)}"},
+        )
 
     await _migrate_lakefs_repository(
         repo_type=repo_type,
