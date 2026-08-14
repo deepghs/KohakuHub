@@ -54,6 +54,7 @@ from kohakuhub.api.quota.util import (
 from kohakuhub.api.repo.utils.gc import cleanup_repository_storage
 from kohakuhub.api.fallback.cache import get_cache as get_fallback_cache
 from kohakuhub.api.validation import normalize_name
+from kohakuhub.api.operation_capabilities import ensure_repository_operation_enabled
 
 logger = get_logger("REPO")
 router = APIRouter()
@@ -1170,6 +1171,8 @@ async def squash_repo(
     Raises:
         HTTPException: If operation fails
     """
+    ensure_repository_operation_enabled("squash")
+
     user, is_admin = auth
     repo_id = payload.repo
     repo_type = payload.type

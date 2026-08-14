@@ -710,6 +710,12 @@ export const orgAPI = {
  */
 export const settingsAPI = {
   /**
+   * Get public site configuration and repository operation capabilities.
+   * @returns {Promise} - public site configuration
+   */
+  getSiteConfig: () => api.get("/api/site-config"),
+
+  /**
    * Get current user info with organizations (HuggingFace compatible)
    * @returns {Promise} - { type, name, fullname, email, emailVerified, orgs }
    */

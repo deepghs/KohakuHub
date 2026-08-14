@@ -11,6 +11,11 @@ async def test_version_site_config_and_yaml_validation(client):
     site_config_response = await client.get("/api/site-config")
     assert site_config_response.status_code == 200
     assert "site_name" in site_config_response.json()
+    assert site_config_response.json()["capabilities"]["repository_operations"] == {
+        "revert": False,
+        "reset": False,
+        "squash": False,
+    }
 
     valid_yaml_response = await client.post(
         "/api/validate-yaml",

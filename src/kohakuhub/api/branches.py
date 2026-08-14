@@ -31,6 +31,7 @@ from kohakuhub.api.repo.utils.hf import (
     hf_repo_not_found,
     hf_server_error,
 )
+from kohakuhub.api.operation_capabilities import ensure_repository_operation_enabled
 
 logger = get_logger("BRANCHES")
 
@@ -503,6 +504,8 @@ async def revert_branch(
     Raises:
         HTTPException: If revert fails or LFS files are not recoverable
     """
+    ensure_repository_operation_enabled("revert")
+
     repo_id = f"{namespace}/{name}"
 
     # Check if repository exists
@@ -779,6 +782,8 @@ async def reset_branch(
     Raises:
         HTTPException: If reset fails or LFS files are not recoverable
     """
+    ensure_repository_operation_enabled("reset")
+
     repo_id = f"{namespace}/{name}"
 
     # Check if repository exists

@@ -118,6 +118,11 @@ class AppConfig(BaseModel):
     db_backend: str = "sqlite"
     # Optional features
     disable_dataset_viewer: bool = False
+    # Dangerous repository history operations stay disabled until their
+    # integrity and recovery gates have passed.
+    repository_revert_enabled: bool = False
+    repository_reset_enabled: bool = False
+    repository_squash_enabled: bool = False
     database_url: str = "sqlite:///./hub.db"
     database_key: str = (
         ""  # Encryption key for external tokens (generate with: openssl rand -hex 32)
@@ -482,6 +487,18 @@ def load_config(path: str = None) -> Config:
     if "KOHAKU_HUB_DISABLE_DATASET_VIEWER" in os.environ:
         app_env["disable_dataset_viewer"] = (
             os.environ["KOHAKU_HUB_DISABLE_DATASET_VIEWER"].lower() == "true"
+        )
+    if "KOHAKU_HUB_REPOSITORY_REVERT_ENABLED" in os.environ:
+        app_env["repository_revert_enabled"] = (
+            os.environ["KOHAKU_HUB_REPOSITORY_REVERT_ENABLED"].lower() == "true"
+        )
+    if "KOHAKU_HUB_REPOSITORY_RESET_ENABLED" in os.environ:
+        app_env["repository_reset_enabled"] = (
+            os.environ["KOHAKU_HUB_REPOSITORY_RESET_ENABLED"].lower() == "true"
+        )
+    if "KOHAKU_HUB_REPOSITORY_SQUASH_ENABLED" in os.environ:
+        app_env["repository_squash_enabled"] = (
+            os.environ["KOHAKU_HUB_REPOSITORY_SQUASH_ENABLED"].lower() == "true"
         )
     if "KOHAKU_HUB_DB_BACKEND" in os.environ:
         app_env["db_backend"] = os.environ["KOHAKU_HUB_DB_BACKEND"]

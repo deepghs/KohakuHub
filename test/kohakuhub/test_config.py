@@ -102,6 +102,9 @@ def test_load_config_merges_file_and_environment(monkeypatch):
     monkeypatch.setenv("KOHAKU_HUB_INTERNAL_BASE_URL", "http://internal-app")
     monkeypatch.setenv("KOHAKU_HUB_API_BASE", "/api/v2")
     monkeypatch.setenv("KOHAKU_HUB_DISABLE_DATASET_VIEWER", "true")
+    monkeypatch.setenv("KOHAKU_HUB_REPOSITORY_REVERT_ENABLED", "true")
+    monkeypatch.setenv("KOHAKU_HUB_REPOSITORY_RESET_ENABLED", "false")
+    monkeypatch.setenv("KOHAKU_HUB_REPOSITORY_SQUASH_ENABLED", "true")
     monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "postgres")
     monkeypatch.setenv("KOHAKU_HUB_DATABASE_URL", "postgres://db")
     monkeypatch.setenv("KOHAKU_HUB_DATABASE_KEY", "key")
@@ -149,6 +152,9 @@ def test_load_config_merges_file_and_environment(monkeypatch):
     assert cfg.app.internal_base_url == "http://internal-app"
     assert cfg.app.api_base == "/api/v2"
     assert cfg.app.disable_dataset_viewer is True
+    assert cfg.app.repository_revert_enabled is True
+    assert cfg.app.repository_reset_enabled is False
+    assert cfg.app.repository_squash_enabled is True
     assert cfg.app.db_backend == "postgres"
     assert cfg.app.database_url == "postgres://db"
     assert cfg.app.database_key == "key"
@@ -178,6 +184,9 @@ def test_load_config_uses_defaults_when_file_is_missing(monkeypatch):
     assert cfg.s3.endpoint == "http://localhost:9000"
     assert cfg.lakefs.endpoint == "http://localhost:8000"
     assert cfg.app.base_url == "http://localhost:48888"
+    assert cfg.app.repository_revert_enabled is False
+    assert cfg.app.repository_reset_enabled is False
+    assert cfg.app.repository_squash_enabled is False
     hub_config.load_config.cache_clear()
 
 

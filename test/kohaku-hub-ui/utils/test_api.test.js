@@ -115,6 +115,7 @@ describe("frontend API client", () => {
     await orgAPI.listMembers("acme");
 
     await settingsAPI.whoamiV2();
+    await settingsAPI.getSiteConfig();
     await settingsAPI.getUserProfile("alice");
     await settingsAPI.updateUserSettings("alice", { bio: "hello" });
     await settingsAPI.getOrgProfile("acme");
@@ -177,6 +178,7 @@ describe("frontend API client", () => {
       data: { type: "model", name: "demo", organization: "acme" },
     });
     expect(getSpy).toHaveBeenCalledWith("/api/models/alice/demo");
+    expect(getSpy).toHaveBeenCalledWith("/api/site-config");
     expect(getSpy).toHaveBeenCalledWith("/api/datasets", {
       params: { limit: 5, sort: "likes" },
     });
