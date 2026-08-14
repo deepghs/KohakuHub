@@ -823,6 +823,36 @@ export const settingsAPI = {
   squashRepo: (data) => api.post("/api/repos/squash", data),
 
   /**
+   * Revert a commit on a branch.
+   * @param {string} repoType - Repository type
+   * @param {string} namespace - Repository namespace
+   * @param {string} name - Repository name
+   * @param {string} branch - Branch name
+   * @param {Object} data - Revert payload
+   * @returns {Promise} - Revert result
+   */
+  revertBranch: (repoType, namespace, name, branch, data) =>
+    api.post(
+      `/api/${repoType}s/${namespace}/${name}/branch/${branch}/revert`,
+      data,
+    ),
+
+  /**
+   * Reset a branch to a commit.
+   * @param {string} repoType - Repository type
+   * @param {string} namespace - Repository namespace
+   * @param {string} name - Repository name
+   * @param {string} branch - Branch name
+   * @param {Object} data - Reset payload
+   * @returns {Promise} - Reset result
+   */
+  resetBranch: (repoType, namespace, name, branch, data) =>
+    api.post(
+      `/api/${repoType}s/${namespace}/${name}/branch/${branch}/reset`,
+      data,
+    ),
+
+  /**
    * Create branch
    * @param {string} repoType - Repository type
    * @param {string} namespace - Repository namespace

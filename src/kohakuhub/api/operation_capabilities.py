@@ -17,6 +17,9 @@ _OPERATION_CONFIG_FIELDS: dict[RepositoryOperation, str] = {
 
 def get_repository_operation_capabilities() -> dict[str, bool]:
     """Return the effective public capabilities for dangerous operations."""
+    if str(getattr(cfg.app, "db_backend", "sqlite")).lower() != "postgres":
+        return {operation: False for operation in _OPERATION_CONFIG_FIELDS}
+
     return {
         operation: bool(getattr(cfg.app, config_field, False))
         for operation, config_field in _OPERATION_CONFIG_FIELDS.items()
@@ -38,3 +41,18 @@ def ensure_repository_operation_enabled(operation: RepositoryOperation) -> None:
             "message": f"Repository {operation_name} is temporarily disabled",
         },
     )
+
+
+def require_repository_revert_enabled() -> None:
+    """FastAPI dependency that gates Revert before authentication runs."""
+    ensure_repository_operation_enabled("revert")
+
+
+def require_repository_reset_enabled() -> None:
+    """FastAPI dependency that gates Reset before authentication runs."""
+    ensure_repository_operation_enabled("reset")
+
+
+def require_repository_squash_enabled() -> None:
+    """FastAPI dependency that gates Super Squash before authentication runs."""
+    ensure_repository_operation_enabled("squash")

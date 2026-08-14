@@ -104,6 +104,13 @@ describe("frontend API client", () => {
     await repoAPI.listCommits("space", "alice", "demo", "main", {
       limit: 20,
     });
+    await settingsAPI.revertBranch("model", "alice", "demo", "main", {
+      ref: "commit-1",
+    });
+    await settingsAPI.resetBranch("model", "alice", "demo", "main", {
+      ref: "commit-1",
+      force: true,
+    });
 
     await orgAPI.create({ name: "acme" });
     await orgAPI.get("acme");
@@ -179,6 +186,14 @@ describe("frontend API client", () => {
     });
     expect(getSpy).toHaveBeenCalledWith("/api/models/alice/demo");
     expect(getSpy).toHaveBeenCalledWith("/api/site-config");
+    expect(postSpy).toHaveBeenCalledWith(
+      "/api/models/alice/demo/branch/main/revert",
+      { ref: "commit-1" },
+    );
+    expect(postSpy).toHaveBeenCalledWith(
+      "/api/models/alice/demo/branch/main/reset",
+      { ref: "commit-1", force: true },
+    );
     expect(getSpy).toHaveBeenCalledWith("/api/datasets", {
       params: { limit: 5, sort: "likes" },
     });

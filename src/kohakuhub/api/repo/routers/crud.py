@@ -54,7 +54,10 @@ from kohakuhub.api.quota.util import (
 from kohakuhub.api.repo.utils.gc import cleanup_repository_storage
 from kohakuhub.api.fallback.cache import get_cache as get_fallback_cache
 from kohakuhub.api.validation import normalize_name
-from kohakuhub.api.operation_capabilities import ensure_repository_operation_enabled
+from kohakuhub.api.operation_capabilities import (
+    ensure_repository_operation_enabled,
+    require_repository_squash_enabled,
+)
 
 logger = get_logger("REPO")
 router = APIRouter()
@@ -1147,7 +1150,10 @@ async def move_repo(
     }
 
 
-@router.post("/repos/squash")
+@router.post(
+    "/repos/squash",
+    dependencies=[Depends(require_repository_squash_enabled)],
+)
 async def squash_repo(
     payload: SquashRepoPayload,
     auth: tuple[User | None, bool] = Depends(get_current_user_or_admin),

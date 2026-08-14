@@ -13,8 +13,10 @@ import {
   deleteRepositoryAdmin,
   moveRepositoryAdmin,
   squashRepositoryAdmin,
+  getSiteConfig,
 } from "@/utils/api";
 import { formatBytes } from "@/utils/api";
+import { getRepositoryOperationCapabilities } from "@/utils/repositoryOperationCapabilities";
 import { ElMessage, ElMessageBox } from "element-plus";
 import dayjs from "dayjs";
 
@@ -31,6 +33,7 @@ const storageBreakdown = ref(null);
 const repoCommits = ref([]);
 const loadingStorage = ref(false);
 const loadingCommits = ref(false);
+const squashEnabled = ref(false);
 
 // Actions
 const actionLoading = ref(false);
@@ -127,6 +130,16 @@ async function loadRepositories() {
     }
   } finally {
     loading.value = false;
+  }
+}
+
+async function loadOperationCapabilities() {
+  try {
+    const siteConfig = await getSiteConfig();
+    squashEnabled.value = getRepositoryOperationCapabilities(siteConfig).squash;
+  } catch (err) {
+    // Keep Squash hidden when capabilities cannot be established.
+    console.warn("Failed to load repository operation capabilities:", err);
   }
 }
 
@@ -338,6 +351,7 @@ async function confirmMoveRepo() {
 }
 
 async function confirmSquashRepo() {
+  if (!squashEnabled.value) return;
   try {
     const { value } = await ElMessageBox.prompt(
       `Type "${selectedRepo.value.name}" to confirm squash`,
@@ -395,6 +409,7 @@ async function confirmDeleteRepo() {
 
 onMounted(() => {
   loadRepositories();
+  loadOperationCapabilities();
 });
 </script>
 
@@ -870,7 +885,7 @@ onMounted(() => {
                 </el-card>
 
                 <!-- Squash Repository -->
-                <el-card class="bg-white dark:bg-gray-800">
+                <el-card v-if="squashEnabled" class="bg-white dark:bg-gray-800">
                   <template #header>
                     <div class="font-semibold">Squash Repository</div>
                   </template>

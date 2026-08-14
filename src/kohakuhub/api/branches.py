@@ -31,7 +31,11 @@ from kohakuhub.api.repo.utils.hf import (
     hf_repo_not_found,
     hf_server_error,
 )
-from kohakuhub.api.operation_capabilities import ensure_repository_operation_enabled
+from kohakuhub.api.operation_capabilities import (
+    ensure_repository_operation_enabled,
+    require_repository_reset_enabled,
+    require_repository_revert_enabled,
+)
 
 logger = get_logger("BRANCHES")
 
@@ -475,7 +479,10 @@ async def list_repo_refs(
     return response
 
 
-@router.post("/{repo_type}s/{namespace}/{name}/branch/{branch}/revert")
+@router.post(
+    "/{repo_type}s/{namespace}/{name}/branch/{branch}/revert",
+    dependencies=[Depends(require_repository_revert_enabled)],
+)
 async def revert_branch(
     repo_type: str,
     namespace: str,
@@ -753,7 +760,10 @@ async def merge_branches(
     }
 
 
-@router.post("/{repo_type}s/{namespace}/{name}/branch/{branch}/reset")
+@router.post(
+    "/{repo_type}s/{namespace}/{name}/branch/{branch}/reset",
+    dependencies=[Depends(require_repository_reset_enabled)],
+)
 async def reset_branch(
     repo_type: str,
     namespace: str,

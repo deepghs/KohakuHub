@@ -571,6 +571,7 @@ import axios from "axios";
 import dayjs from "dayjs";
 import relativeTime from "dayjs/plugin/relativeTime";
 import { ElMessage } from "element-plus";
+import { settingsAPI } from "@/utils/api";
 import { getRepositoryOperationCapabilities } from "@/utils/repositoryOperationCapabilities";
 
 dayjs.extend(relativeTime);
@@ -634,7 +635,7 @@ async function loadCommitDetails() {
 
 async function loadOperationCapabilities() {
   try {
-    const { data } = await axios.get("/api/site-config");
+    const { data } = await settingsAPI.getSiteConfig();
     const operations = getRepositoryOperationCapabilities(data);
     revertEnabled.value = operations.revert;
     resetEnabled.value = operations.reset;
@@ -664,8 +665,11 @@ async function doRevert() {
   reverting.value = true;
 
   try {
-    await axios.post(
-      `/api/${type.value}s/${repoId.value}/branch/${selectedBranch.value}/revert`,
+    await settingsAPI.revertBranch(
+      type.value,
+      namespace.value,
+      name.value,
+      selectedBranch.value,
       {
         ref: commitId.value,
         parent_number: 1,
@@ -711,8 +715,11 @@ async function doReset() {
       payload.message = resetMessage.value.trim();
     }
 
-    await axios.post(
-      `/api/${type.value}s/${repoId.value}/branch/${selectedBranch.value}/reset`,
+    await settingsAPI.resetBranch(
+      type.value,
+      namespace.value,
+      name.value,
+      selectedBranch.value,
       payload,
     );
 

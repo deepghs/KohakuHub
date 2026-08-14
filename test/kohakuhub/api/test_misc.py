@@ -1,6 +1,13 @@
 """API tests for utility routes."""
 
+from types import SimpleNamespace
+
 import httpx
+import pytest
+
+import kohakuhub.api.branches as branches_api
+import kohakuhub.api.operation_capabilities as operation_capabilities
+import kohakuhub.api.repo.routers.crud as repo_crud
 
 
 async def test_version_site_config_and_yaml_validation(client):
@@ -30,6 +37,78 @@ async def test_version_site_config_and_yaml_validation(client):
     )
     assert invalid_yaml_response.status_code == 200
     assert invalid_yaml_response.json()["valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_disabled_operations_reject_before_auth_and_repository_lookup(
+    app, client, monkeypatch
+):
+    for field in (
+        "repository_revert_enabled",
+        "repository_reset_enabled",
+        "repository_squash_enabled",
+    ):
+        monkeypatch.setattr(operation_capabilities.cfg.app, field, False)
+
+    auth_calls = []
+    repository_lookups = []
+
+    def unexpected_user_dependency():
+        auth_calls.append("user")
+        return SimpleNamespace(username="owner")
+
+    def unexpected_admin_dependency():
+        auth_calls.append("admin")
+        return (SimpleNamespace(username="owner"), False)
+
+    def unexpected_repository_lookup(*_args):
+        repository_lookups.append(True)
+        return SimpleNamespace()
+
+    app.dependency_overrides[branches_api.get_current_user] = unexpected_user_dependency
+    app.dependency_overrides[repo_crud.get_current_user_or_admin] = (
+        unexpected_admin_dependency
+    )
+    monkeypatch.setattr(branches_api, "get_repository", unexpected_repository_lookup)
+    monkeypatch.setattr(repo_crud, "get_repository", unexpected_repository_lookup)
+
+    try:
+        requests = [
+            (
+                "/api/models/owner/demo-model/branch/main/revert",
+                {"ref": "commit-ref"},
+            ),
+            (
+                "/api/models/owner/demo-model/branch/main/reset",
+                {"ref": "commit-ref", "force": True},
+            ),
+            ("/api/repos/squash", {"repo": "owner/demo-model", "type": "model"}),
+        ]
+        responses = [await client.post(path, json=payload) for path, payload in requests]
+    finally:
+        app.dependency_overrides.clear()
+
+    assert [response.status_code for response in responses] == [503, 503, 503]
+    assert [response.json()["detail"]["code"] for response in responses] == [
+        "operation_disabled",
+        "operation_disabled",
+        "operation_disabled",
+    ]
+    assert auth_calls == []
+    assert repository_lookups == []
+
+
+def test_repository_operations_stay_disabled_on_sqlite(monkeypatch):
+    monkeypatch.setattr(operation_capabilities.cfg.app, "db_backend", "sqlite")
+    monkeypatch.setattr(operation_capabilities.cfg.app, "repository_revert_enabled", True)
+    monkeypatch.setattr(operation_capabilities.cfg.app, "repository_reset_enabled", True)
+    monkeypatch.setattr(operation_capabilities.cfg.app, "repository_squash_enabled", True)
+
+    assert operation_capabilities.get_repository_operation_capabilities() == {
+        "revert": False,
+        "reset": False,
+        "squash": False,
+    }
 
 
 async def test_whoami_v2_requires_auth_and_returns_orgs(app, owner_client):
