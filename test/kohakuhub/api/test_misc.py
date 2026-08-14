@@ -5,9 +5,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-import kohakuhub.api.branches as branches_api
 import kohakuhub.api.operation_capabilities as operation_capabilities
-import kohakuhub.api.repo.routers.crud as repo_crud
 
 
 async def test_version_site_config_and_yaml_validation(client):
@@ -41,14 +39,18 @@ async def test_version_site_config_and_yaml_validation(client):
 
 @pytest.mark.asyncio
 async def test_disabled_operations_reject_before_auth_and_repository_lookup(
-    app, client, monkeypatch
+    app, backend_test_state, client, monkeypatch
 ):
+    active_cfg = backend_test_state.modules.config_module.cfg
+    active_branches = backend_test_state.modules.branches_module
+    active_repo_crud = backend_test_state.modules.repo_crud_module
+
     for field in (
         "repository_revert_enabled",
         "repository_reset_enabled",
         "repository_squash_enabled",
     ):
-        monkeypatch.setattr(operation_capabilities.cfg.app, field, False)
+        monkeypatch.setattr(active_cfg.app, field, False)
 
     auth_calls = []
     repository_lookups = []
@@ -65,12 +67,12 @@ async def test_disabled_operations_reject_before_auth_and_repository_lookup(
         repository_lookups.append(True)
         return SimpleNamespace()
 
-    app.dependency_overrides[branches_api.get_current_user] = unexpected_user_dependency
-    app.dependency_overrides[repo_crud.get_current_user_or_admin] = (
+    app.dependency_overrides[active_branches.get_current_user] = unexpected_user_dependency
+    app.dependency_overrides[active_repo_crud.get_current_user_or_admin] = (
         unexpected_admin_dependency
     )
-    monkeypatch.setattr(branches_api, "get_repository", unexpected_repository_lookup)
-    monkeypatch.setattr(repo_crud, "get_repository", unexpected_repository_lookup)
+    monkeypatch.setattr(active_branches, "get_repository", unexpected_repository_lookup)
+    monkeypatch.setattr(active_repo_crud, "get_repository", unexpected_repository_lookup)
 
     try:
         requests = [
@@ -96,6 +98,62 @@ async def test_disabled_operations_reject_before_auth_and_repository_lookup(
     ]
     assert auth_calls == []
     assert repository_lookups == []
+
+
+@pytest.mark.asyncio
+async def test_enabled_operations_still_require_authentication(
+    app, backend_test_state, client, monkeypatch
+):
+    active_cfg = backend_test_state.modules.config_module.cfg
+    active_branches = backend_test_state.modules.branches_module
+    active_repo_crud = backend_test_state.modules.repo_crud_module
+
+    monkeypatch.setattr(active_cfg.app, "db_backend", "postgres")
+    for field in (
+        "repository_revert_enabled",
+        "repository_reset_enabled",
+        "repository_squash_enabled",
+    ):
+        monkeypatch.setattr(active_cfg.app, field, True)
+    mutation_calls = []
+
+    def unexpected_repository_lookup(*_args):
+        mutation_calls.append("repository")
+        raise AssertionError("anonymous request reached repository logic")
+
+    monkeypatch.setattr(active_branches, "get_repository", unexpected_repository_lookup)
+    monkeypatch.setattr(active_repo_crud, "get_repository", unexpected_repository_lookup)
+    app.dependency_overrides[active_branches.require_repository_revert_enabled] = (
+        lambda: None
+    )
+    app.dependency_overrides[active_branches.require_repository_reset_enabled] = (
+        lambda: None
+    )
+    app.dependency_overrides[active_repo_crud.require_repository_squash_enabled] = (
+        lambda: None
+    )
+
+    requests = [
+        (
+            "/api/models/owner/demo-model/branch/main/revert",
+            {"ref": "commit-ref"},
+        ),
+        (
+            "/api/models/owner/demo-model/branch/main/reset",
+            {"ref": "commit-ref", "force": True},
+        ),
+        ("/api/repos/squash", {"repo": "owner/demo-model", "type": "model"}),
+    ]
+
+    try:
+        responses = [
+            await client.post(path, json=payload) for path, payload in requests
+        ]
+    finally:
+        app.dependency_overrides.clear()
+
+    assert [response.status_code for response in responses] == [401, 401, 401]
+    assert mutation_calls == []
 
 
 def test_repository_operations_stay_disabled_on_sqlite(monkeypatch):
