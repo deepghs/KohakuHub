@@ -85,10 +85,10 @@ async def test_get_trending_repositories_filters_missing_mismatched_and_inaccess
     )
     repo_results = [repo_public, repo_private, None]
     stats_rows = [
-        SimpleNamespace(repository=SimpleNamespace(id=1), download_sessions=7),
-        SimpleNamespace(repository=SimpleNamespace(id=1), download_sessions=3),
-        SimpleNamespace(repository=SimpleNamespace(id=2), download_sessions=5),
-        SimpleNamespace(repository=SimpleNamespace(id=3), download_sessions=4),
+        SimpleNamespace(repository_id=1, download_sessions=7),
+        SimpleNamespace(repository_id=1, download_sessions=3),
+        SimpleNamespace(repository_id=2, download_sessions=5),
+        SimpleNamespace(repository_id=3, download_sessions=4),
     ]
 
     class _FakeDailyRepoStats:

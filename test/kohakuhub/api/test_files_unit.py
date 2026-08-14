@@ -124,6 +124,87 @@ async def test_hash_and_sample_helpers_cover_match_failures_and_decode_errors(mo
 
 
 @pytest.mark.asyncio
+async def test_process_preupload_file_uses_batch_metadata_without_file_queries(
+    monkeypatch,
+):
+    repo = SimpleNamespace()
+
+    monkeypatch.setattr(files_api, "should_use_lfs", lambda repo_row, path, size: False)
+    monkeypatch.setattr(
+        files_api,
+        "get_file",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("preupload should use the batch map")
+        ),
+    )
+
+    result = await files_api.process_preupload_file(
+        {"path": "same.bin", "size": 4, "sha256": "sha"},
+        repo,
+        "owner/demo",
+        "lakefs-repo",
+        "main",
+        1024,
+        existing_files={"same.bin": ("sha", 4)},
+    )
+
+    assert result == {
+        "path": "same.bin",
+        "uploadMode": "regular",
+        "shouldIgnore": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_preupload_batch_load_is_limited_to_sha256_paths(monkeypatch):
+    repo = SimpleNamespace(
+        private=True,
+        created_at=None,
+        namespace="alice",
+        downloads=1,
+        likes_count=2,
+    )
+    captured = []
+
+    monkeypatch.setattr(files_api, "check_repo_write_permission", lambda *_args: None)
+    monkeypatch.setattr(files_api, "get_organization", lambda _namespace: None)
+    monkeypatch.setattr(files_api, "get_repository", lambda *_args: repo)
+    monkeypatch.setattr(files_api, "check_quota", lambda *_args: (True, None))
+    monkeypatch.setattr(files_api, "resolve_lakefs_repo", lambda _repo: "lakefs-repo")
+    monkeypatch.setattr(files_api, "get_effective_lfs_threshold", lambda _repo: 1024)
+
+    def _batch_map(_repo, paths):
+        captured.append(set(paths))
+        return {"same.bin": ("sha", 4)}
+
+    monkeypatch.setattr(files_api, "get_repo_file_metadata_map", _batch_map)
+    monkeypatch.setattr(
+        files_api,
+        "process_preupload_file",
+        _async_return({"path": "ok", "uploadMode": "regular", "shouldIgnore": True}),
+    )
+
+    response = await files_api.preupload(
+        files_api.RepoType.model,
+        "alice",
+        "demo",
+        "main",
+        _FakeRequest(
+            body={
+                "files": [
+                    {"path": "same.bin", "size": 4, "sha256": "sha"},
+                    {"path": "sample.txt", "size": 3, "sample": "YWJj"},
+                ]
+            }
+        ),
+        user=SimpleNamespace(username="alice"),
+    )
+
+    assert captured == [{"same.bin"}]
+    assert len(response["files"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_preupload_and_revision_cover_validation_quota_and_resolution_errors(
     monkeypatch,
 ):

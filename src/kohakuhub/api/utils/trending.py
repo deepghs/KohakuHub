@@ -53,7 +53,9 @@ def calculate_trending_scores(repo_type: str, days: int = 7) -> dict[int, float]
     trending_scores = {}  # repo_id -> score
 
     for stat in stats:
-        repo_id = stat.repository.id
+        # Use the loaded scalar FK instead of dereferencing the related model,
+        # which otherwise performs one lazy query per stats row.
+        repo_id = stat.repository_id
         days_ago = (today - stat.date).days
 
         # Decay weight: 1.0 for today, 0.8 for yesterday, 0.64 for 2 days ago, etc.

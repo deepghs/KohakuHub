@@ -58,17 +58,17 @@ class _FrozenDatetime:
 def test_calculate_trending_scores_applies_decay_and_aggregates_multiple_days(monkeypatch):
     stats = [
         SimpleNamespace(
-            repository=SimpleNamespace(id=1),
+            repository_id=1,
             date=datetime(2026, 4, 20, tzinfo=timezone.utc).date(),
             download_sessions=10,
         ),
         SimpleNamespace(
-            repository=SimpleNamespace(id=1),
+            repository_id=1,
             date=datetime(2026, 4, 19, tzinfo=timezone.utc).date(),
             download_sessions=5,
         ),
         SimpleNamespace(
-            repository=SimpleNamespace(id=2),
+            repository_id=2,
             date=datetime(2026, 4, 18, tzinfo=timezone.utc).date(),
             download_sessions=1,
         ),

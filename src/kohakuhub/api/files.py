@@ -17,6 +17,7 @@ from kohakuhub.db import File, Repository, User
 from kohakuhub.db_operations import (
     get_effective_lfs_threshold,
     get_file,
+    get_repo_file_metadata_map,
     get_organization,
     get_repository,
     should_use_lfs,
@@ -145,6 +146,8 @@ async def process_preupload_file(
     lakefs_repo: str,
     revision: str,
     threshold: int,  # Kept for backward compatibility, not used
+    *,
+    existing_files: dict[str, tuple[str, int]] | None = None,
 ) -> dict:
     """Process single file for preupload check.
 
@@ -155,6 +158,7 @@ async def process_preupload_file(
         lakefs_repo: LakeFS repository name
         revision: Branch name
         threshold: Deprecated - use repo.lfs_threshold_bytes instead
+        existing_files: Optional batch-loaded ``path -> (sha256, size)`` map.
 
     Returns:
         Preupload result dict with path, uploadMode, shouldIgnore
@@ -171,7 +175,13 @@ async def process_preupload_file(
     # Check for existing file with same content
     if sha256:
         # If sha256 provided, use it for comparison (most reliable)
-        should_ignore = await check_file_by_sha256(repo, path, sha256, size)
+        if existing_files is None:
+            should_ignore = await check_file_by_sha256(repo, path, sha256, size)
+        else:
+            existing = existing_files.get(path)
+            should_ignore = bool(
+                existing and existing[0] == sha256 and existing[1] == size
+            )
     elif sample and upload_mode == "regular":
         # For small files, compare sample content if no sha256 provided
         should_ignore = await check_file_by_sample(
@@ -260,11 +270,28 @@ async def preupload(
     # Get effective LFS threshold for this repository
     threshold = get_effective_lfs_threshold(repo_row)
 
+    # The old per-file check queried ``File`` once for every SHA256-bearing
+    # entry. Load only the requested paths once; a database failure propagates
+    # as it did for the old ``get_file`` path instead of silently reintroducing
+    # N+1 queries.
+    sha_paths = {
+        file_info.get("path") or file_info.get("path_in_repo")
+        for file_info in files
+        if file_info.get("sha256")
+    }
+    existing_files = get_repo_file_metadata_map(repo_row, sha_paths) if sha_paths else {}
+
     # Process all files in parallel
     result_files = await asyncio.gather(
         *[
             process_preupload_file(
-                f, repo_row, repo_id, lakefs_repo, revision, threshold
+                f,
+                repo_row,
+                repo_id,
+                lakefs_repo,
+                revision,
+                threshold,
+                existing_files=existing_files,
             )
             for f in files
         ]
@@ -286,6 +313,7 @@ async def get_revision(
     request: Request,
     expand: Optional[str] = None,
     fallback: bool = True,
+    blobs: bool = True,
     user: User | None = Depends(get_optional_user),
 ):
     """Get revision information for a repository.
@@ -335,11 +363,15 @@ async def get_revision(
 
     siblings = []
     try:
+        # huggingface_hub sends `blobs` to this route too — it is the same
+        # params dict as the no-revision form — so the opt-out has to work here
+        # or a revision-pinned call could never use it.
         siblings = await collect_hf_siblings(
             repo_row,
             repo_type.value,
             repo_id,
             commit_id or revision,
+            with_metadata=blobs,
         )
     except Exception as e:
         logger.warning(f"Failed to collect siblings for {repo_id}@{revision}: {e}")
