@@ -61,6 +61,11 @@ api_base = "/api"
 db_backend = "postgres"  # or "sqlite"
 database_url = "postgresql://hub:hubpass@127.0.0.1:25432/hubdb"
 auto_migrate = false  # Auto-confirm database migrations (set true for Docker)
+# Dangerous repository history operations stay disabled until their integrity
+# and recovery gates have passed.
+repository_revert_enabled = false
+repository_reset_enabled = false
+repository_squash_enabled = false
 # LFS Configuration (sizes in decimal: 1MB = 1,000,000 bytes)
 lfs_threshold_bytes = 5_000_000  # 5MB - files larger use LFS
 lfs_multipart_threshold_bytes = 100_000_000  # 100MB - files larger use multipart upload

@@ -8,6 +8,9 @@ from kohakuhub.config import cfg
 from kohakuhub.db import User, UserOrganization
 from kohakuhub.logger import get_logger
 from kohakuhub.auth.dependencies import get_optional_user
+from kohakuhub.api.operation_capabilities import (
+    get_repository_operation_capabilities,
+)
 
 logger = get_logger("UTILS")
 
@@ -47,6 +50,9 @@ def get_site_config():
         "site_name": cfg.app.site_name,
         "invitation_only": cfg.auth.invitation_only,
         "require_email_verification": cfg.auth.require_email_verification,
+        "capabilities": {
+            "repository_operations": get_repository_operation_capabilities(),
+        },
     }
 
 

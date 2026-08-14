@@ -20,6 +20,7 @@ describe("admin API client", () => {
 
     vi.spyOn(axios, "create").mockReturnValue(client);
     vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
+    vi.spyOn(axios, "get").mockResolvedValue({ data: {} });
     vi.spyOn(axios, "delete").mockResolvedValue({ data: {} });
 
     client.get.mockResolvedValue({ data: {} });
@@ -220,6 +221,7 @@ describe("admin API client", () => {
       "mai_lin",
       "lineart-caption-base",
     );
+    await api.getSiteConfig();
 
     await api.deleteS3Object("admin-token", "models/demo/file.bin");
     await api.prepareDeleteS3Prefix("admin-token", "models/demo/");
@@ -231,6 +233,7 @@ describe("admin API client", () => {
         "X-Admin-Token": "admin-token",
       },
     });
+    expect(axios.get).toHaveBeenCalledWith("/api/site-config");
 
     expect(client.get).toHaveBeenCalledWith("/users", {
       params: { search: "mai", limit: 10, offset: 5, include_orgs: true },

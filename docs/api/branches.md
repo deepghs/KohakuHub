@@ -10,6 +10,47 @@ Manage branches, tags, and advanced Git operations (merge, revert, reset).
 
 ---
 
+## Repository Operation Gate
+
+The history-mutating operations below are independently controlled by server-side
+capabilities: `revert`, `reset`, and `squash`. The public capability state is
+available without authentication from `GET /api/site-config`:
+
+```json
+{
+  "capabilities": {
+    "repository_operations": {
+      "revert": false,
+      "reset": false,
+      "squash": false
+    }
+  }
+}
+```
+
+Clients must treat an operation as enabled only when its value is the boolean
+`true`. If the request fails, the field is missing, or the value has any other
+type, clients must fail closed and hide the corresponding action.
+
+When an operation is disabled, its API gate runs before authentication and
+repository lookup. The server returns `503 Service Unavailable` with this
+stable response shape:
+
+```json
+{
+  "detail": {
+    "code": "operation_disabled",
+    "operation": "reset",
+    "error": "Repository reset is temporarily disabled",
+    "message": "Repository Reset is temporarily disabled"
+  }
+}
+```
+
+The `operation` value is one of `revert`, `reset`, or `squash`. Once enabled,
+the normal authentication, permission, and repository validation requirements
+still apply.
+
 ## Branches
 
 ### Create Branch
@@ -173,6 +214,7 @@ Manage branches, tags, and advanced Git operations (merge, revert, reset).
 
 **Status Codes:**
 - `200 OK` - Reverted successfully
+- `503 Service Unavailable` - Revert operation is disabled by server policy
 - `404 Not Found` - Commit not found
 - `409 Conflict` - Revert caused conflicts
 
@@ -233,6 +275,7 @@ Manage branches, tags, and advanced Git operations (merge, revert, reset).
 
 **Status Codes:**
 - `200 OK` - Reset successful
+- `503 Service Unavailable` - Reset operation is disabled by server policy
 - `400 Bad Request` - LFS files not recoverable or main branch without force
 - `404 Not Found` - Commit not found
 
