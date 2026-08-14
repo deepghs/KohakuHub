@@ -99,16 +99,23 @@ async def test_disabled_operations_reject_before_auth_and_repository_lookup(
 
 
 def test_repository_operations_stay_disabled_on_sqlite(monkeypatch):
-    monkeypatch.setattr(operation_capabilities.cfg.app, "db_backend", "sqlite")
-    monkeypatch.setattr(operation_capabilities.cfg.app, "repository_revert_enabled", True)
-    monkeypatch.setattr(operation_capabilities.cfg.app, "repository_reset_enabled", True)
-    monkeypatch.setattr(operation_capabilities.cfg.app, "repository_squash_enabled", True)
+    for backend in ("sqlite", "POSTGRES"):
+        monkeypatch.setattr(operation_capabilities.cfg.app, "db_backend", backend)
+        monkeypatch.setattr(
+            operation_capabilities.cfg.app, "repository_revert_enabled", True
+        )
+        monkeypatch.setattr(
+            operation_capabilities.cfg.app, "repository_reset_enabled", True
+        )
+        monkeypatch.setattr(
+            operation_capabilities.cfg.app, "repository_squash_enabled", True
+        )
 
-    assert operation_capabilities.get_repository_operation_capabilities() == {
-        "revert": False,
-        "reset": False,
-        "squash": False,
-    }
+        assert operation_capabilities.get_repository_operation_capabilities() == {
+            "revert": False,
+            "reset": False,
+            "squash": False,
+        }
 
 
 async def test_whoami_v2_requires_auth_and_returns_orgs(app, owner_client):

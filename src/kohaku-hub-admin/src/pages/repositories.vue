@@ -373,7 +373,12 @@ async function confirmSquashRepo() {
     await handleViewRepo(selectedRepo.value);
   } catch (err) {
     if (err !== "cancel") {
-      ElMessage.error(err.response?.data?.detail || "Failed to squash");
+      const detail = err.response?.data?.detail;
+      ElMessage.error(
+        typeof detail === "string"
+          ? detail
+          : detail?.error || "Failed to squash",
+      );
     }
   } finally {
     actionLoading.value = false;

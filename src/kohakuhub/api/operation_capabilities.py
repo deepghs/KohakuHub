@@ -17,7 +17,10 @@ _OPERATION_CONFIG_FIELDS: dict[RepositoryOperation, str] = {
 
 def get_repository_operation_capabilities() -> dict[str, bool]:
     """Return the effective public capabilities for dangerous operations."""
-    if str(getattr(cfg.app, "db_backend", "sqlite")).lower() != "postgres":
+    # Keep this check aligned with db.py: any value other than the exact
+    # configured PostgreSQL backend selects SQLite and cannot enable these
+    # operations safely.
+    if getattr(cfg.app, "db_backend", "sqlite") != "postgres":
         return {operation: False for operation in _OPERATION_CONFIG_FIELDS}
 
     return {
