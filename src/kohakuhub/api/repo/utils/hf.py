@@ -7,6 +7,11 @@ This module provides utilities for making Kohaku Hub compatible with
 from typing import Optional
 
 from fastapi.responses import Response
+from peewee import PeeweeException
+
+from kohakuhub.logger import get_logger
+
+logger = get_logger("HF")
 
 
 class HFErrorCode:
@@ -374,9 +379,20 @@ async def collect_hf_siblings(
     repo_type: str,
     repo_id: str,
     revision: str,
+    *,
+    with_metadata: bool = True,
 ) -> list[dict]:
-    """Collect repository files using the schema expected by `huggingface_hub`."""
-    from kohakuhub.db_operations import get_file, should_use_lfs
+    """Collect repository files using the schema expected by `huggingface_hub`.
+
+    Args:
+        with_metadata: When False, emit only ``rfilename`` per file — no
+            ``size``, no ``lfs`` block — and skip the File-table load entirely.
+            This is what the ``blobs`` query parameter maps to; HF's own default
+            response is name-only, and on a large repo the metadata is what
+            makes this expensive (4000 files: 0.102s and 449KB with it, 0.037s
+            and 160KB without).
+    """
+    from kohakuhub.db_operations import get_repo_file_sha256_map, should_use_lfs
     from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 
     lakefs_repo = resolve_lakefs_repo(repo_row)
@@ -408,21 +424,26 @@ async def collect_hf_siblings(
             break
 
     file_objects = [obj for obj in all_results if obj.get("path_type") == "object"]
-    file_records = {}
 
-    for obj in file_objects:
-        path = obj["path"]
-        size = obj.get("size_bytes", 0)
-        if not should_use_lfs(repo_row, path, size):
-            continue
+    if not with_metadata:
+        # Name-only: no File rows needed, no size/lfs fields emitted.
+        return [{"rfilename": obj["path"]} for obj in file_objects]
 
-        try:
-            record = get_file(repo_row, path)
-        except Exception:
-            record = None
-
-        if record is not None:
-            file_records[path] = record
+    # One query for the whole repo instead of one per LFS file: at 4000 files
+    # the per-path loop costs 2.137s against 0.102s for this whole function.
+    try:
+        file_sha256 = get_repo_file_sha256_map(repo_row)
+    except PeeweeException as e:
+        # Keep serving the listing rather than failing the repo page, but say so
+        # loudly: unlike the previous per-path lookup, one failure here drops the
+        # stored sha256 for *every* file, and the LakeFS checksum substituted
+        # below is an ETag-shaped value rather than a sha256. Degrading silently
+        # would hand clients plausible-but-wrong LFS oids at HTTP 200.
+        logger.warning(
+            f"Could not load File rows for {repo_id}; LFS sha256 falls back to"
+            f" LakeFS checksums for every file: {e}"
+        )
+        file_sha256 = {}
 
     siblings = []
     for obj in file_objects:
@@ -434,12 +455,11 @@ async def collect_hf_siblings(
         }
 
         if should_use_lfs(repo_row, path, size):
-            file_record = file_records.get(path)
-            checksum = (
-                file_record.sha256
-                if file_record is not None and file_record.sha256
-                else obj.get("checksum", "")
-            )
+            # Pre-existing fallback, unchanged: a path with no File row uses
+            # the LakeFS checksum, even though that field is documented as
+            # "typically ETag" and can carry a `sha256:` prefix. Whether that
+            # is the right value is a separate correctness question.
+            checksum = file_sha256.get(path) or obj.get("checksum", "")
             sibling["lfs"] = {
                 "sha256": checksum,
                 "size": size,

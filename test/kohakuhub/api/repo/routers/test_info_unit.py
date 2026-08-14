@@ -126,10 +126,11 @@ class _FakeCommitModel:
 
 class _FakeUserOrganizationModel:
     user = _Field("user")
+    organization = _Field("organization")
     select_query = _Query()
 
     @classmethod
-    def select(cls):
+    def select(cls, *args):
         return cls.select_query
 
 
@@ -245,7 +246,9 @@ async def test_get_repo_info_covers_invalid_type_not_found_siblings_and_storage_
     monkeypatch.setattr(repo_info, "get_lakefs_client", lambda: client)
     monkeypatch.setattr(repo_info, "format_hf_datetime", lambda value: "2024-01-02T00:00:00.000000Z")
 
-    async def fake_collect_hf_siblings(repo, repo_type, repo_id, revision):
+    async def fake_collect_hf_siblings(
+        repo, repo_type, repo_id, revision, *, with_metadata=True
+    ):
         if client.list_error:
             raise client.list_error
 

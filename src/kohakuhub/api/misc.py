@@ -87,7 +87,7 @@ def whoami_v2(user: User | None = Depends(get_optional_user)):
 
     # Get user's organizations (organizations are User objects with is_org=True)
     user_orgs = (
-        UserOrganization.select()
+        UserOrganization.select(UserOrganization, User)
         .join(User, on=(UserOrganization.organization == User.id))
         .where(UserOrganization.user == user)
     )

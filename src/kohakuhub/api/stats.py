@@ -155,7 +155,9 @@ async def get_trending_repositories(
     # Aggregate by repository
     repo_downloads = {}  # repo_id -> total_downloads_in_period
     for stat in stats_query:
-        repo_id = stat.repository.id
+        # ``repository`` is a ForeignKey. Reading ``stat.repository.id`` can
+        # issue one lazy SELECT per row; the scalar FK is already selected.
+        repo_id = stat.repository_id
         if repo_id not in repo_downloads:
             repo_downloads[repo_id] = 0
         repo_downloads[repo_id] += stat.download_sessions

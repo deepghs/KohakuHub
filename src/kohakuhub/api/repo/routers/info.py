@@ -172,6 +172,7 @@ async def get_repo_info(
     repo_name: str,
     request: Request,
     fallback: bool = True,
+    blobs: bool = True,
     user: User | None = Depends(get_optional_user),
 ):
     """Get repository information (without revision).
@@ -251,7 +252,14 @@ async def get_repo_info(
                 logger.debug(f"Could not get commit info: {str(ex)}")
 
         try:
-            siblings = await collect_hf_siblings(repo_row, repo_type, repo_id, "main")
+            # `blobs` is the wire name huggingface_hub uses for
+            # `files_metadata` (every matrix version sends
+            # ``params["blobs"] = True``). Defaulting to True keeps existing
+            # responses unchanged; opting out skips the per-file metadata that
+            # dominates the cost on large repos.
+            siblings = await collect_hf_siblings(
+                repo_row, repo_type, repo_id, "main", with_metadata=blobs
+            )
         except Exception as ex:
             logger.exception(
                 f"Could not fetch siblings for {lakefs_repo}: {str(ex)}", ex
@@ -333,7 +341,9 @@ def _filter_repos_by_privacy(q, user: Optional[User], author: Optional[str] = No
         # Get user's organizations using FK relationship
         user_orgs = [
             uo.organization.username
-            for uo in UserOrganization.select().where(UserOrganization.user == user)
+            for uo in UserOrganization.select(UserOrganization, User)
+            .join(User, on=(UserOrganization.organization == User.id))
+            .where(UserOrganization.user == user)
         ]
 
         # Build query: public OR (private AND owned by user or user's orgs)
