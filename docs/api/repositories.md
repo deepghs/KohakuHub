@@ -195,9 +195,30 @@ Create, read, update, delete, move, and squash repositories.
 
 **Status Codes:**
 - `200 OK` - Repository squashed
+- `503 Service Unavailable` - Squash operation is disabled by server policy
 - `403 Forbidden` - No permission
 - `404 Not Found` - Repository not found
 - `500 Internal Server Error` - Operation failed (attempts recovery)
+
+**Operation gate:** The server exposes the current `revert`, `reset`, and
+`squash` capabilities without authentication through `GET /api/site-config`.
+Clients should use an operation only when its capability is exactly the boolean
+`true`; missing, malformed, or failed capability responses must hide the
+corresponding action. When squash is disabled, the API returns `503` before
+authentication or repository lookup with a stable `operation_disabled` detail:
+
+```json
+{
+  "detail": {
+    "code": "operation_disabled",
+    "operation": "squash",
+    "error": "Repository squash is temporarily disabled",
+    "message": "Repository Squash is temporarily disabled"
+  }
+}
+```
+
+When enabled, the normal authentication and permission checks still apply.
 
 ---
 
