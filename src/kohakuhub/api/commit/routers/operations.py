@@ -26,9 +26,9 @@ from kohakuhub.auth.dependencies import get_current_user
 from kohakuhub.auth.permissions import check_repo_write_permission
 from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 from kohakuhub.utils.s3 import get_object_metadata, object_exists
-from kohakuhub.api.quota.util import update_namespace_storage, update_repository_storage
-from kohakuhub.api.repo.utils.gc import run_gc_for_file, track_lfs_object
 from kohakuhub.api.repo.utils.hf import HFErrorCode
+from kohakuhub.operations.handlers import perform_commit_postprocess
+from kohakuhub.operations.service import IdempotencyConflict
 
 logger = get_logger("FILE")
 router = APIRouter()
@@ -926,64 +926,49 @@ async def commit(
     )
     logger.success(f"Commit URL: {commit_url}")
 
-    # Track LFS objects and run GC
-    if pending_lfs_tracking:
-        logger.info(
-            f"[COMMIT_LFS_TRACKING] Processing {len(pending_lfs_tracking)} LFS file(s) "
-            f"for commit {commit_result['id'][:8]}"
-        )
-        for lfs_info in pending_lfs_tracking:
-            logger.debug(
-                f"  - {lfs_info['path']}: sha256={lfs_info['sha256'][:8]}, size={lfs_info['size']:,}"
+    postprocess_payload = {
+        "repository_id": repo_row.id,
+        "repo_type": repo_type.value,
+        "namespace": namespace,
+        "name": name,
+        "commit_id": commit_result["id"],
+        "branch": revision,
+        "is_org": get_organization(namespace) is not None,
+        "lfs_tracking": pending_lfs_tracking,
+    }
+    # Lightweight unit-test request doubles may not expose Starlette's app;
+    # real requests always do, and production PostgreSQL requests use the
+    # lifespan-owned durable runtime.
+    request_app = getattr(request, "app", None)
+    runtime = getattr(getattr(request_app, "state", None), "operation_runtime", None)
+    if runtime is not None:
+        try:
+            await runtime.service.accept(
+                kind="commit.postprocess.v1",
+                resource_key=f"commit-postprocess:{repo_row.id}:{commit_result['id']}",
+                payload=postprocess_payload,
+                requested_by_user_id=user.id,
+                idempotency_key=f"commit-postprocess:{commit_result['id']}",
+                repository_id=repo_row.id,
+                expected_head=commit_result["id"],
             )
-
-            track_lfs_object(
-                repo_type=repo_type.value,
-                namespace=namespace,
-                name=name,
-                path_in_repo=lfs_info["path"],
-                sha256=lfs_info["sha256"],
-                size=lfs_info["size"],
-                commit_id=commit_result["id"],
+        except IdempotencyConflict:
+            logger.error(
+                f"Commit post-process idempotency conflict for {commit_result['id'][:8]}"
             )
-
-            if cfg.app.lfs_auto_gc and lfs_info.get("old_sha256"):
-                deleted_count = run_gc_for_file(
-                    repo_type=repo_type.value,
-                    namespace=namespace,
-                    name=name,
-                    path_in_repo=lfs_info["path"],
-                    current_commit_id=commit_result["id"],
-                )
-                if deleted_count > 0:
-                    logger.info(
-                        f"GC: Cleaned up {deleted_count} old version(s) of {lfs_info['path']}"
-                    )
+        except Exception as e:
+            # LakeFS commit success is never converted into an API failure.
+            logger.exception(
+                f"Failed to enqueue commit post-process for {commit_result['id'][:8]}: {e}"
+            )
     else:
-        logger.warning(
-            f"[COMMIT_LFS_TRACKING] No LFS files to track for commit {commit_result['id'][:8]}"
-        )
-
-    # Update storage usage for namespace and repository after successful commit
-    try:
-        # Recalculate repository storage (keeps repo.used_bytes accurate)
-        await update_repository_storage(repo_row)
-        logger.debug(
-            f"Updated repository storage for {repo_id}: {repo_row.used_bytes:,} bytes"
-        )
-
-        # Check if namespace is organization (User with is_org=True)
-        org = get_organization(namespace)
-        is_org = org is not None
-
-        # Recalculate namespace storage usage
-        await update_namespace_storage(namespace, is_org)
-        logger.debug(
-            f"Updated storage usage for {'org' if is_org else 'user'} {namespace}"
-        )
-    except Exception as e:
-        # Log error but don't fail the commit
-        logger.warning(f"Failed to update storage usage for {namespace}: {e}")
+        # ASGI unit tests and lightweight SQLite development do not enter the
+        # production lifespan. Keep that explicit path functional; production
+        # PostgreSQL requests always use the durable operation runtime.
+        try:
+            await perform_commit_postprocess(postprocess_payload)
+        except Exception as e:
+            logger.warning(f"Commit post-process fallback failed: {e}")
 
     return {
         "commitUrl": commit_url,

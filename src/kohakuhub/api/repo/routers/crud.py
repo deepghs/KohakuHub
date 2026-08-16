@@ -17,7 +17,6 @@ from kohakuhub.db import (
     StagingUpload,
     User,
     db,
-    init_db,
 )
 from kohakuhub.db_operations import (
     get_file,
@@ -57,7 +56,6 @@ from kohakuhub.api.validation import normalize_name
 
 logger = get_logger("REPO")
 router = APIRouter()
-init_db()
 
 RepoType = Literal["model", "dataset", "space"]
 

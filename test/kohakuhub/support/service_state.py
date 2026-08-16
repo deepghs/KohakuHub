@@ -300,6 +300,12 @@ class ServiceTestState:
         self._reset_database()
         report("rebuilding the database schema")
         self.modules.db_module.init_db()
+        # Live-server tests enter FastAPI lifespan, which now opens the
+        # operation enqueue pool. Prepare the same durable worker schema as
+        # production without moving DDL back into API imports.
+        from scripts.khub_migrate import migrate as migrate_worker_schema
+
+        migrate_worker_schema()
         report("initializing the storage bucket")
         self.modules.s3_module.init_storage()
         transport = httpx.ASGITransport(app=self.modules.app)

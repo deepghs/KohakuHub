@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -685,9 +686,8 @@ async def test_lifespan_shutdown_closes_pooled_client(monkeypatch):
     monkeypatch.setattr(main_mod, "init_storage", lambda: None)
 
     class _StubApp:
-        # The lifespan only consumes ``app`` as its parameter; nothing
-        # else on the app is touched.
-        ...
+        # Match the small part of FastAPI's app contract used by lifespan.
+        state = SimpleNamespace()
 
     async with main_mod.lifespan(_StubApp()):
         # Inside the lifespan, the singleton is still alive.

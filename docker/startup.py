@@ -102,15 +102,15 @@ def init_garage():
     print("[startup] ")
 
 
-def run_migrations():
-    """Run database migrations before starting server."""
-    migrations_script = Path(__file__).parent / "scripts" / "run_migrations.py"
+def verify_schema():
+    """Verify schema compatibility; migrations run in khub-migrate only."""
+    migrations_script = Path(__file__).parent / "scripts" / "verify_schema.py"
 
     if not migrations_script.exists():
         print("[startup] No migration script found, skipping migrations")
         return
 
-    print("[startup] Running database migrations...")
+    print("[startup] Verifying database schema...")
     result = subprocess.run(
         [sys.executable, str(migrations_script)],
         env=os.environ,
@@ -125,10 +125,10 @@ def run_migrations():
         print(result.stderr, file=sys.stderr)
 
     if result.returncode != 0:
-        print("[startup] ✗ Migrations failed! Exiting...")
+        print("[startup] ✗ Schema verification failed! Exiting...")
         sys.exit(1)
 
-    print("[startup] ✓ Migrations completed successfully\n")
+    print("[startup] ✓ Schema verification completed successfully\n")
 
 
 def main():
@@ -158,8 +158,8 @@ def main():
     # Initialize Garage if needed
     init_garage()
 
-    # Run database migrations
-    run_migrations()
+    # Schema changes are applied by the one-shot khub-migrate service.
+    verify_schema()
 
     # Get worker count from environment
     workers = int(os.getenv("KOHAKU_HUB_WORKERS", "4"))

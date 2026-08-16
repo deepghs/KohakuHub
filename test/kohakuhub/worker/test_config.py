@@ -1,0 +1,35 @@
+import pytest
+
+from kohakuhub.worker.config import (
+    CONTROL_LANE,
+    CONTROL_QUEUE,
+    WORK_LANE,
+    WorkerSettings,
+)
+
+
+def test_default_lanes_reserve_control_capacity():
+    assert CONTROL_LANE.queues == (CONTROL_QUEUE,)
+    assert CONTROL_LANE.concurrency == 1
+    assert WORK_LANE.concurrency == 3
+    assert "bulk-v1" in WORK_LANE.queues
+
+
+def test_worker_requires_postgres(monkeypatch):
+    monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "sqlite")
+    monkeypatch.setenv("KOHAKU_HUB_DATABASE_URL", "sqlite:///hub.db")
+
+    with pytest.raises(ValueError, match="requires.*postgres"):
+        WorkerSettings.from_env()
+
+
+def test_worker_rejects_invalid_pool_order(monkeypatch):
+    monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KOHAKU_HUB_DATABASE_URL", "postgresql://user:pass@localhost/db"
+    )
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_POOL_MIN", "9")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_POOL_MAX", "8")
+
+    with pytest.raises(ValueError, match="max size"):
+        WorkerSettings.from_env()

@@ -18,6 +18,7 @@ from kohakuhub.api import (
     stats,
     validation,
 )
+from kohakuhub.api import operation_routes
 from kohakuhub.api.repo.utils.hf import HFErrorCode, hf_repo_not_found
 from kohakuhub.api.invitation import router as invitation
 from kohakuhub.auth import router as auth_router
@@ -35,6 +36,7 @@ from kohakuhub.api.quota import router as quota
 from kohakuhub.auth.dependencies import get_optional_user
 from kohakuhub.auth.permissions import RepoReadDeniedError
 from kohakuhub.utils.s3 import init_storage
+from kohakuhub.operations.runtime import OperationRuntime
 from kohakuhub.api.git.routers import http as git_http
 from kohakuhub.api.git.routers import lfs, ssh_keys
 from kohakuhub.api.repo.routers import crud as repo_crud
@@ -76,9 +78,16 @@ async def lifespan(app: FastAPI):
     from kohakuhub.cache import init_cache, close_cache as _close_cache
     await init_cache()
 
+    operation_runtime = None
+    if cfg.app.db_backend == "postgres":
+        operation_runtime = await OperationRuntime.open(cfg.app.database_url)
+    app.state.operation_runtime = operation_runtime
+
     try:
         yield
     finally:
+        if operation_runtime is not None:
+            await operation_runtime.close()
         # Drop the LakeFS REST client's pooled httpx connections so the
         # worker exits cleanly. Without this the keepalive sockets leak
         # at shutdown and can hold the process from terminating.
@@ -199,6 +208,7 @@ app.include_router(org, prefix="/org", tags=["organizations"])
 app.include_router(git_http.router, tags=["git"])
 app.include_router(ssh_keys.router, tags=["ssh-keys"])
 app.include_router(validation.router, tags=["validation"])
+app.include_router(operation_routes.router, prefix=cfg.app.api_base, tags=["operations"])
 app.include_router(xet_token.router, prefix=cfg.app.api_base, tags=["xet"])
 app.include_router(xet_cas.router, tags=["xet-cas"])
 

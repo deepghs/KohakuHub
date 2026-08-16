@@ -522,28 +522,28 @@ class ConfirmationToken(BaseModel):
         indexes = ((("action_type", "expires_at"), False),)  # For cleanup queries
 
 
+KHUB_MODELS = (
+    User,
+    EmailVerification,
+    Session,
+    Token,
+    UserExternalToken,
+    Repository,
+    File,
+    StagingUpload,
+    UserOrganization,
+    Commit,
+    LFSObjectHistory,
+    SSHKey,
+    Invitation,
+    RepositoryLike,
+    DownloadSession,
+    DailyRepoStats,
+    FallbackSource,
+    ConfirmationToken,
+)
+
+
 def init_db():
     db.connect(reuse_if_open=True)
-    db.create_tables(
-        [
-            User,
-            EmailVerification,
-            Session,
-            Token,
-            UserExternalToken,
-            Repository,
-            File,
-            StagingUpload,
-            UserOrganization,
-            Commit,
-            LFSObjectHistory,
-            SSHKey,
-            Invitation,
-            RepositoryLike,
-            DownloadSession,
-            DailyRepoStats,
-            FallbackSource,
-            ConfirmationToken,
-        ],
-        safe=True,
-    )
+    db.create_tables(KHUB_MODELS, safe=True)

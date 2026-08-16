@@ -16,6 +16,7 @@ RUN uv pip install --system -e .
 COPY ./src/kohakuhub ./src/kohakuhub
 COPY ./scripts ./scripts
 COPY ./docker/startup.py /app/startup.py
+COPY ./docker/worker_startup.py /app/docker/worker_startup.py
 RUN chmod +x /app/startup.py
 
 EXPOSE 48888
