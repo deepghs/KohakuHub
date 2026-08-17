@@ -59,6 +59,25 @@ async def _hold_fence(
         await release.wait()
 
 
+async def _wait_for_any_entered(
+    *events: asyncio.Event,
+    timeout: float = FENCE_READY_TIMEOUT_SECONDS,
+) -> None:
+    """Wait for one contender without assuming connection startup order."""
+
+    waiters = {asyncio.create_task(event.wait()) for event in events}
+    done, pending = await asyncio.wait(
+        waiters,
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for waiter in pending:
+        waiter.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    if not done:
+        raise asyncio.TimeoutError
+
+
 @pytest.mark.asyncio
 async def test_same_ref_is_serialized_across_independent_services(runtimes):
     first, second = runtimes
@@ -86,20 +105,7 @@ async def test_same_ref_is_serialized_across_independent_services(runtimes):
         )
     )
     try:
-        entry_waiters = {
-            asyncio.create_task(first_entered.wait()),
-            asyncio.create_task(second_entered.wait()),
-        }
-        done, pending = await asyncio.wait(
-            entry_waiters,
-            timeout=FENCE_READY_TIMEOUT_SECONDS,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if not done:
-            raise asyncio.TimeoutError
+        await _wait_for_any_entered(first_entered, second_entered)
         await asyncio.sleep(0.15)
         assert first_entered.is_set() != second_entered.is_set()
         if first_entered.is_set():
@@ -192,16 +198,21 @@ async def test_repository_cutover_blocks_ordinary_mutation(runtimes):
         )
     )
     try:
-        await asyncio.wait_for(
-            cutover_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
-        )
+        await _wait_for_any_entered(cutover_entered, mutation_entered)
         await asyncio.sleep(0.15)
-        assert not mutation_entered.is_set()
-        cutover_release.set()
-        await asyncio.wait_for(
-            mutation_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
-        )
+        assert cutover_entered.is_set() != mutation_entered.is_set()
+        if cutover_entered.is_set():
+            cutover_release.set()
+            await asyncio.wait_for(
+                mutation_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+            )
+        else:
+            mutation_release.set()
+            await asyncio.wait_for(
+                cutover_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+            )
         mutation_release.set()
+        cutover_release.set()
         await asyncio.gather(cutover_task, mutation_task)
     finally:
         cutover_release.set()
