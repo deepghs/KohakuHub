@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -213,3 +214,180 @@ async def test_supervisor_stops_partially_constructed_workers(monkeypatch):
 
     assert closed
     assert PartiallyConstructedWorker.instances[0].stopped
+
+
+@pytest.mark.asyncio
+async def test_supervisor_readiness_checks_connection_budget_and_schema(monkeypatch):
+    checked = []
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        async def fetchone(self):
+            return self.row
+
+    class Connection:
+        async def execute(self, query, *_args):
+            query = str(query)
+            if "SELECT 1" in query:
+                return Result((1,))
+            if "max_connections" in query:
+                return Result((100,))
+            return Result((4,))
+
+    class Pool:
+        def connection(self):
+            class Context:
+                async def __aenter__(self):
+                    return Connection()
+
+                async def __aexit__(self, *_args):
+                    return False
+
+            return Context()
+
+    async def verify(_connection):
+        checked.append(True)
+
+    monkeypatch.setattr(supervisor_module, "verify_operation_schema", verify)
+    supervisor = WorkerSupervisor(
+        WorkerSettings(database_url="postgresql://user:pass@localhost/db"),
+    )
+    await supervisor._verify_readiness(SimpleNamespace(connector=SimpleNamespace(pool=Pool())))
+
+    assert checked == [True]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_rejects_connection_budget_over_headroom(monkeypatch):
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        async def fetchone(self):
+            return self.row
+
+    class Connection:
+        async def execute(self, query, *_args):
+            if "SELECT 1" in str(query):
+                return Result((1,))
+            if "max_connections" in str(query):
+                return Result((100,))
+            return Result((1,))
+
+    class Pool:
+        def connection(self):
+            class Context:
+                async def __aenter__(self):
+                    return Connection()
+
+                async def __aexit__(self, *_args):
+                    return False
+
+            return Context()
+
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_CONNECTION_BUDGET", "81")
+    supervisor = WorkerSupervisor(
+        WorkerSettings(database_url="postgresql://user:pass@localhost/db"),
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds 80% headroom"):
+        await supervisor._verify_readiness(SimpleNamespace(connector=SimpleNamespace(pool=Pool())))
+
+
+@pytest.mark.asyncio
+async def test_supervisor_exports_process_health_and_pool_pressure(monkeypatch):
+    stop = asyncio.Event()
+    calls = 0
+
+    async def wait_for(awaitable, timeout):
+        nonlocal calls
+        calls += 1
+        awaitable.close()
+        stop.set()
+        raise asyncio.TimeoutError
+
+    class Pool:
+        def get_stats(self):
+            return {"pool_size": 3, "requests_waiting": 2}
+
+    monkeypatch.setattr(supervisor_module.asyncio, "wait_for", wait_for)
+    monkeypatch.setattr(
+        supervisor_module.resource,
+        "getrusage",
+        lambda _kind: SimpleNamespace(ru_maxrss=1024),
+    )
+    supervisor = WorkerSupervisor(
+        WorkerSettings(database_url="postgresql://user:pass@localhost/db"),
+    )
+    supervisor._apps = [
+        SimpleNamespace(connector=SimpleNamespace(pool=Pool())),
+        SimpleNamespace(connector=SimpleNamespace(pool=Pool())),
+    ]
+
+    await supervisor._observe_process_health(stop)
+
+    assert calls == 1
+
+
+def test_supervisor_tolerates_platforms_without_signal_handlers(monkeypatch):
+    class Loop:
+        def add_signal_handler(self, *_args):
+            raise NotImplementedError
+
+        def remove_signal_handler(self, *_args):
+            raise RuntimeError("embedded loop")
+
+    monkeypatch.setattr(supervisor_module.asyncio, "get_running_loop", lambda: Loop())
+    supervisor = WorkerSupervisor(
+        WorkerSettings(database_url="postgresql://user:pass@localhost/db"),
+    )
+
+    supervisor._install_signal_handlers()
+    supervisor._remove_signal_handlers()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reports_unexpected_ready_lane_exit(monkeypatch):
+    class Runner:
+        pass
+
+    class ReadyWorker:
+        def __init__(self, *_args, **_kwargs):
+            self.worker_id = "ready"
+            self.stopped = False
+
+        async def run(self):
+            return None
+
+        def stop(self):
+            self.stopped = True
+
+    class App(FakeApp):
+        pass
+
+    runner = Runner()
+    monkeypatch.setattr(supervisor_module, "serve_worker_http", lambda *_args: _async_value(runner))
+    closed = []
+
+    async def close(value):
+        closed.append(value)
+
+    monkeypatch.setattr(supervisor_module, "close_worker_http", close)
+    supervisor = WorkerSupervisor(
+        WorkerSettings(database_url="postgresql://user:pass@localhost/db"),
+        app_factory=lambda _settings: (App(), App()),
+        worker_factory=ReadyWorker,
+    )
+    supervisor._install_signal_handlers = lambda: None
+    supervisor._remove_signal_handlers = lambda: None
+
+    with pytest.raises(RuntimeError, match="exited unexpectedly"):
+        await supervisor.run()
+
+    assert closed == [runner]
+
+
+async def _async_value(value):
+    return value

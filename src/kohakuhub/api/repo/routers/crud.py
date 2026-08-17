@@ -694,8 +694,6 @@ async def delete_repo(
     if not repo_row:
         return hf_repo_not_found(full_id, repo_type)
 
-    lakefs_repo = resolve_lakefs_repo(repo_row)
-
     # 2. Check if user has permission to delete this repository (admin bypasses)
     check_repo_delete_permission(repo_row, user, is_admin=is_admin)
 
@@ -709,6 +707,10 @@ async def delete_repo(
             getattr(repo_row, "id", None),
             lambda: delete_repo(payload, auth=auth, request=request),
         )
+
+    # Resolve the active backing only after the repository-wide fence is held.
+    # A rename/generation transition can otherwise make a pre-fence lookup stale.
+    lakefs_repo = resolve_lakefs_repo(repo_row)
 
     # 3. Delete LakeFS repository metadata first to avoid leaving orphan repos behind.
     client = get_lakefs_client()

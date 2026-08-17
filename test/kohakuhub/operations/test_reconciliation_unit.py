@@ -374,3 +374,323 @@ async def test_revert_observer_persists_cursor_and_immutable_head(monkeypatch):
 
     assert await reconciliation._observe_revert_operation_unfenced(pool, "op", 1)
     assert calls == [("snapshot-head", None), ("snapshot-head", "page-2")]
+
+
+def test_observation_cursor_round_trip_and_malformed_values_are_fail_closed():
+    encoded = reconciliation._encode_observation_cursor(
+        "page-2", {"commit-b", "commit-a"}
+    )
+
+    assert reconciliation._decode_observation_cursor(encoded) == (
+        "page-2",
+        {"commit-a", "commit-b"},
+    )
+    assert reconciliation._decode_observation_cursor("not-a-cursor") == (
+        "not-a-cursor",
+        set(),
+    )
+    assert reconciliation._decode_observation_cursor(
+        reconciliation.OBSERVATION_CURSOR_PREFIX + "{}"
+    ) == (None, set())
+    assert reconciliation._decode_observation_cursor(
+        reconciliation.OBSERVATION_CURSOR_PREFIX + "not-json"
+    ) == (None, set())
+
+
+@pytest.mark.asyncio
+async def test_stalled_delivery_recovery_is_bounded_and_tolerates_races():
+    retried = []
+
+    class Manager:
+        async def get_stalled_jobs(self, **kwargs):
+            assert kwargs["seconds_since_heartbeat"] == 10
+            return [SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=3)]
+
+        async def retry_job_by_id_async(self, job_id, **_kwargs):
+            if job_id == 2:
+                raise RuntimeError("another reconciler won")
+            retried.append(job_id)
+
+    app = SimpleNamespace(job_manager=Manager())
+
+    assert await reconciliation._recover_stalled_deliveries(
+        app, seconds_since_heartbeat=10, limit=2
+    ) == {1}
+    assert retried == [1]
+
+
+@pytest.mark.asyncio
+async def test_stalled_delivery_recovery_is_noop_without_procrastinate_manager():
+    assert await reconciliation._recover_stalled_deliveries(
+        SimpleNamespace(), seconds_since_heartbeat=10, limit=10
+    ) == set()
+
+
+@pytest.mark.asyncio
+async def test_runtime_metrics_reset_known_gauges_and_publish_rows(monkeypatch):
+    class Result:
+        def __init__(self, *, many=(), one=None):
+            self.many = list(many)
+            self.one = one
+
+        async def fetchall(self):
+            return self.many
+
+        async def fetchone(self):
+            return self.one
+
+    class Connection:
+        async def execute(self, query, _params=None):
+            query = " ".join(str(query).split())
+            if query.startswith("SELECT queue_name, status, count"):
+                return Result(many=[("control-v1", "todo", 2)])
+            if query.startswith("SELECT j.queue_name"):
+                return Result(many=[("control-v1", 3.5)])
+            if query.startswith("SELECT state, count"):
+                return Result(many=[("running", 4)])
+            if "state IN ('uncertain', 'dispatch_started')" in query:
+                return Result(one=(1,))
+            return Result(one=(2,))
+
+    await reconciliation._observe_runtime_metrics(Connection(), retention_hours=168)
+
+
+@pytest.mark.asyncio
+async def test_observation_head_freezes_one_remote_head_after_quiet_period(monkeypatch):
+    calls = []
+
+    class Client:
+        async def get_branch(self, **kwargs):
+            calls.append(kwargs)
+            return {"commit_id": "snapshot-head"}
+
+    monkeypatch.setattr(reconciliation, "get_lakefs_client", lambda: Client())
+    intent = SimpleNamespace(
+        payload_json={"lakefs_repo": "repo"},
+        observation_head=None,
+        observe_not_before=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ref="main",
+        version=None,
+    )
+
+    assert await reconciliation._ensure_observation_head(None, intent) is intent
+    assert calls == [{"repository": "repo", "branch": "main"}]
+
+
+@pytest.mark.asyncio
+async def test_observe_commit_accepts_marker_found_in_commit_detail(monkeypatch):
+    calls = []
+
+    class Client:
+        async def log_commits(self, **kwargs):
+            calls.append(("log", kwargs))
+            return {
+                "results": [{"id": "marker-commit", "metadata": {}}],
+                "pagination": {"has_more": True, "next_offset": "next"},
+            }
+
+        async def get_commit(self, **kwargs):
+            calls.append(("detail", kwargs))
+            return {"id": kwargs["commit_id"], "metadata": {"khub_marker": "marker"}}
+
+    monkeypatch.setattr(reconciliation, "get_lakefs_client", lambda: Client())
+    intent = SimpleNamespace(
+        payload_json={"lakefs_repo": "repo"},
+        lakefs_commit_id=None,
+        observe_not_before=datetime.now(timezone.utc) - timedelta(seconds=1),
+        observation_cursor=None,
+        observation_head="snapshot-head",
+        ref="main",
+        base_head="base-head",
+        marker="marker",
+    )
+
+    commit_id, commit, cursor = await reconciliation._observe_commit(intent)
+
+    assert commit_id is None
+    assert commit is None
+    assert cursor.startswith(reconciliation.OBSERVATION_CURSOR_PREFIX)
+    assert "marker-commit" in cursor
+    assert calls[0][0] == "log"
+    assert calls[1][0] == "detail"
+
+
+@pytest.mark.asyncio
+async def test_observe_commit_resolves_marker_when_base_is_reached(monkeypatch):
+    class Client:
+        async def log_commits(self, **_kwargs):
+            return {
+                "results": [
+                    {"id": "marker-commit", "metadata": {"khub_marker": "marker"}},
+                    {"id": "base-head", "metadata": {}},
+                ],
+                "pagination": {"has_more": False},
+            }
+
+        async def get_commit(self, **kwargs):
+            return {"id": kwargs["commit_id"], "metadata": {}}
+
+    monkeypatch.setattr(reconciliation, "get_lakefs_client", lambda: Client())
+    intent = SimpleNamespace(
+        payload_json={"lakefs_repo": "repo"},
+        lakefs_commit_id=None,
+        observe_not_before=datetime.now(timezone.utc) - timedelta(seconds=1),
+        observation_cursor=None,
+        observation_head="snapshot-head",
+        ref="main",
+        base_head="base-head",
+        marker="marker",
+    )
+
+    commit_id, commit, cursor = await reconciliation._observe_commit(intent)
+
+    assert commit_id == "marker-commit"
+    assert commit["id"] == "marker-commit"
+    assert cursor is None
+
+
+@pytest.mark.asyncio
+async def test_observe_commit_uses_confirmed_commit_id_without_scanning_history(monkeypatch):
+    class Client:
+        async def get_commit(self, **kwargs):
+            return {"id": kwargs["commit_id"], "metadata": {"khub_marker": "marker"}}
+
+        async def log_commits(self, **_kwargs):
+            raise AssertionError("confirmed commit must not scan history")
+
+    monkeypatch.setattr(reconciliation, "get_lakefs_client", lambda: Client())
+    intent = SimpleNamespace(
+        payload_json={"lakefs_repo": "repo"},
+        lakefs_commit_id="confirmed",
+        observe_not_before=None,
+        marker="marker",
+        ref="main",
+        base_head="base",
+    )
+
+    assert await reconciliation._observe_commit(intent) == (
+        "confirmed",
+        {"id": "confirmed", "metadata": {"khub_marker": "marker"}},
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_prepared_cleanup_resets_only_unchanged_branch(monkeypatch):
+    reset_calls = []
+    abandon_calls = []
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Connection:
+        def transaction(self):
+            return Transaction()
+
+    current = SimpleNamespace(
+        id="intent",
+        state="prepared",
+        ref="main",
+        base_head="base",
+        prepared_deadline_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        version=3,
+    )
+
+    class Store:
+        async def get_commit_intent(self, *_args, **_kwargs):
+            return current
+
+    class Service:
+        store = Store()
+
+        @staticmethod
+        def repository_ref_fence(*_args, **_kwargs):
+            class Fence:
+                async def __aenter__(self):
+                    return Connection()
+
+                async def __aexit__(self, *_args):
+                    return False
+
+            return Fence()
+
+        async def abandon_prepared_commit_intent_on_connection(self, *_args, **kwargs):
+            abandon_calls.append(kwargs)
+            return True
+
+    class Client:
+        async def get_branch(self, **_kwargs):
+            return {"commit_id": "base"}
+
+    monkeypatch.setattr(reconciliation, "get_lakefs_client", lambda: Client())
+    async def hard_reset(*args, **kwargs):
+        reset_calls.append((args, kwargs))
+
+    monkeypatch.setattr(reconciliation.mutation_gateway, "hard_reset_branch", hard_reset)
+    intent = SimpleNamespace(
+        id="intent",
+        repository_id=1,
+        ref="main",
+        payload_json={"lakefs_repo": "repo"},
+    )
+
+    assert await reconciliation._reset_stale_prepared_intent(Service(), intent)
+    assert reset_calls[0][1]["ref"] == "base"
+    assert abandon_calls == [
+        {"expected_version": 3, "error_code": "stale_prepared_cleanup"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_returns_when_another_reconciler_holds_lock(monkeypatch):
+    class Result:
+        async def fetchone(self):
+            return (False,)
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Connection:
+        def transaction(self):
+            return Transaction()
+
+        async def execute(self, *_args, **_kwargs):
+            return Result()
+
+    class Pool:
+        def connection(self):
+            class Context:
+                async def __aenter__(self):
+                    return Connection()
+
+                async def __aexit__(self, *_args):
+                    return False
+
+            return Context()
+
+    class Service:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class Store:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(reconciliation, "OperationService", Service)
+    monkeypatch.setattr(reconciliation, "OperationStore", Store)
+    async def recover(*_args, **_kwargs):
+        return set()
+
+    monkeypatch.setattr(reconciliation, "_recover_stalled_deliveries", recover)
+
+    assert await reconciliation.reconcile_once(
+        Pool(), SimpleNamespace(khub_stalled_worker_timeout_seconds=10)
+    ) == 0

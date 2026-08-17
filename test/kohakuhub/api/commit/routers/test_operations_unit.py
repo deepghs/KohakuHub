@@ -194,6 +194,27 @@ def test_calculate_git_blob_sha1_matches_git_blob_format():
     assert digest == "95d09f2b10159347eece71399a7e2e907ea3df4f"
 
 
+def test_debug_commit_payload_logging_is_metadata_only(monkeypatch):
+    messages = []
+    monkeypatch.setattr(commit_ops.cfg.app, "debug_log_payloads", True)
+    monkeypatch.setattr(
+        commit_ops.logger,
+        "debug",
+        lambda *args, **kwargs: messages.append((args, kwargs)),
+    )
+
+    raw = b'{"key":"file","value":{"path":"private.txt","content":"secret"}}\n'
+    lines = raw.decode("utf-8").splitlines()
+    commit_ops._log_commit_payload_debug(lines, raw)
+
+    rendered = repr(messages)
+    assert "private.txt" not in rendered
+    assert "secret" not in rendered
+    assert messages == [
+        (("Commit payload received: {} lines, {} bytes", 1, len(raw)), {})
+    ]
+
+
 @pytest.mark.asyncio
 async def test_process_regular_file_covers_validation_skip_restore_and_success(monkeypatch):
     repo = SimpleNamespace(owner=SimpleNamespace(username="owner"))

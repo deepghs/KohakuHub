@@ -42,6 +42,17 @@ logger = get_logger("FILE")
 router = APIRouter()
 
 
+def _log_commit_payload_debug(lines: list[str], raw: bytes) -> None:
+    """Log commit diagnostics without emitting private NDJSON content."""
+
+    if cfg.app.debug_log_payloads:
+        logger.debug(
+            "Commit payload received: {} lines, {} bytes",
+            len(lines),
+            len(raw),
+        )
+
+
 def _lakefs_status_code(exc: BaseException) -> int | None:
     response = getattr(exc, "response", None)
     return getattr(response, "status_code", None)
@@ -1041,10 +1052,7 @@ async def _commit_unlocked(
     raw = await request.body()
     lines = raw.decode("utf-8").splitlines()
 
-    if cfg.app.debug_log_payloads:
-        logger.debug("==== Commit Payload ====")
-        for line in lines:
-            logger.debug(line)
+    _log_commit_payload_debug(lines, raw)
 
     # Parse header and operations
     header = None

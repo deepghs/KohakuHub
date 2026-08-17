@@ -138,6 +138,8 @@ services:
     depends_on:
       khub-migrate:
         condition: service_completed_successfully
+      hub-api:
+        condition: service_healthy
       lakefs:
         condition: service_healthy
       minio:

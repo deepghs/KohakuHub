@@ -315,6 +315,80 @@ async def test_delete_repo_direct_call_remains_compatible_with_postgres(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_delete_repo_resolves_backing_inside_repository_fence(monkeypatch):
+    events = []
+    repo = SimpleNamespace(
+        id=17,
+        repo_type="model",
+        full_id="owner/repo",
+        owner=SimpleNamespace(username="owner"),
+        private=False,
+        lakefs_repo="lakefs-generation-2",
+        delete_instance=lambda: None,
+    )
+    client = _FakeClient()
+
+    monkeypatch.setattr(repo_crud, "get_repository", lambda *_args: repo)
+    monkeypatch.setattr(repo_crud, "check_repo_delete_permission", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repo_crud, "_reject_non_durable_repository_delete", lambda _request: None)
+    monkeypatch.setattr(repo_crud, "get_lakefs_client", lambda: client)
+    monkeypatch.setattr(repo_crud, "cleanup_repository_storage", lambda **_kwargs: _async_return({
+        "repo_objects_deleted": 0,
+        "lfs_objects_deleted": 0,
+        "lfs_history_deleted": 0,
+    }))
+    monkeypatch.setattr(repo_crud, "get_fallback_cache", lambda: SimpleNamespace(invalidate_repo=lambda *_args: None))
+    monkeypatch.setattr(
+        repo_crud,
+        "db",
+        SimpleNamespace(atomic=lambda: _AtomicContext({})),
+    )
+
+    def resolve(value):
+        events.append("resolve")
+        return value.lakefs_repo
+
+    monkeypatch.setattr(repo_crud, "resolve_lakefs_repo", resolve)
+
+    class Fence:
+        async def __aenter__(self):
+            events.append("enter-fence")
+
+        async def __aexit__(self, *_args):
+            events.append("exit-fence")
+
+    class Service:
+        def repository_ref_fence(self, *_args, **_kwargs):
+            return Fence()
+
+    from starlette.requests import Request
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "DELETE",
+            "path": "/api/repos/delete",
+            "headers": [],
+            "app": SimpleNamespace(
+                state=SimpleNamespace(
+                    operation_runtime=SimpleNamespace(service=Service()),
+                )
+            ),
+        }
+    )
+    monkeypatch.setattr(repo_crud.cfg.app, "db_backend", "postgres")
+
+    result = await repo_crud.delete_repo(
+        repo_crud.DeleteRepoPayload(type="model", name="repo"),
+        auth=(repo.owner, False),
+        request=request,
+    )
+
+    assert result["message"].startswith("Repository '")
+    assert events.index("enter-fence") < events.index("resolve")
+
+
+@pytest.mark.asyncio
 async def test_migrate_lakefs_repository_covers_noop_missing_source_success_and_cleanup(monkeypatch):
     client = _FakeClient()
     from_repo = SimpleNamespace(full_id="owner/from")
