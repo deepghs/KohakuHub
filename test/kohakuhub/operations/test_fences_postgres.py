@@ -86,16 +86,34 @@ async def test_same_ref_is_serialized_across_independent_services(runtimes):
         )
     )
     try:
-        await asyncio.wait_for(
-            first_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+        entry_waiters = {
+            asyncio.create_task(first_entered.wait()),
+            asyncio.create_task(second_entered.wait()),
+        }
+        done, pending = await asyncio.wait(
+            entry_waiters,
+            timeout=FENCE_READY_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
         )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if not done:
+            raise asyncio.TimeoutError
         await asyncio.sleep(0.15)
-        assert not second_entered.is_set()
-        first_release.set()
-        await asyncio.wait_for(
-            second_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
-        )
+        assert first_entered.is_set() != second_entered.is_set()
+        if first_entered.is_set():
+            first_release.set()
+            await asyncio.wait_for(
+                second_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+            )
+        else:
+            second_release.set()
+            await asyncio.wait_for(
+                first_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+            )
         second_release.set()
+        first_release.set()
         await asyncio.gather(first_task, second_task)
     finally:
         first_release.set()
