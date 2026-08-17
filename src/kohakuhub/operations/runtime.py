@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any
 
 from psycopg_pool import AsyncConnectionPool
@@ -56,6 +57,12 @@ class OperationRuntime:
                 worker_app,
                 registry,
                 database_url=database_url,
+                fence_connection_limit=int(
+                    os.getenv(
+                        "KOHAKU_HUB_API_FENCE_MAX_CONNECTIONS",
+                        os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4"),
+                    )
+                ),
             ),
         )
 

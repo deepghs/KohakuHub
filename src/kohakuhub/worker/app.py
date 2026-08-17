@@ -41,6 +41,7 @@ def build_worker_app(
     # connection for registered repository mutation handlers. It is never
     # persisted in an operation payload.
     app.khub_database_url = settings.database_url
+    app.khub_fence_connection_limit = settings.worker_fence_max_connections
     app.khub_stalled_worker_timeout_seconds = settings.stalled_worker_timeout_seconds
 
     @app.task(

@@ -47,21 +47,26 @@ class WorkerSupervisor:
         self._stop_requested = False
 
     async def run(self) -> None:
+        self._stop_requested = False
         ready = asyncio.Event()
         http_runner = await serve_worker_http(
             self.settings.metrics_host, self.settings.metrics_port, ready
         )
-        built = self.app_factory(self.settings)
-        if isinstance(built, (tuple, list)):
-            apps = tuple(built)
-        else:
-            # Backward-compatible test and embedding hook. Production uses
-            # build_worker_apps and therefore gets one App per lane.
-            apps = tuple(built for _ in self.lanes)
-        if len(apps) != len(self.lanes):
-            raise RuntimeError("worker app count must match lane count")
-        self._apps = apps
+        tasks: list[asyncio.Task[Any]] = []
+        health_stop: asyncio.Event | None = None
+        health_task: asyncio.Task[Any] | None = None
+        signal_handlers_installed = False
         try:
+            built = self.app_factory(self.settings)
+            if isinstance(built, (tuple, list)):
+                apps = tuple(built)
+            else:
+                # Backward-compatible test and embedding hook. Production uses
+                # build_worker_apps and therefore gets one App per lane.
+                apps = tuple(built for _ in self.lanes)
+            if len(apps) != len(self.lanes):
+                raise RuntimeError("worker app count must match lane count")
+            self._apps = apps
             async with AsyncExitStack() as stack:
                 opened: set[int] = set()
                 for app in apps:
@@ -90,6 +95,7 @@ class WorkerSupervisor:
                     for app, lane in zip(apps, self.lanes)
                 ]
                 self._install_signal_handlers()
+                signal_handlers_installed = True
                 tasks = [asyncio.create_task(worker.run()) for worker in self._workers]
                 health_stop = asyncio.Event()
                 health_task = asyncio.create_task(
@@ -101,26 +107,27 @@ class WorkerSupervisor:
                 # not, so they are considered started after one event-loop turn.
                 await self._wait_for_workers_started(tasks)
                 ready.set()
-                try:
-                    done, _ = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    failures = [task.exception() for task in done if not task.cancelled()]
-                    if failures and failures[0] is not None:
-                        raise failures[0]
-                    if not self._stop_requested:
-                        raise RuntimeError("khub-worker lane exited unexpectedly")
-                finally:
-                    ready.clear()
-                    self.stop()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    health_stop.set()
-                    await asyncio.gather(health_task, return_exceptions=True)
-                    self._remove_signal_handlers()
-                    self._workers.clear()
+                done, _ = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                failures = [task.exception() for task in done if not task.cancelled()]
+                if failures and failures[0] is not None:
+                    raise failures[0]
+                if not self._stop_requested:
+                    raise RuntimeError("khub-worker lane exited unexpectedly")
         finally:
-            self._apps = ()
             ready.clear()
+            self.stop()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if health_stop is not None:
+                health_stop.set()
+            if health_task is not None:
+                await asyncio.gather(health_task, return_exceptions=True)
+            if signal_handlers_installed:
+                self._remove_signal_handlers()
+            self._workers.clear()
+            self._apps = ()
             await close_worker_http(http_runner)
 
     async def _wait_for_workers_started(self, tasks: list[asyncio.Task[Any]]) -> None:

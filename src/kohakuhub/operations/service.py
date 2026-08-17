@@ -98,10 +98,14 @@ _FORBIDDEN_PAYLOAD_KEYS = {
 _FENCE_LIMITERS: dict[str, tuple[int, asyncio.Semaphore]] = {}
 
 
-def _fence_connection_limiter(database_url: str) -> asyncio.Semaphore:
+def _fence_connection_limiter(
+    database_url: str, configured_limit: int | None = None
+) -> asyncio.Semaphore:
     """Bound dedicated advisory-lock connections per API/worker process."""
 
-    limit = int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4"))
+    limit = configured_limit
+    if limit is None:
+        limit = int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4"))
     if limit < 1:
         raise ValueError("KOHAKU_HUB_FENCE_MAX_CONNECTIONS must be positive")
     current = _FENCE_LIMITERS.get(database_url)
@@ -173,12 +177,14 @@ class OperationService:
         registry: OperationRegistry = DEFAULT_REGISTRY,
         *,
         database_url: str | None = None,
+        fence_connection_limit: int | None = None,
     ):
         self.pool = pool
         self.app = app
         self.registry = registry
         self.store = OperationStore(pool)
         self.database_url = database_url
+        self.fence_connection_limit = fence_connection_limit
 
     def _accept_request(
         self,
@@ -467,7 +473,9 @@ class OperationService:
 
         lock_ref = canonical_mutation_ref(ref)
         cutover = scope == "cutover" or lock_ref == "__repository__"
-        limiter = _fence_connection_limiter(self.database_url)
+        limiter = _fence_connection_limiter(
+            self.database_url, self.fence_connection_limit
+        )
         await limiter.acquire()
         try:
             async with await psycopg.AsyncConnection.connect(
@@ -585,7 +593,9 @@ class OperationService:
         if not self.database_url:
             raise RuntimeError("a dedicated PostgreSQL fence connection is required")
 
-        limiter = _fence_connection_limiter(self.database_url)
+        limiter = _fence_connection_limiter(
+            self.database_url, self.fence_connection_limit
+        )
         await limiter.acquire()
         try:
             async with await psycopg.AsyncConnection.connect(

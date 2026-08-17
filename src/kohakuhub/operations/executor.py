@@ -168,6 +168,9 @@ async def execute_operation_step(
                         app,
                         registry,
                         database_url=database_url,
+                        fence_connection_limit=getattr(
+                            app, "khub_fence_connection_limit", None
+                        ),
                     )
                     fence_ref = str(
                         step.input_json.get("branch")
