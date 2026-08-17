@@ -167,3 +167,49 @@ async def test_supervisor_cleans_pre_readiness_worker_failure(monkeypatch):
 
     assert closed
     assert installed == removed == 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stops_partially_constructed_workers(monkeypatch):
+    class Runner:
+        pass
+
+    runner = Runner()
+    closed = False
+
+    async def serve(*_args):
+        return runner
+
+    async def close(value):
+        nonlocal closed
+        assert value is runner
+        closed = True
+
+    class PartiallyConstructedWorker:
+        instances = []
+
+        def __init__(self, _app, **_kwargs):
+            if self.instances:
+                raise RuntimeError("second worker failed")
+            self.stopped = False
+            self.instances.append(self)
+
+        async def run(self):
+            await asyncio.Event().wait()
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr(supervisor_module, "serve_worker_http", serve)
+    monkeypatch.setattr(supervisor_module, "close_worker_http", close)
+    supervisor = WorkerSupervisor(
+        WorkerSettings(database_url="postgresql://user:pass@localhost/db"),
+        app_factory=lambda _settings: FakeApp(),
+        worker_factory=PartiallyConstructedWorker,
+    )
+
+    with pytest.raises(RuntimeError, match="second worker failed"):
+        await supervisor.run()
+
+    assert closed
+    assert PartiallyConstructedWorker.instances[0].stopped

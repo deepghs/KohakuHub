@@ -76,26 +76,27 @@ class WorkerSupervisor:
                     opened.add(id(app))
                 for app in apps:
                     await self._verify_readiness(app)
-                self._workers = [
-                    self.worker_factory(
-                        app,
-                        # Procrastinate binds queue filters as a PostgreSQL array;
-                        # psycopg3 accepts a list here, while our policy stays immutable.
-                        queues=list(lane.queues),
-                        name=f"khub-{lane.name}",
-                        concurrency=lane.concurrency,
-                        wait=True,
-                        fetch_job_polling_interval=self.settings.polling_interval_seconds,
-                        abort_job_polling_interval=self.settings.polling_interval_seconds,
-                        shutdown_graceful_timeout=self.settings.graceful_shutdown_seconds,
-                        install_signal_handlers=False,
-                        update_heartbeat_interval=self.settings.heartbeat_interval_seconds,
-                        stalled_worker_timeout=self.settings.stalled_worker_timeout_seconds,
+                self._workers = []
+                for app, lane in zip(apps, self.lanes):
+                    self._workers.append(
+                        self.worker_factory(
+                            app,
+                            # Procrastinate binds queue filters as a PostgreSQL array;
+                            # psycopg3 accepts a list here, while our policy stays immutable.
+                            queues=list(lane.queues),
+                            name=f"khub-{lane.name}",
+                            concurrency=lane.concurrency,
+                            wait=True,
+                            fetch_job_polling_interval=self.settings.polling_interval_seconds,
+                            abort_job_polling_interval=self.settings.polling_interval_seconds,
+                            shutdown_graceful_timeout=self.settings.graceful_shutdown_seconds,
+                            install_signal_handlers=False,
+                            update_heartbeat_interval=self.settings.heartbeat_interval_seconds,
+                            stalled_worker_timeout=self.settings.stalled_worker_timeout_seconds,
+                        )
                     )
-                    for app, lane in zip(apps, self.lanes)
-                ]
-                self._install_signal_handlers()
                 signal_handlers_installed = True
+                self._install_signal_handlers()
                 tasks = [asyncio.create_task(worker.run()) for worker in self._workers]
                 health_stop = asyncio.Event()
                 health_task = asyncio.create_task(
