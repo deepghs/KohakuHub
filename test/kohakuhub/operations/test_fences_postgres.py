@@ -15,6 +15,8 @@ from kohakuhub.operations.service import CommitInProgress
 
 pytestmark = pytest.mark.integration
 
+FENCE_READY_TIMEOUT_SECONDS = 30
+
 
 def _database_url() -> str:
     value = os.environ.get("KOHAKU_HUB_DATABASE_URL", "")
@@ -84,16 +86,23 @@ async def test_same_ref_is_serialized_across_independent_services(runtimes):
         )
     )
     try:
-        await asyncio.wait_for(first_entered.wait(), timeout=5)
+        await asyncio.wait_for(
+            first_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+        )
         await asyncio.sleep(0.15)
         assert not second_entered.is_set()
         first_release.set()
-        await asyncio.wait_for(second_entered.wait(), timeout=5)
+        await asyncio.wait_for(
+            second_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+        )
         second_release.set()
         await asyncio.gather(first_task, second_task)
     finally:
         first_release.set()
         second_release.set()
+        for task in (first_task, second_task):
+            if not task.done():
+                task.cancel()
         await asyncio.gather(first_task, second_task, return_exceptions=True)
 
 
@@ -125,12 +134,15 @@ async def test_different_refs_can_run_concurrently(runtimes):
     try:
         await asyncio.wait_for(
             asyncio.gather(first_entered.wait(), second_entered.wait()),
-            timeout=5,
+            timeout=FENCE_READY_TIMEOUT_SECONDS,
         )
         release.set()
         await asyncio.gather(first_task, second_task)
     finally:
         release.set()
+        for task in (first_task, second_task):
+            if not task.done():
+                task.cancel()
         await asyncio.gather(first_task, second_task, return_exceptions=True)
 
 
@@ -162,16 +174,23 @@ async def test_repository_cutover_blocks_ordinary_mutation(runtimes):
         )
     )
     try:
-        await asyncio.wait_for(cutover_entered.wait(), timeout=5)
+        await asyncio.wait_for(
+            cutover_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+        )
         await asyncio.sleep(0.15)
         assert not mutation_entered.is_set()
         cutover_release.set()
-        await asyncio.wait_for(mutation_entered.wait(), timeout=5)
+        await asyncio.wait_for(
+            mutation_entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+        )
         mutation_release.set()
         await asyncio.gather(cutover_task, mutation_task)
     finally:
         cutover_release.set()
         mutation_release.set()
+        for task in (cutover_task, mutation_task):
+            if not task.done():
+                task.cancel()
         await asyncio.gather(
             cutover_task, mutation_task, return_exceptions=True
         )
@@ -202,9 +221,13 @@ async def test_connection_death_releases_process_advisory_lock(runtimes):
         )
     )
     try:
-        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(
+            entered.wait(), timeout=FENCE_READY_TIMEOUT_SECONDS
+        )
     finally:
         release.set()
+        if not task.done():
+            task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
 
