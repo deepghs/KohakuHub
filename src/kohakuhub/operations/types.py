@@ -8,6 +8,21 @@ from typing import Any, Literal
 from uuid import UUID
 
 
+class RetryableOperationError(Exception):
+    """A handler failure that is safe to retry from its durable checkpoint."""
+
+    def __init__(
+        self,
+        message: str = "operation dependency is temporarily unavailable",
+        *,
+        error_code: str = "retryable_failure",
+        error_summary: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.error_summary = error_summary or message
+
+
 OperationState = Literal[
     "accepted",
     "running",
@@ -28,6 +43,15 @@ StepState = Literal[
     "failed",
     "cancelled",
     "uncertain",
+]
+CommitIntentState = Literal[
+    "prepared",
+    "dispatch_started",
+    "committed",
+    "finalized",
+    "reconciliation_required",
+    "uncertain",
+    "abandoned",
 ]
 
 
@@ -55,6 +79,7 @@ class OperationRecord:
     dispatch_started_at: datetime | None
     remote_deadline_at: datetime | None
     observe_not_before: datetime | None
+    observation_cursor: str | None
     result_json: dict[str, Any] | None
     error_code: str | None
     error_summary: str | None
@@ -126,9 +151,14 @@ class StepResult:
     result_json: dict[str, Any] | None = None
     error_code: str | None = None
     error_summary: str | None = None
+    retryable: bool = False
+    # True only when the registered handler has completed every external
+    # effect in this quantum and has an idempotent recovery contract.
+    external_effect_confirmed: bool = False
     next_step_input: dict[str, Any] | None = None
     next_step_name: str | None = None
     next_step_version: str | None = None
+
 
     @classmethod
     def succeeded(
@@ -163,3 +193,58 @@ class StepResult:
             progress_message=progress_message,
             next_step_input=input_json,
         )
+
+    @classmethod
+    def retry_with(
+        cls,
+        *,
+        input_json: dict[str, Any],
+        progress_current: int | None = None,
+        progress_total: int | None = None,
+        progress_message: str | None = None,
+        error_code: str = "retryable_failure",
+        error_summary: str = "operation will retry from the last checkpoint",
+    ) -> "StepResult":
+        """Retry the same bounded quantum through a durable successor step."""
+
+        return cls(
+            state="succeeded",
+            progress_current=progress_current,
+            progress_total=progress_total,
+            progress_message=progress_message,
+            error_code=error_code,
+            error_summary=error_summary,
+            next_step_input=input_json,
+            retryable=True,
+        )
+
+
+@dataclass(frozen=True)
+class CommitIntentRecord:
+    id: UUID
+    operation_id: UUID | None
+    observation_operation_id: UUID | None
+    repository_id: int
+    requested_by_user_id: int | None
+    ref: str
+    base_head: str
+    marker: str
+    idempotency_key: str | None
+    request_hash: str | None
+    prepared_deadline_at: datetime | None
+    dispatch_started_at: datetime | None
+    remote_deadline_at: datetime | None
+    observe_not_before: datetime | None
+    observation_head: str | None
+    observation_cursor: str | None
+    payload_hash: str
+    payload_json: dict[str, Any]
+    state: CommitIntentState
+    lakefs_commit_id: str | None
+    result_json: dict[str, Any] | None
+    error_code: str | None
+    error_summary: str | None
+    created_at: datetime
+    updated_at: datetime
+    finalized_at: datetime | None
+    version: int

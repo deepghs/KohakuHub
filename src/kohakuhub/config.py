@@ -30,6 +30,10 @@ class LakeFSConfig(BaseModel):
     access_key: str = "test-access-key"
     secret_key: str = "test-secret-key"
     repo_namespace: str = "hf"
+    connect_timeout_seconds: float = 5.0
+    read_timeout_seconds: float = 30.0
+    write_timeout_seconds: float = 120.0
+    pool_timeout_seconds: float = 5.0
 
 
 class SMTPConfig(BaseModel):
@@ -126,6 +130,11 @@ class AppConfig(BaseModel):
     # 5MB file -> ~6.7MB base64, leaving room for multiple files in one commit
     lfs_threshold_bytes: int = 5 * 1000 * 1000
     debug_log_payloads: bool = False
+    # Dangerous repository operations remain explicitly disabled until their
+    # worker-backed recovery/canary gates are complete.
+    enable_revert_operations: bool = False
+    enable_reset_operations: bool = False
+    enable_squash_operations: bool = False
     # LFS Multipart Upload settings
     lfs_multipart_threshold_bytes: int = (
         100 * 1000 * 1000
@@ -329,6 +338,22 @@ def load_config(path: str = None) -> Config:
         lakefs_env["secret_key"] = os.environ["KOHAKU_HUB_LAKEFS_SECRET_KEY"]
     if "KOHAKU_HUB_LAKEFS_REPO_NAMESPACE" in os.environ:
         lakefs_env["repo_namespace"] = os.environ["KOHAKU_HUB_LAKEFS_REPO_NAMESPACE"]
+    if "KOHAKU_HUB_LAKEFS_CONNECT_TIMEOUT_SECONDS" in os.environ:
+        lakefs_env["connect_timeout_seconds"] = float(
+            os.environ["KOHAKU_HUB_LAKEFS_CONNECT_TIMEOUT_SECONDS"]
+        )
+    if "KOHAKU_HUB_LAKEFS_READ_TIMEOUT_SECONDS" in os.environ:
+        lakefs_env["read_timeout_seconds"] = float(
+            os.environ["KOHAKU_HUB_LAKEFS_READ_TIMEOUT_SECONDS"]
+        )
+    if "KOHAKU_HUB_LAKEFS_WRITE_TIMEOUT_SECONDS" in os.environ:
+        lakefs_env["write_timeout_seconds"] = float(
+            os.environ["KOHAKU_HUB_LAKEFS_WRITE_TIMEOUT_SECONDS"]
+        )
+    if "KOHAKU_HUB_LAKEFS_POOL_TIMEOUT_SECONDS" in os.environ:
+        lakefs_env["pool_timeout_seconds"] = float(
+            os.environ["KOHAKU_HUB_LAKEFS_POOL_TIMEOUT_SECONDS"]
+        )
     if lakefs_env:
         config_from_env["lakefs"] = lakefs_env
 
@@ -510,6 +535,18 @@ def load_config(path: str = None) -> Config:
     if "KOHAKU_HUB_DEBUG_LOG_PAYLOADS" in os.environ:
         app_env["debug_log_payloads"] = (
             os.environ["KOHAKU_HUB_DEBUG_LOG_PAYLOADS"].lower() == "true"
+        )
+    if "KOHAKU_HUB_ENABLE_REVERT_OPERATIONS" in os.environ:
+        app_env["enable_revert_operations"] = (
+            os.environ["KOHAKU_HUB_ENABLE_REVERT_OPERATIONS"].lower() == "true"
+        )
+    if "KOHAKU_HUB_ENABLE_RESET_OPERATIONS" in os.environ:
+        app_env["enable_reset_operations"] = (
+            os.environ["KOHAKU_HUB_ENABLE_RESET_OPERATIONS"].lower() == "true"
+        )
+    if "KOHAKU_HUB_ENABLE_SQUASH_OPERATIONS" in os.environ:
+        app_env["enable_squash_operations"] = (
+            os.environ["KOHAKU_HUB_ENABLE_SQUASH_OPERATIONS"].lower() == "true"
         )
     if "KOHAKU_HUB_LOG_LEVEL" in os.environ:
         app_env["log_level"] = os.environ["KOHAKU_HUB_LOG_LEVEL"]

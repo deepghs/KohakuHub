@@ -22,10 +22,26 @@ class HandlerSpec:
     priority: int
     handler: Handler
     lock_prefix: str | None = None
+    cancel_while_running: bool = True
+    # External handlers must cross a durable dispatch boundary before running.
+    # Replay is opt-in for handlers whose individual effects are idempotent.
+    external_side_effect: bool = False
+    replay_safe_after_dispatch: bool = False
+    fence_scope: str | None = None
+    # Bulk and cleanup lanes can opt into one global delivery lock while
+    # retaining their domain-level repository/resource fences.
+    lock_scope: str = "resource"
 
     @property
     def step_name(self) -> str:
         return self.kind
+
+    def delivery_lock(self, resource_key: str) -> str | None:
+        if not self.lock_prefix:
+            return None
+        if self.lock_scope == "global":
+            return self.lock_prefix
+        return f"{self.lock_prefix}:{resource_key}"
 
 
 class OperationRegistry:
@@ -41,6 +57,10 @@ class OperationRegistry:
             raise ValueError(f"duplicate operation handler: {spec.kind}")
         if not spec.kind or not spec.version or not spec.task_name:
             raise ValueError("operation handler identity is required")
+        if spec.lock_scope not in {"resource", "global"}:
+            raise ValueError("unsupported operation lock scope")
+        if spec.lock_scope == "global" and not spec.lock_prefix:
+            raise ValueError("global operation locks require a lock prefix")
         self._specs[spec.kind] = spec
 
     def get(self, kind: str) -> HandlerSpec:
@@ -81,6 +101,23 @@ async def _chain_handler(_operation: OperationRecord, step: StepRecord) -> StepR
     )
 
 
+async def _observation_handler(
+    _operation: OperationRecord, _step: StepRecord
+) -> StepResult:
+    """Keep an unresolved external commit visible until reconciliation settles it.
+
+    The control reconciliation task owns remote observation.  This handler is
+    intentionally non-mutating; running it can never resend the LakeFS commit.
+    """
+
+    return StepResult(
+        state="uncertain",
+        progress_message="waiting for commit reconciliation",
+        error_code="commit_observing",
+        error_summary="the external commit result is still being observed",
+    )
+
+
 DEFAULT_REGISTRY = OperationRegistry(
     (
         HandlerSpec(
@@ -107,6 +144,18 @@ DEFAULT_REGISTRY = OperationRegistry(
             priority=10,
             handler=commit_postprocess_handler,
             lock_prefix="commit-postprocess",
+            cancel_while_running=False,
+            external_side_effect=True,
+            replay_safe_after_dispatch=True,
+        ),
+        HandlerSpec(
+            kind="commit.observe.v1",
+            version="1",
+            task_name="khub:operation:execute.v1",
+            queue="control-v1",
+            priority=115,
+            handler=_observation_handler,
+            lock_prefix="commit-observe",
         ),
     )
 )

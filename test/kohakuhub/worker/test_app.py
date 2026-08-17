@@ -1,6 +1,6 @@
 from procrastinate.testing import InMemoryConnector
 
-from kohakuhub.worker.app import build_worker_app
+from kohakuhub.worker.app import build_worker_app, build_worker_apps
 from kohakuhub.worker.config import WorkerSettings
 
 
@@ -14,3 +14,14 @@ def test_worker_app_registers_only_code_owned_tasks():
     task = app.tasks["khub:worker:probe.v1"]
     assert task.queue == "control-v1"
     assert task.priority == 100
+
+
+def test_worker_apps_reserve_periodic_registry_for_control_lane():
+    control, work = build_worker_apps(
+        WorkerSettings(database_url="postgresql://user:pass@localhost/db")
+    )
+
+    assert control.periodic_registry.periodic_tasks
+    assert not work.periodic_registry.periodic_tasks
+    assert "khub:operation:execute.v1" in control.tasks
+    assert "khub:operation:execute.v1" in work.tasks

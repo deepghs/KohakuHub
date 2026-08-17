@@ -18,12 +18,24 @@ from kohakuhub.config import cfg
 from kohakuhub.migrations.schema import (
     expected_table_columns,
     is_exact_current_schema,
+    kernel_semantic_diff,
     operation_schema_object_diff,
+    procrastinate_schema_diff,
     signature_digest,
 )
-from kohakuhub.operations.sql import OPERATION_SCHEMA_SQL, OPERATION_SCHEMA_VERSION
+from kohakuhub.operations.sql import (
+    OPERATION_SCHEMA_SQL,
+    OPERATION_SCHEMA_VERSION,
+    operation_table_columns_for_version,
+)
 
 LOCK_KEY = "kohakuhub.schema.lifecycle.v1"
+RELEASED_OPERATION_SCHEMA_CHECKSUMS = {
+    # 17a225a shipped schema v2 and signed all KHub tables together with the
+    # operation tables. Keep the resulting ledger value immutable: deriving
+    # it from current Peewee models would break upgrades after model changes.
+    2: "edc67a3141b85e4b5dfff264609764e236d192d7086ba2d9b0571b49c381d23e",
+}
 LEDGER_DDL = """
 CREATE TABLE IF NOT EXISTS khub_schema_migrations (
     migration_name TEXT PRIMARY KEY,
@@ -73,7 +85,11 @@ def _has_ledger(connection: psycopg.Connection) -> bool:
 
 
 def _schema_checksum() -> str:
-    return signature_digest(expected_table_columns())
+    # Keep this checksum scoped to the operation kernel.  Ordinary KHub model
+    # changes must not invalidate a worker migration that did not change.
+    from kohakuhub.operations.sql import operation_table_columns
+
+    return signature_digest(operation_table_columns())
 
 
 def _legacy_schema_checksum() -> str:
@@ -85,11 +101,21 @@ def _record(connection: psycopg.Connection, name: str, version: int, checksum: s
         """
         INSERT INTO khub_schema_migrations (migration_name, version, checksum)
         VALUES (%s, %s, %s)
-        ON CONFLICT (migration_name) DO UPDATE
-        SET version = EXCLUDED.version, checksum = EXCLUDED.checksum
+        ON CONFLICT (migration_name) DO NOTHING
         """,
         (name, version, checksum),
     )
+    row = connection.execute(
+        """SELECT version, checksum
+           FROM khub_schema_migrations
+           WHERE migration_name = %s""",
+        (name,),
+    ).fetchone()
+    if row is None or int(row[0]) != int(version) or row[1] != checksum:
+        raise RuntimeError(
+            f"immutable migration ledger mismatch for {name}: "
+            f"recorded={row!r} expected={(version, checksum)!r}"
+        )
 
 
 def _assert_recorded_checksum(
@@ -99,7 +125,7 @@ def _assert_recorded_checksum(
 ) -> None:
     row = connection.execute(
         """
-        SELECT checksum
+        SELECT version, checksum
         FROM khub_schema_migrations
         WHERE migration_name = %s
         """,
@@ -107,11 +133,27 @@ def _assert_recorded_checksum(
     ).fetchone()
     if row is None:
         return
-    if row[0] != expected_checksum:
+    if row[1] != expected_checksum:
         raise RuntimeError(
             f"schema checksum mismatch for {name}: "
-            f"recorded={row[0]} expected={expected_checksum}"
+            f"recorded={row[1]} expected={expected_checksum}"
         )
+
+
+def _historical_operation_schema_checksum(version: int) -> str:
+    """Return a checksum for a released kernel schema, never infer one."""
+
+    try:
+        signature = operation_table_columns_for_version(version)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"unsupported historical operation schema version {version}; "
+            "upgrade from a supported durable-kernel release or rebuild explicitly"
+        ) from exc
+    released_checksum = RELEASED_OPERATION_SCHEMA_CHECKSUMS.get(version)
+    if released_checksum is not None:
+        return released_checksum
+    return signature_digest(signature)
 
 
 def _apply_procrastinate_schema(connection: psycopg.Connection) -> None:
@@ -148,6 +190,12 @@ def _apply_procrastinate_schema(connection: psycopg.Connection) -> None:
                 "partial Procrastinate schema; refusing to guess DDL: "
                 f"missing_tables={missing_tables}, missing_types={missing_types}"
             )
+        catalog_diff = procrastinate_schema_diff(connection)
+        if any(catalog_diff.values()):
+            raise RuntimeError(
+                "partial or incompatible Procrastinate schema; refusing to guess DDL: "
+                f"diagnostic={catalog_diff}"
+            )
         checksum = hashlib.sha256(SchemaManager.get_schema().encode("utf-8")).hexdigest()
         _assert_recorded_checksum(connection, "procrastinate-3.9.0", checksum)
         _record(connection, "procrastinate-3.9.0", 1, checksum)
@@ -160,11 +208,23 @@ def _apply_procrastinate_schema(connection: psycopg.Connection) -> None:
 
 
 def _apply_operation_schema(connection: psycopg.Connection) -> None:
+    legacy = connection.execute(
+        """SELECT version, checksum
+           FROM khub_schema_migrations
+           WHERE migration_name = 'khub-operation-kernel'"""
+    ).fetchone()
+    if legacy is not None:
+        expected_legacy = _historical_operation_schema_checksum(int(legacy[0]))
+        if legacy[1] != expected_legacy:
+            raise RuntimeError(
+                "historical operation schema checksum mismatch: "
+                f"recorded={legacy[1]} expected={expected_legacy}"
+            )
     with connection.cursor() as cursor:
         cursor.execute(OPERATION_SCHEMA_SQL)
     _record(
         connection,
-        "khub-operation-kernel",
+        f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}",
         OPERATION_SCHEMA_VERSION,
         _schema_checksum(),
     )
@@ -220,6 +280,11 @@ def migrate() -> None:
             if any(object_diff.values()):
                 raise RuntimeError(
                     f"operation schema object mismatch after migration: {object_diff}"
+                )
+            semantic_diff = kernel_semantic_diff(connection)
+            if any(semantic_diff.values()):
+                raise RuntimeError(
+                    f"operation schema semantic mismatch after migration: {semantic_diff}"
                 )
             connection.commit()
         except Exception:

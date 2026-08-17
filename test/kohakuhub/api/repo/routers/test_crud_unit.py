@@ -269,6 +269,52 @@ async def test_delete_repo_covers_admin_validation_not_found_and_failures(monkey
 
 
 @pytest.mark.asyncio
+async def test_delete_repo_direct_call_remains_compatible_with_postgres(monkeypatch):
+    repo_row = SimpleNamespace(
+        id=7,
+        delete_instance=lambda: None,
+        repo_type="model",
+        full_id="owner/demo-model",
+        lakefs_repo="model:owner/demo-model",
+    )
+    client = _FakeClient()
+
+    monkeypatch.setattr(repo_crud.cfg.app, "db_backend", "postgres")
+    monkeypatch.setattr(repo_crud, "get_repository", lambda *_args: repo_row)
+    monkeypatch.setattr(repo_crud, "get_lakefs_client", lambda: client)
+    monkeypatch.setattr(repo_crud, "resolve_lakefs_repo", lambda repo: repo.lakefs_repo)
+    monkeypatch.setattr(
+        repo_crud,
+        "check_repo_delete_permission",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        repo_crud,
+        "cleanup_repository_storage",
+        lambda **_kwargs: _async_return(
+            {
+                "repo_objects_deleted": 0,
+                "lfs_objects_deleted": 0,
+                "lfs_history_deleted": 0,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        repo_crud,
+        "db",
+        SimpleNamespace(atomic=lambda: _AtomicContext({})),
+    )
+
+    result = await repo_crud.delete_repo(
+        repo_crud.DeleteRepoPayload(type="model", name="demo-model"),
+        auth=(SimpleNamespace(username="owner"), False),
+    )
+
+    assert "deleted" in result["message"].lower()
+    assert [name for name, _kwargs in client.calls] == ["delete_repository"]
+
+
+@pytest.mark.asyncio
 async def test_migrate_lakefs_repository_covers_noop_missing_source_success_and_cleanup(monkeypatch):
     client = _FakeClient()
     from_repo = SimpleNamespace(full_id="owner/from")
@@ -460,6 +506,7 @@ async def test_move_repo_covers_validation_quota_success_and_nonfatal_cleanup(mo
 
 @pytest.mark.asyncio
 async def test_squash_repo_covers_validation_success_and_recovery(monkeypatch):
+    monkeypatch.setattr(repo_crud.cfg.app, "enable_squash_operations", True)
     repo_row = SimpleNamespace(
         private=False,
         repo_type="model",

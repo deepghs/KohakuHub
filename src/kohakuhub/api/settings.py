@@ -33,6 +33,20 @@ logger = get_logger("SETTINGS")
 router = APIRouter()
 
 
+@router.get("/site-config")
+async def get_site_config():
+    """Return public capability flags without exposing deployment secrets."""
+
+    return {
+        "site_name": cfg.app.site_name,
+        "capabilities": {
+            "revert": cfg.app.enable_revert_operations,
+            "reset": cfg.app.enable_reset_operations,
+            "squash": cfg.app.enable_squash_operations,
+        },
+    }
+
+
 # ============================================================================
 # User Settings API
 # ============================================================================

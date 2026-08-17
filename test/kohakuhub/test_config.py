@@ -112,6 +112,9 @@ def test_load_config_merges_file_and_environment(monkeypatch):
     monkeypatch.setenv("KOHAKU_HUB_LFS_AUTO_GC", "true")
     monkeypatch.setenv("KOHAKU_HUB_SITE_NAME", "Env Hub")
     monkeypatch.setenv("KOHAKU_HUB_DEBUG_LOG_PAYLOADS", "true")
+    monkeypatch.setenv("KOHAKU_HUB_ENABLE_REVERT_OPERATIONS", "true")
+    monkeypatch.setenv("KOHAKU_HUB_ENABLE_RESET_OPERATIONS", "true")
+    monkeypatch.setenv("KOHAKU_HUB_ENABLE_SQUASH_OPERATIONS", "true")
     monkeypatch.setenv("KOHAKU_HUB_LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("KOHAKU_HUB_LOG_FORMAT", "terminal")
     monkeypatch.setenv("KOHAKU_HUB_LOG_DIR", "/tmp/logs")
@@ -159,6 +162,9 @@ def test_load_config_merges_file_and_environment(monkeypatch):
     assert cfg.app.lfs_auto_gc is True
     assert cfg.app.site_name == "Env Hub"
     assert cfg.app.debug_log_payloads is True
+    assert cfg.app.enable_revert_operations is True
+    assert cfg.app.enable_reset_operations is True
+    assert cfg.app.enable_squash_operations is True
     assert cfg.app.log_level == "DEBUG"
     assert cfg.app.log_format == "terminal"
     assert cfg.app.log_dir == "/tmp/logs"
@@ -178,6 +184,9 @@ def test_load_config_uses_defaults_when_file_is_missing(monkeypatch):
     assert cfg.s3.endpoint == "http://localhost:9000"
     assert cfg.lakefs.endpoint == "http://localhost:8000"
     assert cfg.app.base_url == "http://localhost:48888"
+    assert cfg.app.enable_revert_operations is False
+    assert cfg.app.enable_reset_operations is False
+    assert cfg.app.enable_squash_operations is False
     hub_config.load_config.cache_clear()
 
 

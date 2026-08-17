@@ -6,9 +6,12 @@ from typing import Any
 
 from procrastinate import App
 from procrastinate.psycopg_connector import PsycopgConnector
+from procrastinate.retry import RetryStrategy
 
 from kohakuhub.operations.executor import execute_operation_step
+from kohakuhub.operations.types import RetryableOperationError
 from kohakuhub.operations.registry import DEFAULT_REGISTRY, OperationRegistry
+from kohakuhub.operations.reconciliation import reconcile_once
 
 from .config import CONTROL_QUEUE, SYNC_QUEUE, WorkerSettings
 
@@ -18,8 +21,9 @@ def build_worker_app(
     *,
     connector: Any | None = None,
     registry: OperationRegistry = DEFAULT_REGISTRY,
+    include_periodic: bool = True,
 ) -> App:
-    """Build one task registry used by both supervised worker lanes.
+    """Build one task registry for a supervised worker lane.
 
     The connector is injectable so registry and supervisor tests can run without
     a database. Production callers use one shared connector/pool for both lanes.
@@ -33,6 +37,10 @@ def build_worker_app(
         )
 
     app = App(connector=connector)
+    # The executor uses this only to open a dedicated advisory-fence
+    # connection for registered repository mutation handlers. It is never
+    # persisted in an operation payload.
+    app.khub_database_url = settings.database_url
 
     @app.task(
         name="khub:worker:probe.v1",
@@ -46,6 +54,11 @@ def build_worker_app(
         name="khub:operation:execute.v1",
         queue=SYNC_QUEUE,
         priority=0,
+        retry=RetryStrategy(
+            max_attempts=3,
+            exponential_wait=2,
+            retry_exceptions=(RetryableOperationError,),
+        ),
     )
     async def operation_execute(operation_id: str, step_id: str) -> None:
         """Execute one code-registered, bounded operation step."""
@@ -58,4 +71,65 @@ def build_worker_app(
             app=app,
         )
 
+    @app.task(
+        name="khub:worker:reconcile.v1",
+        queue=CONTROL_QUEUE,
+        priority=110,
+        queueing_lock="khub:worker:reconcile",
+    )
+    async def reconcile_operations(timestamp: int | None = None) -> None:
+        """Repair missing deliveries and observe external commit intents."""
+
+        await reconcile_once(
+            connector.pool,
+            app,
+            registry=registry,
+            database_url=settings.database_url,
+        )
+
+    if include_periodic:
+        # Only the control App owns periodic deferral.  The work App registers
+        # the same task name for delivery but has no periodic registry, so a
+        # second worker lane cannot create duplicate scheduler activity.
+        app.periodic(
+            cron="*/30 * * * * *",
+            periodic_id="operation-reconciliation-v1",
+            queue=CONTROL_QUEUE,
+            priority=110,
+            queueing_lock="khub:worker:reconcile",
+        )(reconcile_operations)
+
     return app
+
+
+def build_worker_apps(
+    settings: WorkerSettings,
+    *,
+    registry: OperationRegistry = DEFAULT_REGISTRY,
+) -> tuple[App, App]:
+    """Build the control and work Apps inside one khub-worker service."""
+
+    control_connector = PsycopgConnector(
+        conninfo=settings.database_url,
+        min_size=settings.pool_min_size,
+        max_size=settings.control_pool_max_size,
+    )
+    work_connector = PsycopgConnector(
+        conninfo=settings.database_url,
+        min_size=settings.pool_min_size,
+        max_size=settings.work_pool_max_size,
+    )
+    return (
+        build_worker_app(
+            settings,
+            connector=control_connector,
+            registry=registry,
+            include_periodic=True,
+        ),
+        build_worker_app(
+            settings,
+            connector=work_connector,
+            registry=registry,
+            include_periodic=False,
+        ),
+    )

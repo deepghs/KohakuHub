@@ -354,6 +354,7 @@ async def _process_single_path(
     file_records: dict[str, File],
     semaphore: asyncio.Semaphore,
     expand: bool,
+    include_directory_stats: bool = True,
 ) -> dict | None:
     """Resolve one path to either a file or directory entry."""
     client = get_lakefs_client()
@@ -424,7 +425,7 @@ async def _process_single_path(
 
         last_modified = _format_last_modified(first_result.get("mtime"))
 
-        if expand:
+        if expand and include_directory_stats:
             try:
                 dir_size, latest_mtime = await _calculate_directory_stats(
                     lakefs_repo=lakefs_repo,
@@ -596,6 +597,7 @@ async def get_paths_info(
     request: Request,
     paths: list[str] = Form(...),
     expand: bool = Form(False),
+    directory_stats: bool = Form(False),
     fallback: bool = True,
     user: User | None = Depends(get_optional_user),
 ):
@@ -636,6 +638,7 @@ async def get_paths_info(
                     file_records=file_records,
                     semaphore=semaphore,
                     expand=expand,
+                    include_directory_stats=directory_stats,
                 )
                 for clean_path in normalized_paths
             ]

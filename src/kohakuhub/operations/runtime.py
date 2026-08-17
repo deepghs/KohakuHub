@@ -13,6 +13,7 @@ from kohakuhub.worker.config import WorkerSettings
 
 from .registry import DEFAULT_REGISTRY, OperationRegistry
 from .service import OperationService
+from .readiness import verify_operation_schema
 
 
 @dataclass
@@ -36,6 +37,8 @@ class OperationRuntime:
             open=False,
         )
         await pool.open(wait=True)
+        async with pool.connection() as connection:
+            await verify_operation_schema(connection)
         connector = PsycopgConnector()
         settings = WorkerSettings(database_url=database_url, pool_max_size=4)
         worker_app = build_worker_app(
@@ -48,7 +51,12 @@ class OperationRuntime:
             pool=pool,
             connector=connector,
             app=worker_app,
-            service=OperationService(pool, worker_app, registry),
+            service=OperationService(
+                pool,
+                worker_app,
+                registry,
+                database_url=database_url,
+            ),
         )
 
     async def close(self) -> None:

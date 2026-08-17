@@ -118,3 +118,12 @@ async def test_get_repo_info_blobs_true_matches_the_default(client):
 
     assert default.status_code == explicit.status_code == 200
     assert default.json()["siblings"] == explicit.json()["siblings"]
+
+
+async def test_get_repo_info_can_skip_unbounded_sibling_enumeration(client):
+    response = await client.get(
+        "/api/models/owner/demo-model", params={"include_siblings": "false"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["siblings"] == []

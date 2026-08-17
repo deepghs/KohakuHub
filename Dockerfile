@@ -20,4 +20,5 @@ COPY ./docker/worker_startup.py /app/docker/worker_startup.py
 RUN chmod +x /app/startup.py
 
 EXPOSE 48888
+EXPOSE 9108
 CMD ["/app/startup.py"]

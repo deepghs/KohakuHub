@@ -85,6 +85,14 @@ def _restore_backend_state_per_test(request):
     from kohakuhub import lakefs_rest_client as _lakefs_rest
     _lakefs_rest._singleton_client = None
 
+    # ``live_server_url`` runs the shared app through FastAPI lifespan.  Its
+    # shutdown clears the production operation runtime by assigning ``None``;
+    # the next ASGI-transport test must remove that stale marker so it uses
+    # the intended test compatibility path instead of looking like a broken
+    # PostgreSQL runtime.
+    backend_test_state.modules.app.state._state.pop("operation_runtime", None)
+    backend_test_state.modules.app.state._khub_test_compatibility = True
+
     if request.node.get_closest_marker("backend_per_test") is not None:
         backend_test_state.restore_active_state()
         _lakefs_rest._singleton_client = None

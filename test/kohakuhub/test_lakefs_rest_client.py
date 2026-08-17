@@ -596,9 +596,11 @@ async def test_pooled_httpx_client_uses_keepalive_limits(monkeypatch):
     assert limits.max_connections == 64
     assert limits.max_keepalive_connections == 32
     assert limits.keepalive_expiry == 30.0
-    # ``timeout=None`` matches the previous unpooled per-call default —
-    # we don't want to silently introduce a tighter budget at this layer.
-    assert kw["timeout"] is None
+    timeout = kw["timeout"]
+    assert timeout.connect == 5.0
+    assert timeout.read == 30.0
+    assert timeout.write == 120.0
+    assert timeout.pool == 5.0
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,15 @@
 """Branch and tag management API endpoints."""
 
-from typing import Any, Optional
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
+from typing import Any, Optional, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from kohakuhub.db import Repository, User
 from kohakuhub.db_operations import create_commit, get_repository
+from kohakuhub.config import cfg
 from kohakuhub.logger import get_logger
 from kohakuhub.auth.dependencies import get_current_user, get_optional_user
 from kohakuhub.auth.permissions import (
@@ -31,10 +34,91 @@ from kohakuhub.api.repo.utils.hf import (
     hf_repo_not_found,
     hf_server_error,
 )
+from kohakuhub.operations.service import CommitInProgress
+from kohakuhub import lakefs_mutation_gateway as mutation_gateway
 
 logger = get_logger("BRANCHES")
 
 router = APIRouter()
+_mutation_fence_active: ContextVar[bool] = ContextVar(
+    "khub_branch_mutation_fence_active", default=False
+)
+
+
+async def _run_fenced_mutation(
+    request: Request | None,
+    repository_id: int,
+    ref: str,
+    callback: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Run one LakeFS mutation through the shared cross-process fence."""
+
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    runtime_present = app_state is not None and hasattr(app_state, "operation_runtime")
+    compatibility_mode = bool(
+        getattr(app_state, "_khub_test_compatibility", False)
+    )
+    runtime = app_state
+    runtime = getattr(runtime, "operation_runtime", None)
+    service = getattr(runtime, "service", None)
+    token = _mutation_fence_active.set(True)
+    try:
+        # Direct function calls without an ASGI request are the supported
+        # SQLite/unit-test compatibility path. Every production HTTP request
+        # supplies Request and must have the durable runtime.
+        if (
+            cfg.app.db_backend == "postgres"
+            and isinstance(request, Request)
+            and not compatibility_mode
+        ):
+            if not runtime_present:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "mutation_fence_unavailable"},
+                )
+            if service is None or repository_id is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "mutation_fence_unavailable"},
+                )
+            try:
+                async with service.repository_ref_fence(repository_id, ref):
+                    return await callback()
+            except CommitInProgress as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "repository_mutation_in_progress"},
+                ) from exc
+        return await callback()
+    finally:
+        _mutation_fence_active.reset(token)
+
+
+def _require_operation_enabled(operation: str, enabled: bool) -> None:
+    """Fail closed before any repository or LakeFS work for gated operations."""
+
+    if not enabled:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "operation_disabled", "operation": operation},
+        )
+
+
+def _reject_legacy_dangerous_path(request: Request | None, operation: str) -> None:
+    """Do not run a long dangerous mutation synchronously in production."""
+
+    state = getattr(getattr(request, "app", None), "state", None)
+    if cfg.app.db_backend == "postgres" and request is not None and getattr(
+        state, "operation_runtime", None
+    ) is not None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "durable_operation_not_available",
+                "operation": operation,
+            },
+            headers={"Retry-After": "30"},
+        )
 
 
 class CreateBranchPayload(BaseModel):
@@ -57,6 +141,7 @@ async def create_branch(
     name: str,
     payload: CreateBranchPayload,
     user: User = Depends(get_current_user),
+    request: Request = cast(Request, None),
 ):
     """Create a new branch.
 
@@ -81,20 +166,25 @@ async def create_branch(
     # Check if user has permission
     check_repo_delete_permission(repo_row, user)
 
-    lakefs_repo = resolve_lakefs_repo(repo_row)
-    client = get_lakefs_client()
-
-    try:
+    async def mutate():
+        lakefs_repo = resolve_lakefs_repo(repo_row)
+        client = get_lakefs_client()
         # Resolve source revision — accept branch name, tag, or commit sha
         # (huggingface_hub.create_branch(revision=…) passes any of the three).
         source_ref = payload.revision or "main"
         source_commit, _ = await resolve_revision(client, lakefs_repo, source_ref)
 
         # Create new branch
-        await client.create_branch(
+        await mutation_gateway.create_branch(
+            client,
             repository=lakefs_repo,
             name=payload.branch,
             source=source_commit,
+        )
+
+    try:
+        await _run_fenced_mutation(
+            request, getattr(repo_row, "id", None), f"branch:{payload.branch}", mutate
         )
     except ValueError as e:
         # resolve_revision raises ValueError when the ref is neither branch
@@ -104,6 +194,8 @@ async def create_branch(
             HFErrorCode.REVISION_NOT_FOUND,
             str(e),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Failed to create branch", e)
         error_msg = str(e).replace("\n", " ").replace("\r", " ")
@@ -129,6 +221,7 @@ async def create_branch_compat(
     branch: str,
     payload: CreateBranchCompatPayload,
     user: User = Depends(get_current_user),
+    request: Request = cast(Request, None),
 ):
     """Create a branch using the Hugging Face Hub compatible route shape."""
     return await create_branch(
@@ -140,6 +233,7 @@ async def create_branch_compat(
             revision=payload.startingPoint,
         ),
         user=user,
+        request=request,
     )
 
 
@@ -150,6 +244,7 @@ async def delete_branch(
     name: str,
     branch: str,
     user: User = Depends(get_current_user),
+    request: Request = cast(Request, None),
 ):
     """Delete a branch.
 
@@ -182,11 +277,21 @@ async def delete_branch(
             "Cannot delete main branch",
         )
 
-    lakefs_repo = resolve_lakefs_repo(repo_row)
-    client = get_lakefs_client()
-
+    async def mutate():
+        lakefs_repo = resolve_lakefs_repo(repo_row)
+        client = get_lakefs_client()
+        await mutation_gateway.delete_branch(
+            client, repository=lakefs_repo, branch=branch
+        )
     try:
-        await client.delete_branch(repository=lakefs_repo, branch=branch)
+        await _run_fenced_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            f"branch:{branch}",
+            mutate,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         return hf_server_error(f"Failed to delete branch: {str(e)}")
 
@@ -199,7 +304,7 @@ class RevertPayload(BaseModel):
     ref: str  # Commit ID or ref to revert
     parent_number: int = 1  # For merge commits
     message: Optional[str] = None
-    metadata: Optional[dict[str, str]] = None
+    metadata: None = None
     force: bool = False
     allow_empty: bool = False
 
@@ -245,6 +350,7 @@ async def create_tag(
     name: str,
     payload: CreateTagPayload,
     user: User = Depends(get_current_user),
+    request: Request = cast(Request, None),
 ):
     """Create a new tag.
 
@@ -269,19 +375,24 @@ async def create_tag(
     # Check if user has permission
     check_repo_delete_permission(repo_row, user)
 
-    lakefs_repo = resolve_lakefs_repo(repo_row)
-    client = get_lakefs_client()
-
-    try:
+    async def mutate():
+        lakefs_repo = resolve_lakefs_repo(repo_row)
+        client = get_lakefs_client()
         # Resolve source revision — accept branch, tag, or commit sha.
         source_ref = payload.revision or "main"
         source_commit, _ = await resolve_revision(client, lakefs_repo, source_ref)
 
         # Create new tag
-        await client.create_tag(
+        await mutation_gateway.create_tag(
+            client,
             repository=lakefs_repo,
             id=payload.tag,
             ref=source_commit,
+        )
+
+    try:
+        await _run_fenced_mutation(
+            request, getattr(repo_row, "id", None), f"tag:{payload.tag}", mutate
         )
     except ValueError as e:
         return hf_error_response(
@@ -289,6 +400,8 @@ async def create_tag(
             HFErrorCode.REVISION_NOT_FOUND,
             str(e),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         return hf_server_error(f"Failed to create tag: {str(e)}")
 
@@ -303,6 +416,7 @@ async def create_tag_compat(
     revision: str,
     payload: CreateTagCompatPayload,
     user: User = Depends(get_current_user),
+    request: Request = cast(Request, None),
 ):
     """Create a tag using the Hugging Face Hub compatible route shape."""
     return await create_tag(
@@ -315,6 +429,7 @@ async def create_tag_compat(
             message=payload.message,
         ),
         user=user,
+        request=request,
     )
 
 
@@ -325,6 +440,7 @@ async def delete_tag(
     name: str,
     tag: str,
     user: User = Depends(get_current_user),
+    request: Request = cast(Request, None),
 ):
     """Delete a tag.
 
@@ -349,11 +465,19 @@ async def delete_tag(
     # Check if user has permission
     check_repo_delete_permission(repo_row, user)
 
-    lakefs_repo = resolve_lakefs_repo(repo_row)
-    client = get_lakefs_client()
-
+    async def mutate():
+        lakefs_repo = resolve_lakefs_repo(repo_row)
+        client = get_lakefs_client()
+        await mutation_gateway.delete_tag(client, repository=lakefs_repo, tag=tag)
     try:
-        await client.delete_tag(repository=lakefs_repo, tag=tag)
+        await _run_fenced_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            f"tag:{tag}",
+            mutate,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         return hf_server_error(f"Failed to delete tag: {str(e)}")
 
@@ -482,6 +606,7 @@ async def revert_branch(
     branch: str,
     payload: RevertPayload,
     user: User = Depends(get_current_user),
+    request: Request = None,
 ):
     """Revert a commit on a branch.
 
@@ -503,6 +628,11 @@ async def revert_branch(
     Raises:
         HTTPException: If revert fails or LFS files are not recoverable
     """
+    _require_operation_enabled("revert", cfg.app.enable_revert_operations)
+    # Revert remains an Issue #99 consumer until its no-resend observer and
+    # finalization gates pass. An accidentally enabled production flag must
+    # never fall through to either durable acceptance or the legacy mutator.
+    _reject_legacy_dangerous_path(request, "revert")
     repo_id = f"{namespace}/{name}"
 
     # Check if repository exists
@@ -513,6 +643,22 @@ async def revert_branch(
 
     # Check if user has write permission
     check_repo_write_permission(repo_row, user)
+
+    if not _mutation_fence_active.get():
+        return await _run_fenced_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            f"branch:{branch}",
+            lambda: revert_branch(
+                repo_type,
+                namespace,
+                name,
+                branch,
+                payload,
+                user=user,
+                request=request,
+            ),
+        )
 
     lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
@@ -537,7 +683,8 @@ async def revert_branch(
 
     # Perform the revert
     try:
-        await client.revert_branch(
+        await mutation_gateway.revert_branch(
+            client,
             repository=lakefs_repo,
             branch=branch,
             ref=payload.ref,
@@ -550,6 +697,8 @@ async def revert_branch(
         logger.success(
             f"Successfully reverted commit {commit_id[:8]} on branch {branch}"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Failed to revert commit: {error_msg}")
@@ -629,6 +778,7 @@ async def merge_branches(
     destination_branch: str,
     payload: MergePayload,
     user: User = Depends(get_current_user),
+    request: Request = None,
 ):
     """Merge source reference into destination branch.
 
@@ -658,12 +808,32 @@ async def merge_branches(
     # Check if user has write permission
     check_repo_write_permission(repo_row, user)
 
+    _reject_legacy_dangerous_path(request, "reset")
+
+    if not _mutation_fence_active.get():
+        return await _run_fenced_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            f"branch:{destination_branch}",
+            lambda: merge_branches(
+                repo_type,
+                namespace,
+                name,
+                source_ref,
+                destination_branch,
+                payload,
+                user=user,
+                request=request,
+            ),
+        )
+
     lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
 
     # Perform the merge
     try:
-        merge_result = await client.merge_into_branch(
+        merge_result = await mutation_gateway.merge_into_branch(
+            client,
             repository=lakefs_repo,
             source_ref=source_ref,
             destination_branch=destination_branch,
@@ -677,6 +847,8 @@ async def merge_branches(
         logger.success(
             f"Successfully merged {source_ref} into {destination_branch} in {repo_id}"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Failed to merge {source_ref} into {destination_branch}", e)
         error_msg = str(e)
@@ -758,6 +930,7 @@ async def reset_branch(
     branch: str,
     payload: ResetPayload,
     user: User = Depends(get_current_user),
+    request: Request = None,
 ):
     """Reset a branch to a specific commit (like git reset --hard).
 
@@ -779,6 +952,7 @@ async def reset_branch(
     Raises:
         HTTPException: If reset fails or LFS files are not recoverable
     """
+    _require_operation_enabled("reset", cfg.app.enable_reset_operations)
     repo_id = f"{namespace}/{name}"
 
     # Check if repository exists
@@ -798,6 +972,22 @@ async def reset_branch(
                 "error": "Cannot reset main branch without force=true. "
                 "This is a safety measure to prevent accidental data loss."
             },
+        )
+
+    if not _mutation_fence_active.get():
+        return await _run_fenced_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            f"branch:{branch}",
+            lambda: reset_branch(
+                repo_type,
+                namespace,
+                name,
+                branch,
+                payload,
+                user=user,
+                request=request,
+            ),
         )
 
     lakefs_repo = resolve_lakefs_repo(repo_row)
@@ -895,7 +1085,8 @@ async def reset_branch(
 
             if diff_type == "added":
                 # File was added after target → delete it
-                await client.delete_object(
+                await mutation_gateway.delete_object(
+                    client,
                     repository=lakefs_repo,
                     branch=branch,
                     path=path,
@@ -912,7 +1103,8 @@ async def reset_branch(
                     path=path,
                 )
 
-                await client.upload_object(
+                await mutation_gateway.upload_object(
+                    client,
                     repository=lakefs_repo,
                     branch=branch,
                     path=path,
@@ -931,7 +1123,8 @@ async def reset_branch(
                     path=path,
                 )
 
-                await client.upload_object(
+                await mutation_gateway.upload_object(
+                    client,
                     repository=lakefs_repo,
                     branch=branch,
                     path=path,
@@ -951,7 +1144,8 @@ async def reset_branch(
 
         commit_message = payload.message or f"Reset to commit {commit_id[:8]}"
 
-        commit_result = await client.commit(
+        commit_result = await mutation_gateway.commit(
+            client,
             repository=lakefs_repo,
             branch=branch,
             message=commit_message,

@@ -14,7 +14,9 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
 from kohakuhub.config import cfg
 from kohakuhub.migrations.schema import (
     is_exact_current_schema,
+    kernel_semantic_diff,
     operation_schema_object_diff,
+    procrastinate_schema_diff,
 )
 
 
@@ -28,6 +30,12 @@ def verify() -> None:
         object_diff = operation_schema_object_diff(connection)
         if any(object_diff.values()):
             raise RuntimeError(f"operation schema object mismatch: {object_diff}")
+        semantic_diff = kernel_semantic_diff(connection)
+        if any(semantic_diff.values()):
+            raise RuntimeError(f"operation schema semantic mismatch: {semantic_diff}")
+        worker_diff = procrastinate_schema_diff(connection)
+        if any(worker_diff.values()):
+            raise RuntimeError(f"Procrastinate schema mismatch: {worker_diff}")
         required = (
             "khub_schema_migrations",
             "procrastinate_jobs",

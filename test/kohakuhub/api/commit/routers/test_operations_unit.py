@@ -369,8 +369,10 @@ async def test_process_deleted_file_and_folder_cover_success_partial_failures_an
     assert _FakeFileModel.update_query.where_calls
 
     client.raise_on["delete_object"] = RuntimeError("delete failed")
-    deleted = await commit_ops.process_deleted_file("README.md", repo, "lakefs", "main")
-    assert deleted is True
+    with pytest.raises(HTTPException) as delete_error:
+        await commit_ops.process_deleted_file("README.md", repo, "lakefs", "main")
+    assert delete_error.value.status_code == 502
+    assert len(_FakeFileModel.update_query.where_calls) == 1
     client.raise_on.pop("delete_object", None)
 
     client.list_payload = {
@@ -384,8 +386,9 @@ async def test_process_deleted_file_and_folder_cover_success_partial_failures_an
     assert folder_deleted is True
 
     client.raise_on["list_objects"] = RuntimeError("list failed")
-    folder_deleted = await commit_ops.process_deleted_folder("folder", repo, "lakefs", "main")
-    assert folder_deleted is True
+    with pytest.raises(HTTPException) as folder_error:
+        await commit_ops.process_deleted_folder("folder", repo, "lakefs", "main")
+    assert folder_error.value.status_code == 502
 
 
 @pytest.mark.asyncio

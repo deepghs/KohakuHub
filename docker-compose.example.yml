@@ -25,11 +25,11 @@ services:
       khub-migrate:
         condition: service_completed_successfully
       lakefs:
-        condition: service_started
+        condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
       valkey:
-        condition: service_started
+        condition: service_healthy
     environment:
       ## ===== CRITICAL: Endpoint Configuration (MUST CHANGE) =====
       ## These determine how users access your KohakuHub instance
@@ -104,6 +104,18 @@ services:
       # - KOHAKU_HUB_CACHE_NAMESPACE=kh # Override if multiple deployments share Valkey
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:48888/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   khub-migrate:
     build: .
@@ -111,7 +123,8 @@ services:
     restart: "no"
     command: ["python", "scripts/khub_migrate.py"]
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
       - KOHAKU_HUB_DB_BACKEND=postgres
       - KOHAKU_HUB_DATABASE_URL=postgresql://<user>:<password>@postgres:5432/kohakuhub
@@ -125,18 +138,19 @@ services:
     depends_on:
       khub-migrate:
         condition: service_completed_successfully
-      hub-api:
-        condition: service_started
       lakefs:
-        condition: service_started
+        condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
     environment:
       - KOHAKU_HUB_DB_BACKEND=postgres
       - KOHAKU_HUB_DATABASE_URL=postgresql://<user>:<password>@postgres:5432/kohakuhub
       - KOHAKU_HUB_WORKER_POOL_MIN=1
       - KOHAKU_HUB_WORKER_POOL_MAX=8
+      - KOHAKU_HUB_WORKER_METRICS_HOST=0.0.0.0
+      - KOHAKU_HUB_WORKER_METRICS_PORT=9108
       - KOHAKU_HUB_LAKEFS_ENDPOINT=http://lakefs:28000
+      - KOHAKU_HUB_LAKEFS_REPO_NAMESPACE=hf
       - KOHAKU_HUB_S3_ENDPOINT=http://minio:9000
       - KOHAKU_HUB_S3_ACCESS_KEY=minioadmin
       - KOHAKU_HUB_S3_SECRET_KEY=minioadmin
@@ -144,6 +158,20 @@ services:
       - KOHAKU_HUB_S3_REGION=us-east-1
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds:ro
+    ports:
+      - "9108:9108"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:9108/readyz', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   minio:
     image: quay.io/minio/minio:latest
@@ -162,6 +190,11 @@ services:
     volumes:
       - ./hub-storage/minio-data:/data
       - ./hub-meta/minio-data:/root/.minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   lakefs:
     build:
@@ -184,10 +217,16 @@ services:
       - "28000:28000"   # LakeFS admin UI (optional)
     user: "${UID}:${GID}"
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     volumes:
       - ./hub-meta/lakefs-data:/var/lakefs/data
       - ./hub-meta/lakefs-cache:/lakefs/data/cache
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:28000/_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   postgres:
     image: postgres:15
@@ -201,6 +240,11 @@ services:
       - "25432:5432" # Optional: for external access
     volumes:
       - ./hub-meta/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   # L2 cache. Pure cache: losing it never compromises correctness. The
   # volume + RDB persistence is intentional — it preserves the warm Mode-A

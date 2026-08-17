@@ -34,10 +34,14 @@ class WorkerSettings:
     database_url: str
     pool_min_size: int = 1
     pool_max_size: int = 8
+    control_pool_max_size: int = 2
+    work_pool_max_size: int = 6
     graceful_shutdown_seconds: float = 30.0
     polling_interval_seconds: float = 5.0
     heartbeat_interval_seconds: float = 10.0
     stalled_worker_timeout_seconds: float = 30.0
+    metrics_host: str = "0.0.0.0"
+    metrics_port: int = 0
 
     @classmethod
     def from_env(cls) -> "WorkerSettings":
@@ -54,10 +58,22 @@ class WorkerSettings:
                 "khub-worker requires a PostgreSQL KOHAKU_HUB_DATABASE_URL"
             )
 
+        pool_min_size = _positive_int("KOHAKU_HUB_WORKER_POOL_MIN", 1)
+        pool_max_size = _positive_int("KOHAKU_HUB_WORKER_POOL_MAX", 8)
+        control_pool_max_size = _positive_int(
+            "KOHAKU_HUB_WORKER_CONTROL_POOL_MAX",
+            max(1, pool_max_size // 4),
+        )
+        work_pool_max_size = _positive_int(
+            "KOHAKU_HUB_WORKER_WORK_POOL_MAX",
+            max(1, pool_max_size - control_pool_max_size),
+        )
         settings = cls(
             database_url=database_url,
-            pool_min_size=_positive_int("KOHAKU_HUB_WORKER_POOL_MIN", 1),
-            pool_max_size=_positive_int("KOHAKU_HUB_WORKER_POOL_MAX", 8),
+            pool_min_size=pool_min_size,
+            pool_max_size=pool_max_size,
+            control_pool_max_size=control_pool_max_size,
+            work_pool_max_size=work_pool_max_size,
             graceful_shutdown_seconds=_positive_float(
                 "KOHAKU_HUB_WORKER_SHUTDOWN_SECONDS", 30.0
             ),
@@ -70,9 +86,19 @@ class WorkerSettings:
             stalled_worker_timeout_seconds=_positive_float(
                 "KOHAKU_HUB_WORKER_STALLED_SECONDS", 30.0
             ),
+            metrics_host=os.getenv("KOHAKU_HUB_WORKER_METRICS_HOST", "0.0.0.0"),
+            metrics_port=_nonnegative_int("KOHAKU_HUB_WORKER_METRICS_PORT", 0),
         )
         if settings.pool_max_size < settings.pool_min_size:
             raise ValueError("worker pool max size must be >= min size")
+        if settings.control_pool_max_size < settings.pool_min_size:
+            raise ValueError("control worker pool max size must be >= min size")
+        if settings.work_pool_max_size < settings.pool_min_size:
+            raise ValueError("work worker pool max size must be >= min size")
+        if settings.control_pool_max_size + settings.work_pool_max_size > settings.pool_max_size:
+            raise ValueError(
+                "control and work worker pool max sizes exceed aggregate pool max size"
+            )
         return settings
 
 
@@ -87,4 +113,11 @@ def _positive_float(name: str, default: float) -> float:
     value = float(os.getenv(name, str(default)))
     if value <= 0:
         raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _nonnegative_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 0 or value > 65535:
+        raise ValueError(f"{name} must be between 0 and 65535")
     return value

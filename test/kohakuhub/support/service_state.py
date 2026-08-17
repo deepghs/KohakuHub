@@ -308,18 +308,33 @@ class ServiceTestState:
         migrate_worker_schema()
         report("initializing the storage bucket")
         self.modules.s3_module.init_storage()
+        # This ASGI transport does not run FastAPI lifespan.  A prior live
+        # server test may nevertheless have left the reusable app with the
+        # lifespan-owned attribute set to None after closing its runtime.
+        # Remove that stale marker so the seed exercises the documented
+        # SQLite/unit-test compatibility path instead of production fail
+        # closed fencing.
+        self.modules.app.state._state.pop("operation_runtime", None)
+        self.modules.app.state._khub_test_compatibility = True
         transport = httpx.ASGITransport(app=self.modules.app)
+        previous_db_backend = self.modules.config_module.cfg.app.db_backend
+        # The seed intentionally exercises the direct SQLite/unit-test
+        # compatibility path without a lifespan-owned operation runtime.
+        self.modules.config_module.cfg.app.db_backend = "sqlite"
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://testserver",
             follow_redirects=False,
         ) as client:
-            report("seeding the backend baseline")
-            await build_baseline(
-                client,
-                self.s3_client,
-                self.modules.config_module.cfg,
-            )
+            try:
+                report("seeding the backend baseline")
+                await build_baseline(
+                    client,
+                    self.s3_client,
+                    self.modules.config_module.cfg,
+                )
+            finally:
+                self.modules.config_module.cfg.app.db_backend = previous_db_backend
         self.modules.fallback_cache_module.get_cache().clear()
         report("baseline restore completed")
 

@@ -88,6 +88,10 @@ async def lifespan(app: FastAPI):
     finally:
         if operation_runtime is not None:
             await operation_runtime.close()
+            # ASGI transports used by tests and embedding applications may
+            # reuse the FastAPI object after a lifespan restart. Do not leave
+            # a closed pool looking like a live operation runtime.
+            app.state.operation_runtime = None
         # Drop the LakeFS REST client's pooled httpx connections so the
         # worker exits cleanly. Without this the keepalive sockets leak
         # at shutdown and can hold the process from terminating.

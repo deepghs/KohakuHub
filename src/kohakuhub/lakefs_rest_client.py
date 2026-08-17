@@ -81,6 +81,13 @@ class LakeFSRestClient:
         self.endpoint = endpoint.rstrip("/")
         self.base_url = f"{self.endpoint}/api/v1"
         self.auth = (access_key, secret_key)
+        self.timeout = httpx.Timeout(
+            timeout=cfg.lakefs.read_timeout_seconds,
+            connect=cfg.lakefs.connect_timeout_seconds,
+            read=cfg.lakefs.read_timeout_seconds,
+            write=cfg.lakefs.write_timeout_seconds,
+            pool=cfg.lakefs.pool_timeout_seconds,
+        )
         # Lazily-constructed pooled httpx client. We DO NOT build it eagerly
         # because httpx.AsyncClient binds connections to the calling event
         # loop on first use; deferring construction lets the same
@@ -99,10 +106,7 @@ class LakeFSRestClient:
         if self._httpx_client is None:
             self._httpx_client = httpx.AsyncClient(
                 limits=_HTTPX_LIMITS,
-                # ``timeout=None`` matches the previous per-call default. Per-
-                # call sites can still override via ``timeout=`` kwarg if
-                # they want a tighter budget.
-                timeout=None,
+                timeout=self.timeout,
             )
         return self._httpx_client
 
@@ -178,7 +182,7 @@ class LakeFSRestClient:
             params={"path": path},
             headers=headers,
             auth=self.auth,
-            timeout=None,
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.content
@@ -204,7 +208,7 @@ class LakeFSRestClient:
             url,
             params={"path": path, "user_metadata": user_metadata},
             auth=self.auth,
-            timeout=None,
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.json()
@@ -238,7 +242,7 @@ class LakeFSRestClient:
             content=content,
             headers={"Content-Type": "application/octet-stream"},
             auth=self.auth,
-            timeout=None,
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.json()
@@ -265,7 +269,7 @@ class LakeFSRestClient:
             url,
             params=params,
             auth=self.auth,
-            timeout=None,
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.json()
@@ -302,7 +306,7 @@ class LakeFSRestClient:
             params={"path": path},
             json=metadata_dict,
             auth=self.auth,
-            timeout=None,
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.json()
@@ -336,7 +340,7 @@ class LakeFSRestClient:
             url,
             json=commit_data,
             auth=self.auth,
-            timeout=None,  # No timeout for internal service
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.json()
@@ -354,7 +358,7 @@ class LakeFSRestClient:
         url = f"{self.base_url}/repositories/{repository}/commits/{commit_id}"
 
         client = self._httpx()
-        response = await client.get(url, auth=self.auth, timeout=None)
+        response = await client.get(url, auth=self.auth, timeout=self.timeout)
         self._check_response(response)
         return response.json()
 
@@ -419,7 +423,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.get(
-            url, params=params, auth=self.auth, timeout=None
+            url, params=params, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
         return response.json()
@@ -453,7 +457,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.get(
-            url, params=params, auth=self.auth, timeout=None
+            url, params=params, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
         return response.json()
@@ -495,7 +499,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.get(
-            url, params=params, auth=self.auth, timeout=None
+            url, params=params, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
         return response.json()
@@ -515,7 +519,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.delete(
-            url, params={"path": path, "force": force}, auth=self.auth, timeout=None
+            url, params={"path": path, "force": force}, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
 
@@ -542,7 +546,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.post(
-            url, json=repo_data, auth=self.auth, timeout=None
+            url, json=repo_data, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
         return response.json()
@@ -558,7 +562,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.delete(
-            url, params={"force": force}, auth=self.auth, timeout=None
+            url, params={"force": force}, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
 
@@ -577,7 +581,7 @@ class LakeFSRestClient:
         url = f"{self.base_url}/repositories/{repository}"
 
         client = self._httpx()
-        response = await client.get(url, auth=self.auth, timeout=None)
+        response = await client.get(url, auth=self.auth, timeout=self.timeout)
         self._check_response(response)
         return response.json()
 
@@ -593,7 +597,7 @@ class LakeFSRestClient:
         url = f"{self.base_url}/repositories/{repository}"
 
         client = self._httpx()
-        response = await client.get(url, auth=self.auth, timeout=None)
+        response = await client.get(url, auth=self.auth, timeout=self.timeout)
         if response.status_code == 404:
             return False
         self._check_response(response)
@@ -612,7 +616,7 @@ class LakeFSRestClient:
         url = f"{self.base_url}/repositories/{repository}/branches/{branch}"
 
         client = self._httpx()
-        response = await client.get(url, auth=self.auth, timeout=None)
+        response = await client.get(url, auth=self.auth, timeout=self.timeout)
         self._check_response(response)
         return response.json()
 
@@ -644,7 +648,7 @@ class LakeFSRestClient:
             url,
             params=params,
             auth=self.auth,
-            timeout=None,
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.json()
@@ -666,7 +670,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.post(
-            url, json=branch_data, auth=self.auth, timeout=None
+            url, json=branch_data, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
         # LakeFS returns 201 with text/html (plain string ref), not JSON
@@ -686,7 +690,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.delete(
-            url, params={"force": force}, auth=self.auth, timeout=None
+            url, params={"force": force}, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
 
@@ -710,7 +714,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.post(
-            url, json=tag_data, auth=self.auth, timeout=None
+            url, json=tag_data, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
         return response.json()
@@ -743,7 +747,7 @@ class LakeFSRestClient:
             url,
             params=params,
             auth=self.auth,
-            timeout=None,
+            timeout=self.timeout,
         )
         self._check_response(response)
         return response.json()
@@ -760,7 +764,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.delete(
-            url, params={"force": force}, auth=self.auth, timeout=None
+            url, params={"force": force}, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
 
@@ -806,7 +810,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.post(
-            url, json=revert_data, auth=self.auth, timeout=None
+            url, json=revert_data, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
 
@@ -855,7 +859,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.post(
-            url, json=merge_data, auth=self.auth, timeout=None
+            url, json=merge_data, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
         return response.json()
@@ -891,7 +895,7 @@ class LakeFSRestClient:
 
         client = self._httpx()
         response = await client.put(
-            url, params=params, auth=self.auth, timeout=None
+            url, params=params, auth=self.auth, timeout=self.timeout
         )
         self._check_response(response)
 

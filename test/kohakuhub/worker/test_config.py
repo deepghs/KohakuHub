@@ -33,3 +33,16 @@ def test_worker_rejects_invalid_pool_order(monkeypatch):
 
     with pytest.raises(ValueError, match="max size"):
         WorkerSettings.from_env()
+
+
+def test_worker_pool_split_must_fit_aggregate_budget(monkeypatch):
+    monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KOHAKU_HUB_DATABASE_URL", "postgresql://user:pass@localhost/db"
+    )
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_POOL_MAX", "8")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_CONTROL_POOL_MAX", "3")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_WORK_POOL_MAX", "6")
+
+    with pytest.raises(ValueError, match="aggregate pool max"):
+        WorkerSettings.from_env()

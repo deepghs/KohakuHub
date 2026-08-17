@@ -3,9 +3,10 @@
 import asyncio
 import json
 import uuid
-from typing import Literal, Optional
+from contextvars import ContextVar
+from typing import Literal, Optional, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -35,7 +36,7 @@ from kohakuhub.utils.lakefs import (
     get_lakefs_client,
     resolve_lakefs_repo,
 )
-from kohakuhub.utils.s3 import copy_s3_folder, delete_objects_with_prefix, get_s3_client
+from kohakuhub.utils.s3 import copy_s3_folder, get_s3_client
 from kohakuhub.lakefs_rest_client import StagingLocation, StagingMetadata
 from kohakuhub.api.repo.utils.hf import (
     HFErrorCode,
@@ -53,9 +54,71 @@ from kohakuhub.api.quota.util import (
 from kohakuhub.api.repo.utils.gc import cleanup_repository_storage
 from kohakuhub.api.fallback.cache import get_cache as get_fallback_cache
 from kohakuhub.api.validation import normalize_name
+from kohakuhub.operations.service import CommitInProgress
+from kohakuhub import (
+    lakefs_mutation_gateway as mutation_gateway,
+    storage_deletion_gateway as deletion_gateway,
+)
+
+# Compatibility seam for existing unit-test and embedding hooks.  The symbol
+# still points at the approved deletion gateway rather than the S3 adapter.
+delete_objects_with_prefix = deletion_gateway.delete_prefix
 
 logger = get_logger("REPO")
 router = APIRouter()
+_repository_mutation_fence_active: ContextVar[bool] = ContextVar(
+    "khub_repository_mutation_fence_active", default=False
+)
+
+
+async def _run_fenced_repository_mutation(
+    request: Request | None,
+    repository_id: int | None,
+    callback,
+):
+    """Serialize a repository-wide backing mutation across API and workers."""
+
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    runtime_present = app_state is not None and hasattr(app_state, "operation_runtime")
+    compatibility_mode = bool(
+        getattr(app_state, "_khub_test_compatibility", False)
+    )
+    runtime = app_state
+    runtime = getattr(runtime, "operation_runtime", None)
+    service = getattr(runtime, "service", None)
+    token = _repository_mutation_fence_active.set(True)
+    try:
+        # Direct function calls without an ASGI request are the supported
+        # SQLite/unit-test compatibility path. Production HTTP requests must
+        # provide the PostgreSQL operation runtime.
+        if (
+            cfg.app.db_backend == "postgres"
+            and isinstance(request, Request)
+            and not compatibility_mode
+        ):
+            if not runtime_present:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "mutation_fence_unavailable"},
+                )
+            if service is None or repository_id is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "mutation_fence_unavailable"},
+                )
+            try:
+                async with service.repository_ref_fence(
+                    repository_id, "__repository__"
+                ):
+                    return await callback()
+            except CommitInProgress as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "repository_mutation_in_progress"},
+                ) from exc
+        return await callback()
+    finally:
+        _repository_mutation_fence_active.reset(token)
 
 RepoType = Literal["model", "dataset", "space"]
 
@@ -91,6 +154,39 @@ def _repo_exists_response(
             "X-Error-Message": body_message,
         },
     )
+
+
+def _reject_legacy_dangerous_path(request: Request | None, operation: str) -> None:
+    """Keep enabled dangerous operations fail-closed until their durable consumer lands."""
+
+    state = getattr(getattr(request, "app", None), "state", None)
+    if cfg.app.db_backend == "postgres" and request is not None and getattr(
+        state, "operation_runtime", None
+    ) is not None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "durable_operation_not_available", "operation": operation},
+            headers={"Retry-After": "30"},
+        )
+
+
+def _reject_non_durable_repository_delete(request: Request | None) -> None:
+    """Fail closed for production deletes until durable cleanup is available."""
+
+    state = getattr(getattr(request, "app", None), "state", None)
+    compatibility_mode = bool(
+        getattr(state, "_khub_test_compatibility", False)
+    )
+    if (
+        cfg.app.db_backend == "postgres"
+        and request is not None
+        and not compatibility_mode
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "durable_cleanup_unavailable"},
+            headers={"Retry-After": "30"},
+        )
 
 
 class CreateRepoPayload(BaseModel):
@@ -278,7 +374,7 @@ async def _delete_exact_repo_dummy_marker(repo_prefix: str) -> bool:
         s3 = get_s3_client()
         key = f"{repo_prefix}_lakefs/dummy"
         try:
-            s3.delete_object(Bucket=cfg.s3.bucket, Key=key)
+            deletion_gateway.delete_object(s3, Bucket=cfg.s3.bucket, Key=key)
             logger.warning(f"Deleted exact orphan dummy marker: {key}")
             return True
         except Exception as e:
@@ -425,7 +521,8 @@ async def create_repo(
     storage_namespace = f"s3://{cfg.s3.bucket}/{lakefs_repo}"
 
     try:
-        await client.create_repository(
+        await mutation_gateway.create_repository(
+            client,
             name=lakefs_repo,
             storage_namespace=storage_namespace,
             default_branch="main",
@@ -472,7 +569,8 @@ async def create_repo(
             )
             if cleaned:
                 try:
-                    await client.create_repository(
+                    await mutation_gateway.create_repository(
+                        client,
                         name=lakefs_repo,
                         storage_namespace=storage_namespace,
                         default_branch="main",
@@ -535,6 +633,7 @@ class DeleteRepoPayload(BaseModel):
 async def delete_repo(
     payload: DeleteRepoPayload,
     auth: tuple[User | None, bool] = Depends(get_current_user_or_admin),
+    request: Request = cast(Request, None),
 ):
     """Delete a repository. (NOTE: This is IRREVERSIBLE)
 
@@ -574,11 +673,24 @@ async def delete_repo(
     # 2. Check if user has permission to delete this repository (admin bypasses)
     check_repo_delete_permission(repo_row, user, is_admin=is_admin)
 
+    # PostgreSQL production deletes require a durable cleanup job. Until that
+    # consumer exists, do not mutate LakeFS/S3 or delete the authoritative row.
+    _reject_non_durable_repository_delete(request)
+
+    if not _repository_mutation_fence_active.get():
+        return await _run_fenced_repository_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            lambda: delete_repo(payload, auth=auth, request=request),
+        )
+
     # 3. Delete LakeFS repository metadata first to avoid leaving orphan repos behind.
     client = get_lakefs_client()
     try:
         # Note: Deleting a LakeFS repo is generally fast as it only deletes metadata
-        await client.delete_repository(repository=lakefs_repo, force=True)
+        await mutation_gateway.delete_repository(
+            client, repository=lakefs_repo, force=True
+        )
         logger.success(f"Successfully deleted LakeFS repository: {lakefs_repo}")
     except Exception as e:
         # LakeFS returns 404 if repo doesn't exist, which is fine
@@ -738,7 +850,8 @@ async def _migrate_lakefs_repository(
 
         # 2. Create new LakeFS repository
         storage_namespace = f"s3://{cfg.s3.bucket}/{to_lakefs_repo}"
-        await client.create_repository(
+        await mutation_gateway.create_repository(
+            client,
             name=to_lakefs_repo,
             storage_namespace=storage_namespace,
             default_branch="main",
@@ -787,7 +900,8 @@ async def _migrate_lakefs_repository(
                         size_bytes=size_bytes,
                     )
 
-                    await client.link_physical_address(
+                    await mutation_gateway.link_physical_address(
+                        client,
                         repository=to_lakefs_repo,
                         branch="main",
                         path=obj_path,
@@ -805,7 +919,8 @@ async def _migrate_lakefs_repository(
                         path=obj_path,
                     )
 
-                    await client.upload_object(
+                    await mutation_gateway.upload_object(
+                        client,
                         repository=to_lakefs_repo,
                         branch="main",
                         path=obj_path,
@@ -834,7 +949,8 @@ async def _migrate_lakefs_repository(
 
         # 4. Commit all staged/uploaded objects
         if lfs_count + regular_count > 0:
-            await client.commit(
+            await mutation_gateway.commit(
+                client,
                 repository=to_lakefs_repo,
                 branch="main",
                 message=f"Repository moved from {from_id} to {to_id}",
@@ -844,7 +960,9 @@ async def _migrate_lakefs_repository(
         # 5. Delete old LakeFS repository
         deleted = False
         try:
-            await client.delete_repository(repository=from_lakefs_repo, force=True)
+            await mutation_gateway.delete_repository(
+                client, repository=from_lakefs_repo, force=True
+            )
             logger.info(f"Deleted old LakeFS repository: {from_lakefs_repo}")
             deleted = True
         except Exception as e:
@@ -861,7 +979,9 @@ async def _migrate_lakefs_repository(
             await _wait_for_lakefs_repo_deletion(client, from_lakefs_repo)
 
         # 6. Delete old S3 folder to free up the name
-        deleted_count = await delete_objects_with_prefix(cfg.s3.bucket, from_s3_prefix)
+        deleted_count = await delete_objects_with_prefix(
+            cfg.s3.bucket, from_s3_prefix
+        )
         logger.success(f"Deleted {deleted_count} object(s) from old S3 prefix")
 
         logger.success(
@@ -874,7 +994,9 @@ async def _migrate_lakefs_repository(
 
         # Try to delete new LakeFS repo if it was created
         try:
-            await client.delete_repository(repository=to_lakefs_repo, force=True)
+            await mutation_gateway.delete_repository(
+                client, repository=to_lakefs_repo, force=True
+            )
             logger.info(f"Cleaned up new LakeFS repo: {to_lakefs_repo}")
         except Exception:
             pass
@@ -976,6 +1098,7 @@ def _update_repository_database_records(
 async def move_repo(
     payload: MoveRepoPayload,
     auth: tuple[User | None, bool] = Depends(get_current_user_or_admin),
+    request: Request = cast(Request, None),
 ):
     """Move/rename a repository.
 
@@ -1018,6 +1141,13 @@ async def move_repo(
     # Check permissions (admin bypasses)
     check_repo_delete_permission(repo_row, user, is_admin=is_admin)
     check_namespace_permission(to_namespace, user, is_admin=is_admin)
+
+    if not _repository_mutation_fence_active.get():
+        return await _run_fenced_repository_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            lambda: move_repo(payload, auth=auth, request=request),
+        )
 
     # Check if destination already exists. See `_repo_exists_response` for why the
     # response includes a JSON body as well as X-Error-* headers.
@@ -1148,6 +1278,7 @@ async def move_repo(
 async def squash_repo(
     payload: SquashRepoPayload,
     auth: tuple[User | None, bool] = Depends(get_current_user_or_admin),
+    request: Request = cast(Request, None),
 ):
     """Squash repository to clear all commit history and compress storage.
 
@@ -1168,6 +1299,12 @@ async def squash_repo(
     Raises:
         HTTPException: If operation fails
     """
+    if not cfg.app.enable_squash_operations:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "operation_disabled", "operation": "squash"},
+        )
+
     user, is_admin = auth
     repo_id = payload.repo
     repo_type = payload.type
@@ -1188,6 +1325,15 @@ async def squash_repo(
 
     # Check if user has permission (admin bypasses)
     check_repo_delete_permission(repo_row, user, is_admin=is_admin)
+
+    _reject_legacy_dangerous_path(request, "squash")
+
+    if not _repository_mutation_fence_active.get():
+        return await _run_fenced_repository_mutation(
+            request,
+            getattr(repo_row, "id", None),
+            lambda: squash_repo(payload, auth=auth, request=request),
+        )
 
     # Generate temporary repository name
     temp_suffix = uuid.uuid4().hex[:8]

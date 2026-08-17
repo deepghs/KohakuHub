@@ -1,4 +1,4 @@
-FROM treeverse/lakefs:latest
+FROM treeverse/lakefs:1.86.0
 
 USER root
 

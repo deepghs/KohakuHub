@@ -23,6 +23,16 @@ async def test_update_user_and_org_settings(owner_client, member_client):
     assert org_profile.json()["bio"] == "Updated organization bio"
 
 
+async def test_site_config_exposes_safe_operation_capabilities(owner_client):
+    response = await owner_client.get("/api/site-config")
+    assert response.status_code == 200
+    assert response.json()["capabilities"] == {
+        "revert": False,
+        "reset": False,
+        "squash": False,
+    }
+
+
 async def test_update_repo_lfs_settings_and_read_effective_values(owner_client):
     update_response = await owner_client.put(
         "/api/models/owner/demo-model/settings",
