@@ -23,6 +23,12 @@ def _database_url() -> str:
     return value
 
 
+def _repository_id() -> int:
+    """Use a collision-resistant bigint id for advisory-lock isolation."""
+
+    return uuid4().int % (2**63 - 1)
+
+
 @pytest.fixture
 async def runtimes():
     url = _database_url()
@@ -54,7 +60,7 @@ async def _hold_fence(
 @pytest.mark.asyncio
 async def test_same_ref_is_serialized_across_independent_services(runtimes):
     first, second = runtimes
-    repository_id = 7_000_000 + (uuid4().int % 100_000)
+    repository_id = _repository_id()
     first_entered = asyncio.Event()
     second_entered = asyncio.Event()
     first_release = asyncio.Event()
@@ -94,7 +100,7 @@ async def test_same_ref_is_serialized_across_independent_services(runtimes):
 @pytest.mark.asyncio
 async def test_different_refs_can_run_concurrently(runtimes):
     first, second = runtimes
-    repository_id = 7_000_000 + (uuid4().int % 100_000)
+    repository_id = _repository_id()
     first_entered = asyncio.Event()
     second_entered = asyncio.Event()
     release = asyncio.Event()
@@ -131,7 +137,7 @@ async def test_different_refs_can_run_concurrently(runtimes):
 @pytest.mark.asyncio
 async def test_repository_cutover_blocks_ordinary_mutation(runtimes):
     first, second = runtimes
-    repository_id = 7_000_000 + (uuid4().int % 100_000)
+    repository_id = _repository_id()
     cutover_entered = asyncio.Event()
     mutation_entered = asyncio.Event()
     cutover_release = asyncio.Event()
@@ -174,7 +180,7 @@ async def test_repository_cutover_blocks_ordinary_mutation(runtimes):
 @pytest.mark.asyncio
 async def test_connection_death_releases_process_advisory_lock(runtimes):
     first, _second = runtimes
-    repository_id = 7_000_000 + (uuid4().int % 100_000)
+    repository_id = _repository_id()
     lock_key = f"khub-repository:v1:{repository_id}"
     connection = await psycopg.AsyncConnection.connect(
         _database_url(), autocommit=True
@@ -205,7 +211,7 @@ async def test_connection_death_releases_process_advisory_lock(runtimes):
 @pytest.mark.asyncio
 async def test_persisted_unresolved_intent_blocks_after_lock_loss(runtimes):
     first, _second = runtimes
-    repository_id = 7_000_000 + (uuid4().int % 100_000)
+    repository_id = _repository_id()
     ref = f"branch:main-{uuid4()}"
     lock_key = f"khub-repository-ref:v1:{repository_id}:{ref}"
     connection = await psycopg.AsyncConnection.connect(
