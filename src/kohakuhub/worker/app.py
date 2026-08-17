@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from procrastinate import App
@@ -123,17 +124,21 @@ def build_worker_apps(
         min_size=settings.pool_min_size,
         max_size=settings.work_pool_max_size,
     )
-    return (
-        build_worker_app(
-            settings,
-            connector=control_connector,
-            registry=registry,
-            include_periodic=True,
-        ),
-        build_worker_app(
-            settings,
-            connector=work_connector,
-            registry=registry,
-            include_periodic=False,
-        ),
+    limiter_owner = SimpleNamespace()
+    control_app = build_worker_app(
+        settings,
+        connector=control_connector,
+        registry=registry,
+        include_periodic=True,
     )
+    work_app = build_worker_app(
+        settings,
+        connector=work_connector,
+        registry=registry,
+        include_periodic=False,
+    )
+    # Both lanes belong to one worker process and therefore share its fence
+    # connection budget even though Procrastinate uses separate App objects.
+    control_app.khub_fence_limiter_owner = limiter_owner
+    work_app.khub_fence_limiter_owner = limiter_owner
+    return control_app, work_app

@@ -96,16 +96,19 @@ _FORBIDDEN_PAYLOAD_KEYS = {
     "token",
 }
 
-# A semaphore is bound to the event loop that first blocks on it.  Keeping it
-# only by database URL lets a closed test/ASGI loop poison the next lifecycle;
-# weak loop keys preserve the process-local budget without retaining old loops.
+# A semaphore is bound to the event loop that first blocks on it.  Keep the
+# default cache per loop, and let one application explicitly share a limiter
+# owner across its service instances (the worker uses this for both lanes).
 _FENCE_LIMITERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _fence_connection_limiter(
-    database_url: str, configured_limit: int | None = None
+    database_url: str,
+    configured_limit: int | None = None,
+    *,
+    limiter_owner: Any | None = None,
 ) -> asyncio.Semaphore:
-    """Bound dedicated advisory-lock connections for the current event loop."""
+    """Bound dedicated advisory-lock connections for one runtime owner."""
 
     limit = configured_limit
     if limit is None:
@@ -113,7 +116,14 @@ def _fence_connection_limiter(
     if limit < 1:
         raise ValueError("KOHAKU_HUB_FENCE_MAX_CONNECTIONS must be positive")
     loop = asyncio.get_running_loop()
-    loop_limiters = _FENCE_LIMITERS.setdefault(loop, {})
+    if limiter_owner is None:
+        loop_limiters = _FENCE_LIMITERS.setdefault(loop, {})
+    else:
+        owner_limiters = getattr(limiter_owner, "_khub_fence_limiters", None)
+        if owner_limiters is None:
+            owner_limiters = weakref.WeakKeyDictionary()
+            setattr(limiter_owner, "_khub_fence_limiters", owner_limiters)
+        loop_limiters = owner_limiters.setdefault(loop, {})
     current = loop_limiters.get(database_url)
     if current is None or current[0] != limit:
         current = (limit, asyncio.Semaphore(limit))
@@ -480,7 +490,9 @@ class OperationService:
         lock_ref = canonical_mutation_ref(ref)
         cutover = scope == "cutover" or lock_ref == "__repository__"
         limiter = _fence_connection_limiter(
-            self.database_url, self.fence_connection_limit
+            self.database_url,
+            self.fence_connection_limit,
+            limiter_owner=getattr(self.app, "khub_fence_limiter_owner", self.app),
         )
         await limiter.acquire()
         try:
@@ -600,7 +612,9 @@ class OperationService:
             raise RuntimeError("a dedicated PostgreSQL fence connection is required")
 
         limiter = _fence_connection_limiter(
-            self.database_url, self.fence_connection_limit
+            self.database_url,
+            self.fence_connection_limit,
+            limiter_owner=getattr(self.app, "khub_fence_limiter_owner", self.app),
         )
         await limiter.acquire()
         try:

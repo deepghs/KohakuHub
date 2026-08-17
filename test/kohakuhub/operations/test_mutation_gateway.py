@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,21 @@ async def _get_fence_limiter():
     )
 
 
+async def _get_owned_fence_limiters():
+    first_owner = SimpleNamespace()
+    second_owner = SimpleNamespace()
+    first = _fence_connection_limiter(
+        "postgresql://test", 2, limiter_owner=first_owner
+    )
+    first_again = _fence_connection_limiter(
+        "postgresql://test", 2, limiter_owner=first_owner
+    )
+    second = _fence_connection_limiter(
+        "postgresql://test", 2, limiter_owner=second_owner
+    )
+    return first, first_again, second
+
+
 def test_fence_limiter_is_not_reused_across_event_loops():
     first_loop, first, first_again = asyncio.run(_get_fence_limiter())
     second_loop, second, second_again = asyncio.run(_get_fence_limiter())
@@ -30,6 +46,13 @@ def test_fence_limiter_is_not_reused_across_event_loops():
     assert second is second_again
     assert first is not second
     assert first_loop is not second_loop
+
+
+def test_fence_limiter_is_shared_only_by_the_same_owner():
+    first, first_again, second = asyncio.run(_get_owned_fence_limiters())
+
+    assert first is first_again
+    assert first is not second
 
 
 @pytest.mark.asyncio

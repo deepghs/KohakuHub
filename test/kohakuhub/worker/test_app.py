@@ -36,3 +36,4 @@ def test_worker_apps_reserve_periodic_registry_for_control_lane():
     assert not work.periodic_registry.periodic_tasks
     assert "khub:operation:execute.v1" in control.tasks
     assert "khub:operation:execute.v1" in work.tasks
+    assert control.khub_fence_limiter_owner is work.khub_fence_limiter_owner
