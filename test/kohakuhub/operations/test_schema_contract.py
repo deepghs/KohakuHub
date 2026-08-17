@@ -79,12 +79,16 @@ class _OperationUpgradeConnection:
         normalized = " ".join(query.split())
         if "WHERE migration_name = 'khub-operation-kernel'" in normalized:
             return _Row(self.ledger["khub-operation-kernel"])
+        if "WHERE migration_name = %s" in normalized:
+            return _Row(self.ledger.get(params[0]))
+        if "information_schema.tables" in normalized:
+            return _Rows([])
+        if "information_schema.columns" in normalized:
+            return _Rows([])
         if normalized.startswith("INSERT INTO khub_schema_migrations"):
             name, version, checksum = params
             self.ledger.setdefault(name, (version, checksum))
             return _Row(None)
-        if "WHERE migration_name = %s" in normalized:
-            return _Row(self.ledger.get(params[0]))
         raise AssertionError(f"unexpected query: {query}")
 
     def cursor(self):

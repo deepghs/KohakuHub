@@ -34,7 +34,7 @@ def is_initialized(client: httpx.Client):
     except Exception as e:
         print(f"[startup] error calling GET {url}: {e}")
         return False
-    print(f"[startup] GET {url} responded {r.status_code} {r.text}")
+    print(f"[startup] GET {url} responded {r.status_code}")
     if r.status_code == 200:
         try:
             j = r.json()
@@ -53,20 +53,21 @@ def do_setup(client: httpx.Client):
     r = client.post(
         url, json=payload, headers={"accept": "application/json"}, timeout=10
     )
-    print(f"[startup] POST {url} responded {r.status_code} {r.text}")
+    print(f"[startup] POST {url} responded {r.status_code}")
     body = r.json()
     if r.status_code in (200, 201):
         return body["access_key_id"], body["secret_access_key"]
     else:
-        print("[startup] Setup failed:", r.status_code, r.text)
+        print("[startup] Setup failed with status:", r.status_code)
         sys.exit(1)
 
 
 def write_credentials(access_key, secret_key):
     CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CRED_FILE, "w") as f:
+    with open(CRED_FILE, "w", opener=lambda path, flags: os.open(path, flags, 0o600)) as f:
         f.write(f"KOHAKU_HUB_LAKEFS_ACCESS_KEY={access_key}\n")
         f.write(f"KOHAKU_HUB_LAKEFS_SECRET_KEY={secret_key}\n")
+    os.chmod(CRED_FILE, 0o600)
     print(f"[startup] Saved credentials to {CRED_FILE}")
 
 

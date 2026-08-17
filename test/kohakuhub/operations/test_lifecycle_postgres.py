@@ -35,8 +35,25 @@ def _database_url() -> str:
 @pytest.fixture
 async def runtime():
     from scripts.khub_migrate import migrate
+    import psycopg
 
     migrate()
+    # The worker CI job intentionally starts from a fresh schema.  Seed only
+    # the minimal durable-test owner/repository so lifecycle tests do not
+    # depend on the full application fixture or an unrelated test order.
+    with psycopg.connect(_database_url()) as connection:
+        connection.execute(
+            """INSERT INTO \"user\" (id, username, normalized_name, public_used_bytes)
+               VALUES (1, 'owner', 'owner', 0)
+               ON CONFLICT (id) DO NOTHING"""
+        )
+        connection.execute(
+            """INSERT INTO repository
+                   (id, repo_type, namespace, name, full_id, owner_id, private, used_bytes)
+               VALUES (1, 'model', 'owner', 'quota-test', 'owner/quota-test', 1, FALSE, 0)
+               ON CONFLICT (id) DO NOTHING"""
+        )
+        connection.commit()
     value = await OperationRuntime.open(_database_url())
     try:
         yield value

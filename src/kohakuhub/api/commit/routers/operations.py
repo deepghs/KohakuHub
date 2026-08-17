@@ -148,6 +148,26 @@ async def _estimate_commit_quota_delta(
     the LakeFS stat call supplies the missing size before any mutation.
     """
 
+    # Applying two mutations to the same path (or a file and one of its
+    # parent folders) against one pre-commit snapshot makes subtraction
+    # order-dependent and can under/over-count quota.  Reject the ambiguous
+    # request before staging; callers can retry with a canonical operation set.
+    seen_paths: set[str] = set()
+    normalized_paths: list[tuple[str, str]] = []
+    for operation in operations:
+        path = str(operation.get("value", {}).get("path", "")).strip("/")
+        if not path:
+            continue
+        key = operation.get("key", "")
+        normalized_paths.append((path, key))
+        if path in seen_paths:
+            raise ValueError("commit contains overlapping mutations")
+        seen_paths.add(path)
+    for path, _key in normalized_paths:
+        prefix = path + "/"
+        if any(other != path and (other.startswith(prefix) or path.startswith(other + "/")) for other, _ in normalized_paths):
+            raise ValueError("commit contains overlapping file and folder mutations")
+
     delta = 0
 
     def subtract_current(path: str) -> None:
@@ -1082,6 +1102,11 @@ async def _commit_unlocked(
             quota_delta = await _estimate_commit_quota_delta(
                 repo_row, operations, client, lakefs_repo
             )
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                detail={"error": "invalid_commit_operations", "detail": str(exc)},
+            ) from exc
         except Exception as exc:
             raise HTTPException(
                 503,
@@ -1276,8 +1301,12 @@ async def _commit_unlocked(
         try:
             branch = await client.get_branch(repository=lakefs_repo, branch=revision)
             commit_id = branch["commit_id"]
-        except Exception:
-            commit_id = "no-changes"
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                detail={"error": "commit_head_unavailable"},
+                headers={"Retry-After": "30"},
+            ) from exc
 
         commit_url = f"{build_public_repo_path(repo_type, repo_id)}/commit/{commit_id}"
 

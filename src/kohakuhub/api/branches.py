@@ -808,8 +808,6 @@ async def merge_branches(
     # Check if user has write permission
     check_repo_write_permission(repo_row, user)
 
-    _reject_legacy_dangerous_path(request, "reset")
-
     if not _mutation_fence_active.get():
         return await _run_fenced_mutation(
             request,
@@ -963,6 +961,11 @@ async def reset_branch(
 
     # Check if user has write permission
     check_repo_write_permission(repo_row, user)
+
+    # Reset is not enabled as a durable consumer yet.  Even when an operator
+    # accidentally enables the legacy flag, production must not run the old
+    # synchronous destructive path.
+    _reject_legacy_dangerous_path(request, "reset")
 
     # Prevent resetting main branch without force (safety measure)
     if branch == "main" and not payload.force:

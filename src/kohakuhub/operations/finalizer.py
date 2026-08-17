@@ -61,47 +61,53 @@ async def finalize_commit_domain(
     )
 
     mutations: Sequence[Mapping[str, Any]] = payload.get("file_mutations", [])
-    for mutation in mutations:
-        path = str(mutation["path"])
-        action = mutation.get("action", "upsert")
-        if action == "delete":
+    # ``file`` and the quota counters are the current-main projection.  A
+    # feature branch commit is still recorded in ``commit`` but must not
+    # overwrite main's file view or billing totals.
+    if str(payload["branch"]) == "main":
+        for mutation in mutations:
+            path = str(mutation["path"])
+            action = mutation.get("action", "upsert")
+            if action == "delete":
+                await connection.execute(
+                    """UPDATE file
+                       SET is_deleted = TRUE, updated_at = CURRENT_TIMESTAMP
+                       WHERE repository_id = %s AND path_in_repo = %s""",
+                    (repository_id, path),
+                )
+                continue
+            if action != "upsert":
+                raise ValueError(f"unsupported commit file mutation: {action}")
             await connection.execute(
-                """UPDATE file
-                   SET is_deleted = TRUE, updated_at = CURRENT_TIMESTAMP
-                   WHERE repository_id = %s AND path_in_repo = %s""",
-                (repository_id, path),
+                """
+                INSERT INTO file
+                    (repository_id, path_in_repo, size, sha256, lfs, is_deleted,
+                     owner_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, FALSE, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (repository_id, path_in_repo) DO UPDATE SET
+                    size = EXCLUDED.size,
+                    sha256 = EXCLUDED.sha256,
+                    lfs = EXCLUDED.lfs,
+                    is_deleted = FALSE,
+                    owner_id = EXCLUDED.owner_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    repository_id,
+                    path,
+                    int(mutation["size"]),
+                    str(mutation["sha256"]),
+                    bool(mutation["lfs"]),
+                    owner_id,
+                ),
             )
-            continue
-        if action != "upsert":
-            raise ValueError(f"unsupported commit file mutation: {action}")
-        await connection.execute(
-            """
-            INSERT INTO file
-                (repository_id, path_in_repo, size, sha256, lfs, is_deleted,
-                 owner_id, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, FALSE, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT (repository_id, path_in_repo) DO UPDATE SET
-                size = EXCLUDED.size,
-                sha256 = EXCLUDED.sha256,
-                lfs = EXCLUDED.lfs,
-                is_deleted = FALSE,
-                owner_id = EXCLUDED.owner_id,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (
-                repository_id,
-                path,
-                int(mutation["size"]),
-                str(mutation["sha256"]),
-                bool(mutation["lfs"]),
-                owner_id,
-            ),
-        )
 
     # Keep the denormalized counters current at the same commit boundary as
     # the authoritative Commit/File rows. Replaying finalization is guarded by
     # the intent state transition, so this delta is applied at most once.
     quota_delta = int(payload.get("quota_delta", 0) or 0)
+    if str(payload["branch"]) != "main":
+        quota_delta = 0
     if quota_delta:
         is_private = bool(payload.get("is_private", False))
         await connection.execute(

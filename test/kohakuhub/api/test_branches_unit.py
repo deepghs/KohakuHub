@@ -582,3 +582,35 @@ async def test_reset_branch_covers_guardrails_recoverability_success_and_failure
             "model", "owner", "repo", "feature", branches_api.ResetPayload(ref="abc", force=True), user=user
         )
     assert generic_error.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_reset_production_path_fails_closed_even_when_flag_is_enabled(monkeypatch):
+    monkeypatch.setattr(branches_api.cfg.app, "db_backend", "postgres")
+    monkeypatch.setattr(branches_api.cfg.app, "enable_reset_operations", True)
+    repo = SimpleNamespace(id=1, repo_type="model", full_id="owner/repo")
+    user = SimpleNamespace(username="owner")
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(operation_runtime=object()))
+    )
+    monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
+    monkeypatch.setattr(
+        branches_api, "check_repo_write_permission", lambda *_args: None
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await branches_api.reset_branch(
+            "model",
+            "owner",
+            "repo",
+            "feature",
+            branches_api.ResetPayload(ref="abc", force=True),
+            user=user,
+            request=request,
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.detail == {
+        "error": "durable_operation_not_available",
+        "operation": "reset",
+    }

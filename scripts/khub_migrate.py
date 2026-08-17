@@ -132,7 +132,10 @@ def _assert_recorded_checksum(
         (name,),
     ).fetchone()
     if row is None:
-        return
+        raise RuntimeError(
+            f"missing immutable migration ledger record for {name}; "
+            "refusing to infer schema history"
+        )
     if row[1] != expected_checksum:
         raise RuntimeError(
             f"schema checksum mismatch for {name}: "
@@ -208,11 +211,76 @@ def _apply_procrastinate_schema(connection: psycopg.Connection) -> None:
 
 
 def _apply_operation_schema(connection: psycopg.Connection) -> None:
+    current_name = f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}"
     legacy = connection.execute(
         """SELECT version, checksum
            FROM khub_schema_migrations
            WHERE migration_name = 'khub-operation-kernel'"""
     ).fetchone()
+    current = connection.execute(
+        """SELECT version, checksum
+           FROM khub_schema_migrations
+           WHERE migration_name = %s""",
+        (current_name,),
+    ).fetchone()
+
+    # Once any operation table exists, the table shape must be a known
+    # released shape before the migration SQL is allowed to run.  This keeps
+    # ``ADD COLUMN IF NOT EXISTS`` from turning an unknown partial schema into
+    # something that merely looks current after a failed deployment.
+    table_rows = connection.execute(
+        """SELECT table_name
+           FROM information_schema.tables
+           WHERE table_schema = 'public'
+             AND table_name LIKE 'khub_%'"""
+    ).fetchall()
+    operation_tables = {
+        row[0]
+        for row in table_rows
+        if row[0]
+        in {
+            "khub_repository_operations",
+            "khub_operation_steps",
+            "khub_commit_intents",
+            "khub_quota_reservations",
+        }
+    }
+    if operation_tables:
+        recorded = current or legacy
+        if recorded is None:
+            raise RuntimeError(
+                "operation tables exist without a known migration ledger record; "
+                "refusing to run operation DDL"
+            )
+        expected = operation_table_columns_for_version(int(recorded[0]))
+        expected_tables = set(expected)
+        if operation_tables != expected_tables:
+            raise RuntimeError(
+                "operation schema tables do not match recorded version: "
+                f"actual={sorted(operation_tables)} expected={sorted(expected_tables)}"
+            )
+        column_rows = connection.execute(
+            """SELECT table_name, column_name
+               FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = ANY(%s)""",
+            (sorted(expected_tables),),
+        ).fetchall()
+        actual_columns: dict[str, set[str]] = {}
+        for table, column in column_rows:
+            actual_columns.setdefault(table, set()).add(column)
+        column_diff = {
+            table: {
+                "missing": sorted(set(columns) - actual_columns.get(table, set())),
+                "extra": sorted(actual_columns.get(table, set()) - set(columns)),
+            }
+            for table, columns in expected.items()
+            if set(columns) != actual_columns.get(table, set())
+        }
+        if column_diff:
+            raise RuntimeError(
+                "operation schema columns do not match recorded version; "
+                f"refusing DDL: {column_diff}"
+            )
     if legacy is not None:
         expected_legacy = _historical_operation_schema_checksum(int(legacy[0]))
         if legacy[1] != expected_legacy:
@@ -224,7 +292,7 @@ def _apply_operation_schema(connection: psycopg.Connection) -> None:
         cursor.execute(OPERATION_SCHEMA_SQL)
     _record(
         connection,
-        f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}",
+        current_name,
         OPERATION_SCHEMA_VERSION,
         _schema_checksum(),
     )
