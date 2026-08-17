@@ -413,6 +413,17 @@ def generate_hub_api_service(config: dict) -> str:
       - KOHAKU_HUB_DEFAULT_ORG_PUBLIC_QUOTA_BYTES=100_000_000{garage_config_section}
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:48888/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 12
 {networks_str}"""
 
 
