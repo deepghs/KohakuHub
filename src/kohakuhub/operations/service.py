@@ -6,6 +6,7 @@ import hashlib
 import json
 import asyncio
 import os
+import weakref
 from contextlib import asynccontextmanager
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -95,23 +96,28 @@ _FORBIDDEN_PAYLOAD_KEYS = {
     "token",
 }
 
-_FENCE_LIMITERS: dict[str, tuple[int, asyncio.Semaphore]] = {}
+# A semaphore is bound to the event loop that first blocks on it.  Keeping it
+# only by database URL lets a closed test/ASGI loop poison the next lifecycle;
+# weak loop keys preserve the process-local budget without retaining old loops.
+_FENCE_LIMITERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _fence_connection_limiter(
     database_url: str, configured_limit: int | None = None
 ) -> asyncio.Semaphore:
-    """Bound dedicated advisory-lock connections per API/worker process."""
+    """Bound dedicated advisory-lock connections for the current event loop."""
 
     limit = configured_limit
     if limit is None:
         limit = int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4"))
     if limit < 1:
         raise ValueError("KOHAKU_HUB_FENCE_MAX_CONNECTIONS must be positive")
-    current = _FENCE_LIMITERS.get(database_url)
+    loop = asyncio.get_running_loop()
+    loop_limiters = _FENCE_LIMITERS.setdefault(loop, {})
+    current = loop_limiters.get(database_url)
     if current is None or current[0] != limit:
         current = (limit, asyncio.Semaphore(limit))
-        _FENCE_LIMITERS[database_url] = current
+        loop_limiters[database_url] = current
     return current[1]
 
 
