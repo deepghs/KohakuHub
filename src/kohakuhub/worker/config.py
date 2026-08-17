@@ -40,6 +40,14 @@ class WorkerSettings:
     polling_interval_seconds: float = 5.0
     heartbeat_interval_seconds: float = 10.0
     stalled_worker_timeout_seconds: float = 30.0
+    operation_retention_hours: int = 168
+    operation_retention_batch_size: int = 100
+    api_processes: int = 4
+    api_pool_max_size: int = 4
+    api_fence_max_connections: int = 4
+    worker_fence_max_connections: int = 4
+    listener_connections: int = 2
+    migration_admin_connections: int = 2
     metrics_host: str = "0.0.0.0"
     metrics_port: int = 0
 
@@ -86,6 +94,28 @@ class WorkerSettings:
             stalled_worker_timeout_seconds=_positive_float(
                 "KOHAKU_HUB_WORKER_STALLED_SECONDS", 30.0
             ),
+            operation_retention_hours=_positive_int(
+                "KOHAKU_HUB_OPERATION_RETENTION_HOURS", 168
+            ),
+            operation_retention_batch_size=_positive_int(
+                "KOHAKU_HUB_OPERATION_RETENTION_BATCH", 100
+            ),
+            api_processes=_positive_int("KOHAKU_HUB_WORKERS", 4),
+            api_pool_max_size=_positive_int("KOHAKU_HUB_OPERATION_POOL_MAX", 4),
+            api_fence_max_connections=_positive_int(
+                "KOHAKU_HUB_API_FENCE_MAX_CONNECTIONS",
+                int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4")),
+            ),
+            worker_fence_max_connections=_positive_int(
+                "KOHAKU_HUB_WORKER_FENCE_MAX_CONNECTIONS",
+                int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4")),
+            ),
+            listener_connections=_positive_int(
+                "KOHAKU_HUB_WORKER_LISTENER_CONNECTIONS", 2
+            ),
+            migration_admin_connections=_positive_int(
+                "KOHAKU_HUB_MIGRATION_ADMIN_CONNECTIONS", 2
+            ),
             metrics_host=os.getenv("KOHAKU_HUB_WORKER_METRICS_HOST", "0.0.0.0"),
             metrics_port=_nonnegative_int("KOHAKU_HUB_WORKER_METRICS_PORT", 0),
         )
@@ -95,11 +125,26 @@ class WorkerSettings:
             raise ValueError("control worker pool max size must be >= min size")
         if settings.work_pool_max_size < settings.pool_min_size:
             raise ValueError("work worker pool max size must be >= min size")
+        if settings.api_pool_max_size < 1:
+            raise ValueError("API operation pool max size must be positive")
         if settings.control_pool_max_size + settings.work_pool_max_size > settings.pool_max_size:
             raise ValueError(
                 "control and work worker pool max sizes exceed aggregate pool max size"
             )
         return settings
+
+    @property
+    def configured_connection_budget(self) -> int:
+        """Upper bound for the whole deployment sharing this PostgreSQL."""
+
+        return (
+            self.api_processes * (self.api_pool_max_size + self.api_fence_max_connections)
+            + self.control_pool_max_size
+            + self.work_pool_max_size
+            + self.worker_fence_max_connections
+            + self.listener_connections
+            + self.migration_admin_connections
+        )
 
 
 def _positive_int(name: str, default: int) -> int:

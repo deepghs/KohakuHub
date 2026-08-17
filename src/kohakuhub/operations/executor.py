@@ -10,7 +10,7 @@ from uuid import UUID
 
 from .registry import DEFAULT_REGISTRY, OperationRegistry
 from .store import OperationStore
-from .types import RetryableOperationError, StepResult
+from .types import RetryableOperationError, StepResult, operation_max_attempts
 from .metrics import OPERATION_DELIVERIES, OPERATION_FAILURES
 from .service import OperationService
 
@@ -186,7 +186,7 @@ async def execute_operation_step(
             if result is None:
                 return
     except RetryableOperationError as exc:
-        max_attempts = int(os.getenv("KOHAKU_HUB_OPERATION_MAX_RETRIES", "3"))
+        max_attempts = operation_max_attempts()
         if spec.external_side_effect and not spec.replay_safe_after_dispatch:
             # Once an external boundary was crossed, a generic retry could
             # duplicate a mutation.  Keep the operation observable instead;
@@ -212,6 +212,7 @@ async def execute_operation_step(
                         operation_uuid,
                         error_code=exc.error_code,
                         error_summary=exc.error_summary,
+                        max_attempts=max_attempts,
                     )
             OPERATION_FAILURES.labels(kind=operation.kind, code=exc.error_code).inc()
             if not requeued:

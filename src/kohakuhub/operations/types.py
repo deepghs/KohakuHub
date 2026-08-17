@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import os
 from typing import Any, Literal
 from uuid import UUID
 
@@ -21,6 +22,15 @@ class RetryableOperationError(Exception):
         super().__init__(message)
         self.error_code = error_code
         self.error_summary = error_summary or message
+
+
+def operation_max_attempts() -> int:
+    """Return the process-wide durable attempt budget for one step."""
+
+    value = int(os.getenv("KOHAKU_HUB_OPERATION_MAX_RETRIES", "3"))
+    if value < 1:
+        raise ValueError("KOHAKU_HUB_OPERATION_MAX_RETRIES must be positive")
+    return value
 
 
 OperationState = Literal[

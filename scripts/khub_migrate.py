@@ -13,6 +13,9 @@ from procrastinate.schema import SchemaManager
 
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
+# ``khub_migrate.py`` is also imported directly by migration tests.  Keep the
+# sibling legacy runner import valid in both invocation modes.
+sys.path.insert(0, str(SCRIPT_DIR))
 
 from kohakuhub.config import cfg
 from kohakuhub.migrations.schema import (

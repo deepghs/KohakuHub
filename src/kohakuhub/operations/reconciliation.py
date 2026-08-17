@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import time
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from kohakuhub.utils.lakefs import get_lakefs_client
 
 from .metrics import (
+    OPERATION_BACKLOG,
     OPERATION_JOBS_REPAIRED,
+    OPERATION_RETENTION_BACKLOG,
+    OPERATION_RETENTION_PRUNED,
     OPERATION_STALLED,
     OPERATION_UNCERTAIN,
+    QUEUE_DEPTH,
+    QUEUE_OLDEST_AGE_SECONDS,
+    RECONCILIATION_BACKLOG,
     RECONCILIATION_DURATION,
     RECONCILIATION_LAG_SECONDS,
     RECONCILIATION_RUNS,
@@ -22,10 +28,122 @@ from .registry import DEFAULT_REGISTRY, OperationRegistry
 from .service import OperationService
 from .store import OperationStore
 from .handlers import finalize_revert_commit
+from .types import operation_max_attempts
 
 NO_EFFECT_CURSOR = "__khub_observation_no_effect__"
 AMBIGUOUS_MARKER_CURSOR = "__khub_observation_ambiguous_marker__"
 OBSERVATION_CURSOR_PREFIX = "__khub_observation_cursor_v1__:"
+KNOWN_WORKER_QUEUES = ("control-v1", "sync-v1", "bulk-v1", "cleanup-v1")
+
+
+async def _recover_stalled_deliveries(
+    app: Any, *, seconds_since_heartbeat: float, limit: int
+) -> set[int]:
+    """Return stalled Procrastinate deliveries to ``todo`` before ledger repair.
+
+    Procrastinate intentionally leaves a job in ``doing`` when its worker
+    process disappears.  Its supported stalled-job query also covers the
+    post-worker-prune case where ``worker_id`` has become NULL.  Requeue the
+    bounded batch first; the ledger pass below then decides whether the step
+    may retry or must enter observation.
+    """
+
+    manager = getattr(app, "job_manager", None)
+    get_stalled = getattr(manager, "get_stalled_jobs", None)
+    retry_job = getattr(manager, "retry_job_by_id_async", None)
+    if get_stalled is None or retry_job is None:
+        return set()
+
+    stalled = await get_stalled(seconds_since_heartbeat=seconds_since_heartbeat)
+    recovered: set[int] = set()
+    for job in list(stalled)[:limit]:
+        job_id = int(job.id)
+        try:
+            await retry_job(job_id, retry_at=datetime.now(timezone.utc))
+        except Exception:
+            # Another worker/reconciler may have changed the delivery first.
+            # The durable ledger query remains authoritative on the next pass.
+            continue
+        recovered.add(job_id)
+    return recovered
+
+
+async def _observe_runtime_metrics(
+    connection: Any, *, retention_hours: int
+) -> None:
+    """Publish bounded control-plane gauges from the durable PostgreSQL state."""
+
+    for state in (
+        "accepted",
+        "running",
+        "cancel_requested",
+        "dispatch_started",
+        "uncertain",
+        "cleanup_pending",
+    ):
+        OPERATION_BACKLOG.labels(state=state).set(0)
+    for queue in KNOWN_WORKER_QUEUES:
+        for status in ("todo", "doing"):
+            QUEUE_DEPTH.labels(queue=queue, status=status).set(0)
+        QUEUE_OLDEST_AGE_SECONDS.labels(queue=queue).set(0)
+
+    rows = await connection.execute(
+        """SELECT queue_name, status, count(*)
+           FROM procrastinate_jobs
+           WHERE status IN ('todo', 'doing')
+           GROUP BY queue_name, status"""
+    )
+    for queue, status, depth in await rows.fetchall():
+        QUEUE_DEPTH.labels(queue=str(queue), status=str(status)).set(float(depth))
+
+    rows = await connection.execute(
+        """SELECT j.queue_name,
+                  COALESCE(
+                      EXTRACT(EPOCH FROM (
+                          CURRENT_TIMESTAMP - MAX(
+                              CASE
+                                  WHEN e.type IN ('deferred', 'deferred_for_retry', 'started')
+                                  THEN e.at
+                              END
+                          )
+                      )),
+                      0
+                  )
+           FROM procrastinate_jobs j
+           LEFT JOIN procrastinate_events e ON e.job_id = j.id
+           WHERE j.status IN ('todo', 'doing')
+           GROUP BY j.queue_name"""
+    )
+    for queue, age in await rows.fetchall():
+        QUEUE_OLDEST_AGE_SECONDS.labels(queue=str(queue)).set(max(0.0, float(age or 0)))
+
+    rows = await connection.execute(
+        """SELECT state, count(*)
+           FROM khub_repository_operations
+           WHERE state NOT IN ('succeeded', 'failed', 'cancelled')
+           GROUP BY state"""
+    )
+    for state, count in await rows.fetchall():
+        OPERATION_BACKLOG.labels(state=str(state)).set(float(count))
+
+    rows = await connection.execute(
+        """SELECT count(*)
+           FROM khub_repository_operations
+           WHERE state IN ('uncertain', 'dispatch_started')"""
+    )
+    backlog = await rows.fetchone()
+    RECONCILIATION_BACKLOG.set(float(backlog[0] or 0))
+
+    rows = await connection.execute(
+        """SELECT count(*)
+           FROM khub_repository_operations
+           WHERE state IN ('succeeded', 'failed', 'cancelled')
+             AND finished_at IS NOT NULL
+             AND finished_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 hour')""",
+        (retention_hours,),
+    )
+    retention_backlog = await rows.fetchone()
+    OPERATION_RETENTION_BACKLOG.set(float(retention_backlog[0] or 0))
 
 
 def _decode_observation_cursor(value: str | None) -> tuple[str | None, set[str]]:
@@ -466,6 +584,8 @@ async def reconcile_once(
     registry: OperationRegistry = DEFAULT_REGISTRY,
     limit: int = 100,
     database_url: str | None = None,
+    retention_hours: int = 168,
+    retention_batch_size: int = 100,
 ) -> int:
     """Repair durable operation gaps without blindly replaying side effects."""
 
@@ -478,7 +598,22 @@ async def reconcile_once(
         database_url=database_url,
     )
     store = OperationStore(pool)
+    max_attempts = operation_max_attempts()
+    stalled_timeout_seconds = float(
+        getattr(app, "khub_stalled_worker_timeout_seconds", 30.0)
+    )
+    if stalled_timeout_seconds <= 0:
+        raise ValueError("stalled worker timeout must be positive")
+    if retention_hours < 1:
+        raise ValueError("retention_hours must be positive")
+    if retention_batch_size < 1:
+        raise ValueError("retention_batch_size must be positive")
     try:
+        await _recover_stalled_deliveries(
+            app,
+            seconds_since_heartbeat=stalled_timeout_seconds,
+            limit=limit,
+        )
         async with pool.connection() as connection:
             async with connection.transaction():
                 locked = await connection.execute(
@@ -606,7 +741,8 @@ async def reconcile_once(
                        FROM khub_repository_operations o
                        JOIN khub_operation_steps s ON s.operation_id = o.id
                        WHERE s.state IN ('running', 'observing', 'dispatch_started')
-                         AND s.heartbeat_at < CURRENT_TIMESTAMP - INTERVAL '30 seconds'
+                         AND s.heartbeat_at < CURRENT_TIMESTAMP
+                             - (%s * INTERVAL '1 second')
                          AND (
                                s.procrastinate_job_id IS NULL
                                OR NOT EXISTS (
@@ -617,7 +753,7 @@ async def reconcile_once(
                                )
                          )
                        LIMIT %s FOR UPDATE SKIP LOCKED""",
-                    (limit,),
+                    (stalled_timeout_seconds, limit),
                 )
                 stale_rows = await cursor.fetchall()
                 for operation_id, kind, step_id, external_marker in stale_rows:
@@ -628,11 +764,17 @@ async def reconcile_once(
                         )
                     elif external_marker:
                         await store.requeue_stalled_external_step(
-                            connection, step_id, operation_id
+                            connection,
+                            step_id,
+                            operation_id,
+                            max_attempts=max_attempts,
                         )
                     else:
                         await store.requeue_stalled_step(
-                            connection, step_id, operation_id
+                            connection,
+                            step_id,
+                            operation_id,
+                            max_attempts=max_attempts,
                         )
                     OPERATION_STALLED.labels(kind=kind).inc()
 
@@ -662,19 +804,42 @@ async def reconcile_once(
                     )
 
         async with pool.connection() as connection:
-            row = await connection.execute(
-                """SELECT COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - MIN(updated_at))), 0)
-                   FROM khub_repository_operations
-                   WHERE state IN ('uncertain', 'dispatch_started')"""
-            )
-            lag = await row.fetchone()
-            RECONCILIATION_LAG_SECONDS.set(float(lag[0] or 0))
-            row = await connection.execute(
-                """SELECT count(*) FROM khub_repository_operations
-                   WHERE state IN ('uncertain', 'dispatch_started')"""
-            )
-            uncertain = await row.fetchone()
-            OPERATION_UNCERTAIN.set(float(uncertain[0] or 0))
+            async with connection.transaction():
+                row = await connection.execute(
+                    """SELECT COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - MIN(updated_at))), 0)
+                       FROM khub_repository_operations
+                       WHERE state IN ('uncertain', 'dispatch_started')"""
+                )
+                lag = await row.fetchone()
+                RECONCILIATION_LAG_SECONDS.set(float(lag[0] or 0))
+                row = await connection.execute(
+                    """SELECT count(*) FROM khub_repository_operations
+                       WHERE state IN ('uncertain', 'dispatch_started')"""
+                )
+                uncertain = await row.fetchone()
+                OPERATION_UNCERTAIN.set(float(uncertain[0] or 0))
+                deleted_operations, _deleted_jobs = (
+                    await store.prune_terminal_history(
+                        connection,
+                        cutoff=datetime.now(timezone.utc)
+                        - timedelta(hours=retention_hours),
+                        limit=retention_batch_size,
+                    )
+                )
+                if deleted_operations:
+                    OPERATION_RETENTION_PRUNED.inc(deleted_operations)
+                await _observe_runtime_metrics(
+                    connection, retention_hours=retention_hours
+                )
+
+                deleted_unlinked_jobs = await store.prune_unlinked_terminal_jobs(
+                    connection,
+                    cutoff=datetime.now(timezone.utc)
+                    - timedelta(hours=retention_hours),
+                    limit=retention_batch_size,
+                )
+                if deleted_unlinked_jobs:
+                    OPERATION_RETENTION_PRUNED.inc(deleted_unlinked_jobs)
         RECONCILIATION_RUNS.labels(result="ok").inc()
         return repaired
     except Exception:

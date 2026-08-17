@@ -42,15 +42,35 @@ async def runtime():
     # the minimal durable-test owner/repository so lifecycle tests do not
     # depend on the full application fixture or an unrelated test order.
     with psycopg.connect(_database_url()) as connection:
+        # Each test can install a private operation registry.  Remove all
+        # durable operation/job rows before the next test so reconciliation
+        # cannot inspect a kind that is not registered by the current runtime.
         connection.execute(
-            """INSERT INTO \"user\" (id, username, normalized_name, public_used_bytes)
-               VALUES (1, 'owner', 'owner', 0)
+            """TRUNCATE TABLE
+                   khub_commit_intents,
+                   khub_quota_reservations,
+                   khub_operation_steps,
+                   khub_repository_operations,
+                   procrastinate_events,
+                   procrastinate_periodic_defers,
+                   procrastinate_jobs,
+                   procrastinate_workers
+               RESTART IDENTITY CASCADE"""
+        )
+        connection.execute(
+            """INSERT INTO \"user\"
+                   (id, username, normalized_name, is_org, email_verified,
+                    is_active, private_used_bytes, public_used_bytes, created_at)
+               VALUES (1, 'owner', 'owner', FALSE, FALSE,
+                       TRUE, 0, 0, CURRENT_TIMESTAMP)
                ON CONFLICT (id) DO NOTHING"""
         )
         connection.execute(
             """INSERT INTO repository
-                   (id, repo_type, namespace, name, full_id, owner_id, private, used_bytes)
-               VALUES (1, 'model', 'owner', 'quota-test', 'owner/quota-test', 1, FALSE, 0)
+                   (id, repo_type, namespace, name, full_id, owner_id, private,
+                    used_bytes, downloads, likes_count, created_at)
+               VALUES (1, 'model', 'owner', 'quota-test', 'owner/quota-test', 1,
+                       FALSE, 0, 0, 0, CURRENT_TIMESTAMP)
                ON CONFLICT (id) DO NOTHING"""
         )
         connection.commit()
@@ -107,6 +127,182 @@ async def test_accept_is_idempotent_and_real_worker_delivers(runtime):
     finally:
         worker.stop()
         await asyncio.wait_for(worker_task, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_retention_prunes_only_safe_terminal_history(runtime):
+    """Retention must never remove recovery state or a live delivery."""
+
+    operations = []
+    worker = Worker(
+        runtime.app,
+        queues=["control-v1"],
+        name=f"retention-worker-{uuid4()}",
+        concurrency=1,
+        wait=True,
+        install_signal_handlers=False,
+        fetch_job_polling_interval=0.05,
+        abort_job_polling_interval=0.05,
+        update_heartbeat_interval=0.1,
+        stalled_worker_timeout=2,
+    )
+    worker_task = asyncio.create_task(worker.run())
+
+    async def accepted(tag: str):
+        operation = await runtime.service.accept(
+            kind="maintenance.noop.v1",
+            resource_key=f"retention:{tag}:{uuid4()}",
+            payload={},
+            requested_by_user_id=None,
+            trigger="system",
+        )
+        operations.append(operation)
+        return operation
+
+    try:
+        prunable = await accepted("prunable")
+        uncertain = await accepted("uncertain")
+        live_job = await accepted("live-job")
+        unresolved_intent = await accepted("unresolved-intent")
+        young = await accepted("young")
+
+        for operation in (prunable, uncertain, live_job, unresolved_intent, young):
+            for _ in range(150):
+                current = await runtime.service.get(operation.id)
+                if current is not None and current.state == "succeeded":
+                    break
+                await asyncio.sleep(0.05)
+            current = await runtime.service.get(operation.id)
+            assert current is not None and current.state == "succeeded"
+
+        # A non-terminal delivery must remain visible to the reaper. Stop the
+        # worker before changing the job back to todo so it cannot consume the
+        # intentionally live row during the retention pass.
+        worker.stop()
+        await asyncio.wait_for(worker_task, timeout=5)
+        worker_task = None
+
+        async with runtime.pool.connection() as connection:
+            steps = {}
+            for operation in operations:
+                steps[operation.id] = await runtime.service.store.get_step_for_operation(
+                    connection, operation.id, 0
+                )
+            assert all(step is not None for step in steps.values())
+            prunable_job_id = steps[prunable.id].procrastinate_job_id
+            live_job_id = steps[live_job.id].procrastinate_job_id
+            assert prunable_job_id is not None and live_job_id is not None
+
+            async with connection.transaction():
+                await connection.execute(
+                    """UPDATE khub_repository_operations
+                       SET created_at = CURRENT_TIMESTAMP - INTERVAL '8 days',
+                           updated_at = CURRENT_TIMESTAMP - INTERVAL '8 days',
+                           finished_at = CURRENT_TIMESTAMP - INTERVAL '8 days'
+                       WHERE id IN (%s, %s, %s, %s)""",
+                    (prunable.id, uncertain.id, live_job.id, unresolved_intent.id),
+                )
+                await connection.execute(
+                    """UPDATE khub_operation_steps
+                       SET created_at = CURRENT_TIMESTAMP - INTERVAL '8 days',
+                           updated_at = CURRENT_TIMESTAMP - INTERVAL '8 days',
+                           finished_at = CURRENT_TIMESTAMP - INTERVAL '8 days'
+                       WHERE operation_id IN (%s, %s, %s, %s)""",
+                    (prunable.id, uncertain.id, live_job.id, unresolved_intent.id),
+                )
+                await connection.execute(
+                    """UPDATE khub_repository_operations
+                       SET state = 'uncertain', finished_at = NULL
+                       WHERE id = %s""",
+                    (uncertain.id,),
+                )
+                await connection.execute(
+                    """UPDATE khub_operation_steps
+                       SET state = 'uncertain', finished_at = NULL
+                       WHERE operation_id = %s""",
+                    (uncertain.id,),
+                )
+                await connection.execute(
+                    """UPDATE procrastinate_jobs
+                       SET status = 'todo'
+                       WHERE id = %s""",
+                    (live_job_id,),
+                )
+                intent_id = uuid4()
+                await connection.execute(
+                    """INSERT INTO khub_commit_intents
+                           (id, operation_id, repository_id, ref, base_head,
+                            marker, payload_hash, payload_json, state,
+                            observe_not_before)
+                       VALUES (%s, %s, 1, 'main', 'base-head', %s, %s,
+                               '{}'::jsonb, 'uncertain',
+                               CURRENT_TIMESTAMP + INTERVAL '1 day')""",
+                    (
+                        intent_id,
+                        unresolved_intent.id,
+                        f"khub:v1:{uuid4().hex}",
+                        "0" * 64,
+                    ),
+                )
+
+            step_cursor = await connection.execute(
+                "SELECT procrastinate_job_id FROM khub_operation_steps WHERE operation_id = %s",
+                (prunable.id,),
+            )
+            prunable_job_id = (await step_cursor.fetchone())[0]
+            event_cursor = await connection.execute(
+                "SELECT count(*) FROM procrastinate_events WHERE job_id = %s",
+                (prunable_job_id,),
+            )
+            assert (await event_cursor.fetchone())[0] > 0
+
+        await reconcile_once(
+            runtime.pool,
+            runtime.app,
+            retention_hours=1,
+            retention_batch_size=20,
+        )
+
+        assert await runtime.service.get(prunable.id) is None
+        assert await runtime.service.get(uncertain.id) is not None
+        assert await runtime.service.get(live_job.id) is not None
+        assert await runtime.service.get(unresolved_intent.id) is not None
+        assert await runtime.service.get(young.id) is not None
+
+        async with runtime.pool.connection() as connection:
+            row = await connection.execute(
+                "SELECT count(*) FROM khub_operation_steps WHERE operation_id = %s",
+                (prunable.id,),
+            )
+            assert (await row.fetchone())[0] == 0
+            row = await connection.execute(
+                "SELECT count(*) FROM procrastinate_jobs WHERE id = %s",
+                (prunable_job_id,),
+            )
+            assert (await row.fetchone())[0] == 0
+            row = await connection.execute(
+                "SELECT count(*) FROM procrastinate_events WHERE job_id = %s",
+                (prunable_job_id,),
+            )
+            assert (await row.fetchone())[0] == 0
+    finally:
+        if worker_task is not None:
+            worker.stop()
+            await asyncio.wait_for(worker_task, timeout=5)
+        async with runtime.pool.connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM khub_commit_intents WHERE operation_id = ANY(%s)",
+                    ([operation.id for operation in operations],),
+                )
+                await connection.execute(
+                    "DELETE FROM procrastinate_jobs WHERE id IN (SELECT procrastinate_job_id FROM khub_operation_steps WHERE operation_id = ANY(%s))",
+                    ([operation.id for operation in operations],),
+                )
+                await connection.execute(
+                    "DELETE FROM khub_repository_operations WHERE id = ANY(%s)",
+                    ([operation.id for operation in operations],),
+                )
 
 
 @pytest.mark.asyncio
@@ -256,6 +452,243 @@ async def test_retryable_handler_redelivers_from_durable_step(runtime):
         worker.stop()
         await asyncio.wait_for(worker_task, timeout=5)
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_safe_retry_budget_is_bounded_in_executor(runtime, monkeypatch):
+    monkeypatch.setenv("KOHAKU_HUB_OPERATION_MAX_RETRIES", "2")
+    calls = 0
+
+    async def always_retry(_operation, _step):
+        nonlocal calls
+        calls += 1
+        raise RetryableOperationError(
+            "dependency remains unavailable", error_code="dependency_unavailable"
+        )
+
+    registry = OperationRegistry(
+        (
+            HandlerSpec(
+                kind="test.retry-budget.v1",
+                version="1",
+                task_name="khub:operation:execute.v1",
+                queue="control-v1",
+                priority=100,
+                handler=always_retry,
+                external_side_effect=True,
+                replay_safe_after_dispatch=True,
+            ),
+        )
+    )
+    await runtime.close()
+    runtime = await OperationRuntime.open(_database_url(), registry=registry)
+    operation = await runtime.service.accept(
+        kind="test.retry-budget.v1",
+        resource_key=f"test:retry-budget:{uuid4()}",
+        payload={},
+        requested_by_user_id=None,
+        trigger="system",
+    )
+    worker = Worker(
+        runtime.app,
+        queues=["control-v1"],
+        name=f"retry-budget-worker-{uuid4()}",
+        concurrency=1,
+        wait=True,
+        install_signal_handlers=False,
+        fetch_job_polling_interval=0.05,
+        abort_job_polling_interval=0.05,
+        update_heartbeat_interval=0.1,
+        stalled_worker_timeout=2,
+    )
+    worker_task = asyncio.create_task(worker.run())
+    try:
+        for _ in range(150):
+            current = await runtime.service.get(operation.id)
+            if current is not None and current.state == "failed":
+                break
+            await asyncio.sleep(0.05)
+        current = await runtime.service.get(operation.id)
+        assert current is not None
+        assert current.state == "failed"
+        assert current.error_code == "retry_exhausted"
+        assert calls == 2
+        async with runtime.pool.connection() as connection:
+            step = await runtime.service.store.get_step_for_operation(
+                connection, operation.id, 0
+            )
+        assert step is not None
+        assert step.state == "failed"
+        assert step.attempt == 2
+    finally:
+        worker.stop()
+        await asyncio.wait_for(worker_task, timeout=5)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_does_not_requeue_exhausted_replay_safe_step(
+    runtime, monkeypatch
+):
+    monkeypatch.setenv("KOHAKU_HUB_OPERATION_MAX_RETRIES", "2")
+
+    async def never_called(_operation, _step):
+        raise AssertionError("an exhausted stale step must not be delivered")
+
+    registry = OperationRegistry(
+        (
+            HandlerSpec(
+                kind="test.stale-retry-budget.v1",
+                version="1",
+                task_name="khub:operation:execute.v1",
+                queue="control-v1",
+                priority=100,
+                handler=never_called,
+                external_side_effect=True,
+                replay_safe_after_dispatch=True,
+            ),
+        )
+    )
+    await runtime.close()
+    runtime = await OperationRuntime.open(_database_url(), registry=registry)
+    operation = await runtime.service.accept(
+        kind="test.stale-retry-budget.v1",
+        resource_key=f"test:stale-retry-budget:{uuid4()}",
+        payload={},
+        requested_by_user_id=None,
+        trigger="system",
+    )
+    async with runtime.pool.connection() as connection:
+        async with connection.transaction():
+            await connection.execute(
+                """UPDATE khub_operation_steps
+                   SET state = 'dispatch_started', attempt = 2,
+                       external_marker = 'khub:test:stale-retry-budget',
+                       procrastinate_job_id = NULL,
+                       heartbeat_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                   WHERE operation_id = %s""",
+                (operation.id,),
+            )
+            await connection.execute(
+                """UPDATE khub_repository_operations
+                   SET state = 'dispatch_started',
+                       heartbeat_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                   WHERE id = %s""",
+                (operation.id,),
+            )
+
+    await reconcile_once(runtime.pool, runtime.app, registry=registry)
+    current = await runtime.service.get(operation.id)
+    assert current is not None
+    assert current.state == "failed"
+    assert current.error_code == "retry_exhausted"
+    async with runtime.pool.connection() as connection:
+        step = await runtime.service.store.get_step_for_operation(
+            connection, operation.id, 0
+        )
+    assert step is not None and step.state == "failed"
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_requeues_stale_pre_dispatch_step(runtime):
+    operation = await runtime.service.accept(
+        kind="maintenance.noop.v1",
+        resource_key=f"test:stale-pre-dispatch:{uuid4()}",
+        payload={},
+        requested_by_user_id=None,
+        trigger="system",
+    )
+    async with runtime.pool.connection() as connection:
+        step = await runtime.service.store.get_step_for_operation(
+            connection, operation.id, 0
+        )
+    assert step is not None
+    async with runtime.pool.connection() as connection:
+        async with connection.transaction():
+            await connection.execute(
+                """UPDATE khub_operation_steps
+                   SET state = 'running', procrastinate_job_id = NULL,
+                       heartbeat_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                   WHERE id = %s AND operation_id = %s""",
+                (step.id, operation.id),
+            )
+            await connection.execute(
+                """UPDATE khub_repository_operations
+                   SET state = 'running',
+                       heartbeat_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                   WHERE id = %s""",
+                (operation.id,),
+            )
+
+    await reconcile_once(runtime.pool, runtime.app)
+    current = await runtime.service.get(operation.id)
+    assert current is not None and current.state == "running"
+    async with runtime.pool.connection() as connection:
+        recovered = await runtime.service.store.get_step_for_operation(
+            connection, operation.id, 0
+        )
+    assert recovered is not None
+    assert recovered.state == "pending"
+    assert recovered.error_code == "stalled_delivery"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_recovers_doing_job_after_worker_row_is_pruned(runtime):
+    """A killed worker must not leave a doing delivery permanently orphaned."""
+
+    operation = await runtime.service.accept(
+        kind="maintenance.noop.v1",
+        resource_key=f"test:orphaned-delivery:{uuid4()}",
+        payload={},
+        requested_by_user_id=None,
+        trigger="system",
+    )
+    async with runtime.pool.connection() as connection:
+        step = await runtime.service.store.get_step_for_operation(
+            connection, operation.id, 0
+        )
+    assert step is not None and step.procrastinate_job_id is not None
+
+    async with runtime.pool.connection() as connection:
+        async with connection.transaction():
+            await connection.execute(
+                """UPDATE procrastinate_jobs
+                   SET status = 'doing', worker_id = NULL,
+                       attempts = 1
+                   WHERE id = %s""",
+                (step.procrastinate_job_id,),
+            )
+            await connection.execute(
+                """UPDATE khub_operation_steps
+                   SET state = 'running',
+                       heartbeat_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                   WHERE id = %s""",
+                (step.id,),
+            )
+            await connection.execute(
+                """UPDATE khub_repository_operations
+                   SET state = 'running',
+                       heartbeat_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                   WHERE id = %s""",
+                (operation.id,),
+            )
+
+    await reconcile_once(runtime.pool, runtime.app)
+
+    async with runtime.pool.connection() as connection:
+        recovered = await runtime.service.store.get_step_for_operation(
+            connection, operation.id, 0
+        )
+        job_cursor = await connection.execute(
+            "SELECT status, worker_id FROM procrastinate_jobs WHERE id = %s",
+            (step.procrastinate_job_id,),
+        )
+        job = await job_cursor.fetchone()
+    assert recovered is not None
+    assert recovered.state == "pending"
+    assert recovered.error_code == "stalled_delivery"
+    assert job == ("todo", None)
 
 
 @pytest.mark.asyncio
@@ -681,7 +1114,9 @@ async def test_commit_quota_reservation_is_atomic_and_consumed_once(runtime):
                 "description": "",
             }
 
-        first_payload = payload(f"quota-a-{uuid4()}")
+        # Usage projection is intentionally scoped to the authoritative main
+        # ref; use a feature ref only for the competing reservation.
+        first_payload = payload("main")
         first = await runtime.service.prepare_commit_intent(
             repository_id=repository_id,
             ref=first_payload["branch"],

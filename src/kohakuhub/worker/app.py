@@ -9,7 +9,7 @@ from procrastinate.psycopg_connector import PsycopgConnector
 from procrastinate.retry import RetryStrategy
 
 from kohakuhub.operations.executor import execute_operation_step
-from kohakuhub.operations.types import RetryableOperationError
+from kohakuhub.operations.types import RetryableOperationError, operation_max_attempts
 from kohakuhub.operations.registry import DEFAULT_REGISTRY, OperationRegistry
 from kohakuhub.operations.reconciliation import reconcile_once
 
@@ -41,6 +41,7 @@ def build_worker_app(
     # connection for registered repository mutation handlers. It is never
     # persisted in an operation payload.
     app.khub_database_url = settings.database_url
+    app.khub_stalled_worker_timeout_seconds = settings.stalled_worker_timeout_seconds
 
     @app.task(
         name="khub:worker:probe.v1",
@@ -55,7 +56,7 @@ def build_worker_app(
         queue=SYNC_QUEUE,
         priority=0,
         retry=RetryStrategy(
-            max_attempts=3,
+            max_attempts=operation_max_attempts(),
             exponential_wait=2,
             retry_exceptions=(RetryableOperationError,),
         ),
@@ -85,6 +86,8 @@ def build_worker_app(
             app,
             registry=registry,
             database_url=settings.database_url,
+            retention_hours=settings.operation_retention_hours,
+            retention_batch_size=settings.operation_retention_batch_size,
         )
 
     if include_periodic:

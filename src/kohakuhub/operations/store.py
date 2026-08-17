@@ -717,34 +717,55 @@ class OperationStore:
         connection: psycopg.AsyncConnection,
         step_id: int,
         operation_id: UUID,
-    ) -> None:
+        *,
+        max_attempts: int,
+    ) -> bool:
         """Return a pre-dispatch stale step to durable delivery."""
 
-        await connection.execute(
+        step_cursor = await connection.execute(
             """UPDATE khub_operation_steps
-               SET state = 'pending', procrastinate_job_id = NULL,
-                   error_code = 'stalled_delivery',
-                   error_summary = 'worker delivery heartbeat expired; retrying',
+               SET state = CASE WHEN attempt >= %s THEN 'failed' ELSE 'pending' END,
+                   procrastinate_job_id = NULL,
+                   error_code = CASE WHEN attempt >= %s THEN 'retry_exhausted'
+                                     ELSE 'stalled_delivery' END,
+                   error_summary = CASE WHEN attempt >= %s
+                                        THEN 'stalled operation exceeded its retry budget'
+                                        ELSE 'worker delivery heartbeat expired; retrying' END,
+                   finished_at = CASE WHEN attempt >= %s THEN CURRENT_TIMESTAMP
+                                      ELSE finished_at END,
                    updated_at = CURRENT_TIMESTAMP
-               WHERE id = %s AND operation_id = %s AND state = 'running'""",
-            (step_id, operation_id),
+               WHERE id = %s AND operation_id = %s AND state = 'running'
+               RETURNING state""",
+            (max_attempts, max_attempts, max_attempts, max_attempts, step_id, operation_id),
         )
+        row = await step_cursor.fetchone()
+        if row is None:
+            return False
+        exhausted = row[0] == "failed"
         await connection.execute(
             """UPDATE khub_repository_operations
-               SET state = 'running', phase = 'queued',
-                   error_code = 'stalled_delivery',
-                   error_summary = 'worker delivery heartbeat expired; retrying',
+               SET state = CASE WHEN %s THEN 'failed' ELSE 'running' END,
+                   phase = CASE WHEN %s THEN 'failed' ELSE 'queued' END,
+                   error_code = CASE WHEN %s THEN 'retry_exhausted'
+                                     ELSE 'stalled_delivery' END,
+                   error_summary = CASE WHEN %s
+                                        THEN 'stalled operation exceeded its retry budget'
+                                        ELSE 'worker delivery heartbeat expired; retrying' END,
+                   finished_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE finished_at END,
                    updated_at = CURRENT_TIMESTAMP, version = version + 1
                WHERE id = %s AND state = 'running'""",
-            (operation_id,),
+            (exhausted, exhausted, exhausted, exhausted, exhausted, operation_id),
         )
+        return not exhausted
 
     async def requeue_stalled_external_step(
         self,
         connection: psycopg.AsyncConnection,
         step_id: int,
         operation_id: UUID,
-    ) -> None:
+        *,
+        max_attempts: int,
+    ) -> bool:
         """Requeue an explicitly replay-safe external quantum.
 
         This is deliberately separate from ``requeue_stalled_step``.  A
@@ -753,24 +774,43 @@ class OperationStore:
         path.  Other marked steps remain in observation.
         """
 
-        await connection.execute(
+        step_cursor = await connection.execute(
             """UPDATE khub_operation_steps
-               SET state = 'pending', procrastinate_job_id = NULL,
-                   error_code = 'stalled_replay_safe_delivery',
-                   error_summary = 'replaying an idempotent external quantum',
+               SET state = CASE WHEN attempt >= %s THEN 'failed' ELSE 'pending' END,
+                   procrastinate_job_id = NULL,
+                   error_code = CASE WHEN attempt >= %s THEN 'retry_exhausted'
+                                     ELSE 'stalled_replay_safe_delivery' END,
+                   error_summary = CASE WHEN attempt >= %s
+                                        THEN 'stalled operation exceeded its retry budget'
+                                        ELSE 'replaying an idempotent external quantum' END,
+                   finished_at = CASE WHEN attempt >= %s THEN CURRENT_TIMESTAMP
+                                      ELSE finished_at END,
                    updated_at = CURRENT_TIMESTAMP
-               WHERE id = %s AND operation_id = %s AND state IN ('running', 'observing')""",
-            (step_id, operation_id),
+               WHERE id = %s AND operation_id = %s
+                 AND state IN ('running', 'dispatch_started', 'observing')
+               RETURNING state""",
+            (max_attempts, max_attempts, max_attempts, max_attempts, step_id, operation_id),
         )
+        row = await step_cursor.fetchone()
+        if row is None:
+            return False
+        exhausted = row[0] == "failed"
         await connection.execute(
             """UPDATE khub_repository_operations
-               SET state = 'running', phase = 'queued',
-                   error_code = 'stalled_replay_safe_delivery',
-                   error_summary = 'replaying an idempotent external quantum',
+               SET state = CASE WHEN %s THEN 'failed' ELSE 'running' END,
+                   phase = CASE WHEN %s THEN 'failed' ELSE 'queued' END,
+                   error_code = CASE WHEN %s THEN 'retry_exhausted'
+                                     ELSE 'stalled_replay_safe_delivery' END,
+                   error_summary = CASE WHEN %s
+                                        THEN 'stalled operation exceeded its retry budget'
+                                        ELSE 'replaying an idempotent external quantum' END,
+                   finished_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE finished_at END,
                    updated_at = CURRENT_TIMESTAMP, version = version + 1
-               WHERE id = %s AND state IN ('running', 'uncertain')""",
-            (operation_id,),
+               WHERE id = %s
+                 AND state IN ('running', 'dispatch_started', 'uncertain')""",
+            (exhausted, exhausted, exhausted, exhausted, exhausted, operation_id),
         )
+        return not exhausted
 
     async def requeue_retryable_step(
         self,
@@ -818,6 +858,7 @@ class OperationStore:
         *,
         error_code: str,
         error_summary: str,
+        max_attempts: int,
     ) -> bool:
         """Return a marked replay-safe step to durable delivery.
 
@@ -829,25 +870,56 @@ class OperationStore:
 
         step_cursor = await connection.execute(
             """UPDATE khub_operation_steps
-               SET state = 'pending', error_code = %s, error_summary = %s,
+               SET state = CASE WHEN attempt >= %s THEN 'failed' ELSE 'pending' END,
+                   error_code = CASE WHEN attempt >= %s THEN 'retry_exhausted' ELSE %s END,
+                   error_summary = CASE WHEN attempt >= %s
+                                        THEN 'replay-safe operation exceeded its retry budget'
+                                        ELSE %s END,
+                   finished_at = CASE WHEN attempt >= %s THEN CURRENT_TIMESTAMP
+                                      ELSE finished_at END,
                    updated_at = CURRENT_TIMESTAMP
                WHERE id = %s AND operation_id = %s
                  AND state IN ('running', 'dispatch_started')
-               RETURNING id""",
-            (error_code, error_summary, step_id, operation_id),
+               RETURNING state""",
+            (
+                max_attempts,
+                max_attempts,
+                error_code,
+                max_attempts,
+                error_summary,
+                max_attempts,
+                step_id,
+                operation_id,
+            ),
         )
-        if await step_cursor.fetchone() is None:
+        row = await step_cursor.fetchone()
+        if row is None:
             return False
+        exhausted = row[0] == "failed"
         operation_cursor = await connection.execute(
             """UPDATE khub_repository_operations
-               SET state = 'running', phase = 'queued', error_code = %s,
-                   error_summary = %s, updated_at = CURRENT_TIMESTAMP,
-                   version = version + 1
+               SET state = CASE WHEN %s THEN 'failed' ELSE 'running' END,
+                   phase = CASE WHEN %s THEN 'failed' ELSE 'queued' END,
+                   error_code = CASE WHEN %s THEN 'retry_exhausted' ELSE %s END,
+                   error_summary = CASE WHEN %s
+                                        THEN 'replay-safe operation exceeded its retry budget'
+                                        ELSE %s END,
+                   finished_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE finished_at END,
+                   updated_at = CURRENT_TIMESTAMP, version = version + 1
                WHERE id = %s AND state IN ('running', 'dispatch_started')
                RETURNING id""",
-            (error_code, error_summary, operation_id),
+            (
+                exhausted,
+                exhausted,
+                exhausted,
+                error_code,
+                exhausted,
+                error_summary,
+                exhausted,
+                operation_id,
+            ),
         )
-        return await operation_cursor.fetchone() is not None
+        return not exhausted and await operation_cursor.fetchone() is not None
 
     async def get_operation_by_idempotency(
         self,
@@ -940,6 +1012,176 @@ class OperationStore:
                WHERE id = %s""",
             (job_id, step_id),
         )
+
+    async def prune_terminal_history(
+        self,
+        connection: psycopg.AsyncConnection,
+        *,
+        cutoff: Any,
+        limit: int,
+    ) -> tuple[int, int]:
+        """Prune old, fully terminal operations and delivery history.
+
+        The operation row is locked before the candidate is returned. Worker
+        execution also locks that row before changing a step, so a candidate
+        cannot race a new delivery. Unresolved commit intents and non-terminal
+        jobs deliberately keep the operation alive for recovery.
+        """
+
+        if limit < 1:
+            raise ValueError("retention limit must be positive")
+
+        cursor = await connection.execute(
+            """
+            SELECT o.id
+            FROM khub_repository_operations o
+            WHERE o.state IN ('succeeded', 'failed', 'cancelled')
+              AND o.finished_at IS NOT NULL
+              AND o.finished_at < %s
+              AND EXISTS (
+                  SELECT 1
+                  FROM khub_operation_steps s
+                  WHERE s.operation_id = o.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM khub_operation_steps s
+                  WHERE s.operation_id = o.id
+                    AND s.state NOT IN ('succeeded', 'failed', 'cancelled')
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM khub_operation_steps s
+                  LEFT JOIN procrastinate_jobs j
+                    ON j.id = s.procrastinate_job_id
+                  WHERE s.operation_id = o.id
+                    AND s.procrastinate_job_id IS NOT NULL
+                    AND j.id IS NOT NULL
+                    AND j.status NOT IN (
+                        'succeeded', 'failed', 'cancelled', 'aborted'
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM khub_commit_intents i
+                  WHERE (i.operation_id = o.id
+                         OR i.observation_operation_id = o.id)
+                    AND i.state NOT IN ('finalized', 'abandoned')
+              )
+            ORDER BY o.finished_at, o.id
+            LIMIT %s
+            FOR UPDATE OF o SKIP LOCKED
+            """,
+            (cutoff, limit),
+        )
+        operation_ids = [row[0] for row in await cursor.fetchall()]
+        if not operation_ids:
+            return 0, 0
+
+        job_cursor = await connection.execute(
+            """
+            SELECT DISTINCT s.procrastinate_job_id
+            FROM khub_operation_steps s
+            WHERE s.operation_id = ANY(%s)
+              AND s.procrastinate_job_id IS NOT NULL
+            """,
+            (operation_ids,),
+        )
+        job_ids = [int(row[0]) for row in await job_cursor.fetchall()]
+
+        deleted_jobs = 0
+        if job_ids:
+            # Periodic defers use a non-cascading FK to jobs. Remove old
+            # metadata before deleting the corresponding terminal job.
+            await connection.execute(
+                "DELETE FROM procrastinate_periodic_defers WHERE job_id = ANY(%s)",
+                (job_ids,),
+            )
+            job_delete = await connection.execute(
+                """
+                DELETE FROM procrastinate_jobs
+                WHERE id = ANY(%s)
+                  AND status IN ('succeeded', 'failed', 'cancelled', 'aborted')
+                RETURNING id
+                """,
+                (job_ids,),
+            )
+            deleted_jobs = len(await job_delete.fetchall())
+
+        await connection.execute(
+            """
+            DELETE FROM khub_commit_intents
+            WHERE (operation_id = ANY(%s) OR observation_operation_id = ANY(%s))
+              AND state IN ('finalized', 'abandoned')
+            """,
+            (operation_ids, operation_ids),
+        )
+        operation_delete = await connection.execute(
+            """
+            DELETE FROM khub_repository_operations
+            WHERE id = ANY(%s)
+            RETURNING id
+            """,
+            (operation_ids,),
+        )
+        deleted_operations = len(await operation_delete.fetchall())
+        return deleted_operations, deleted_jobs
+
+    async def prune_unlinked_terminal_jobs(
+        self,
+        connection: psycopg.AsyncConnection,
+        *,
+        cutoff: Any,
+        limit: int,
+    ) -> int:
+        """Delete a bounded batch of terminal jobs with no KHub step owner.
+
+        Procrastinate's convenience cleanup is intentionally not used here:
+        it deletes all matching jobs in one statement and cannot distinguish
+        KHub-owned delivery evidence from periodic or other standalone jobs.
+        """
+
+        if limit < 1:
+            raise ValueError("retention limit must be positive")
+        cursor = await connection.execute(
+            """
+            SELECT j.id
+            FROM procrastinate_jobs j
+            WHERE j.status IN ('succeeded', 'failed', 'cancelled', 'aborted')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM khub_operation_steps s
+                  WHERE s.procrastinate_job_id = j.id
+              )
+              AND (
+                  SELECT MAX(e.at)
+                  FROM procrastinate_events e
+                  WHERE e.job_id = j.id
+              ) < %s
+            ORDER BY j.id
+            LIMIT %s
+            FOR UPDATE OF j SKIP LOCKED
+            """,
+            (cutoff, limit),
+        )
+        job_ids = [int(row[0]) for row in await cursor.fetchall()]
+        if not job_ids:
+            return 0
+
+        await connection.execute(
+            "DELETE FROM procrastinate_periodic_defers WHERE job_id = ANY(%s)",
+            (job_ids,),
+        )
+        deleted = await connection.execute(
+            """
+            DELETE FROM procrastinate_jobs
+            WHERE id = ANY(%s)
+              AND status IN ('succeeded', 'failed', 'cancelled', 'aborted')
+            RETURNING id
+            """,
+            (job_ids,),
+        )
+        return len(await deleted.fetchall())
 
     async def request_cancel(
         self, connection: psycopg.AsyncConnection, operation_id: UUID

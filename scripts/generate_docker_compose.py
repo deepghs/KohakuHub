@@ -497,7 +497,9 @@ def generate_khub_worker_service(config: dict) -> str:
       - KOHAKU_HUB_DATABASE_URL={_database_url(config)}
       - KOHAKU_HUB_WORKER_POOL_MIN=1
       - KOHAKU_HUB_WORKER_POOL_MAX=8
-      - KOHAKU_HUB_WORKER_METRICS_HOST=127.0.0.1
+      - KOHAKU_HUB_OPERATION_RETENTION_HOURS=168
+      - KOHAKU_HUB_OPERATION_RETENTION_BATCH=100
+      - KOHAKU_HUB_WORKER_METRICS_HOST=0.0.0.0
       - KOHAKU_HUB_WORKER_METRICS_PORT=9108
       - KOHAKU_HUB_LAKEFS_ENDPOINT=http://lakefs:28000
       - KOHAKU_HUB_LAKEFS_REPO_NAMESPACE=hf
@@ -508,6 +510,18 @@ def generate_khub_worker_service(config: dict) -> str:
       - KOHAKU_HUB_S3_REGION={region}
     expose:
       - \"9108\"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:9108/readyz', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds:ro
 {networks}"""

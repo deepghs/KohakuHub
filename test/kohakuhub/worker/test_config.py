@@ -46,3 +46,11 @@ def test_worker_pool_split_must_fit_aggregate_budget(monkeypatch):
 
     with pytest.raises(ValueError, match="aggregate pool max"):
         WorkerSettings.from_env()
+
+
+def test_worker_connection_budget_covers_api_and_worker_reservations():
+    settings = WorkerSettings(database_url="postgresql://user:pass@localhost/db")
+
+    assert settings.configured_connection_budget == (
+        4 * (4 + 4) + 2 + 6 + 4 + 2 + 2
+    )

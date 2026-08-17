@@ -57,3 +57,58 @@ RECONCILIATION_DURATION = Histogram(
     "Duration of one reconciliation scan",
     registry=METRICS_REGISTRY,
 )
+QUEUE_DEPTH = Gauge(
+    "khub_queue_depth",
+    "Durable Procrastinate jobs by queue and delivery status",
+    ("queue", "status"),
+    registry=METRICS_REGISTRY,
+)
+QUEUE_OLDEST_AGE_SECONDS = Gauge(
+    "khub_queue_oldest_age_seconds",
+    "Age of the oldest ready or running job in a queue",
+    ("queue",),
+    registry=METRICS_REGISTRY,
+)
+OPERATION_BACKLOG = Gauge(
+    "khub_operation_backlog",
+    "Non-terminal operations by state",
+    ("state",),
+    registry=METRICS_REGISTRY,
+)
+RECONCILIATION_BACKLOG = Gauge(
+    "khub_reconciliation_backlog",
+    "Operations currently requiring external observation",
+    registry=METRICS_REGISTRY,
+)
+OPERATION_RETENTION_PRUNED = Counter(
+    "khub_operation_retention_pruned_total",
+    "Terminal operation and durable job records removed by retention",
+    registry=METRICS_REGISTRY,
+)
+OPERATION_RETENTION_BACKLOG = Gauge(
+    "khub_operation_retention_backlog",
+    "Terminal operation records eligible for retention",
+    registry=METRICS_REGISTRY,
+)
+WORKER_EVENT_LOOP_LAG_SECONDS = Gauge(
+    "khub_worker_event_loop_lag_seconds",
+    "Observed worker event-loop scheduling lag",
+    registry=METRICS_REGISTRY,
+)
+WORKER_RSS_BYTES = Gauge(
+    "khub_worker_rss_bytes",
+    "Resident set size of the worker process",
+    registry=METRICS_REGISTRY,
+)
+DB_POOL_SIZE = Gauge(
+    "khub_worker_db_pool_size",
+    "Current psycopg pool size by worker lane",
+    ("lane",),
+    registry=METRICS_REGISTRY,
+)
+DB_POOL_WAITING = Gauge(
+    "khub_worker_db_pool_waiting",
+    "Requests waiting for a psycopg connection by worker lane",
+    ("lane",),
+    registry=METRICS_REGISTRY,
+)

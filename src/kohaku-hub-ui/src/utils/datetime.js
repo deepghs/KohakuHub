@@ -53,7 +53,8 @@ function parseBrowserTime(value) {
     return dayjs.tz(value, timeZone);
   }
 
-  return dayjs(value).tz(timeZone);
+  const parsed = dayjs(value);
+  return parsed.isValid() ? parsed.tz(timeZone) : parsed;
 }
 
 export function formatRelativeTime(value, fallback = "never") {

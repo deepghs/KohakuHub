@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import resource
 import signal
 from contextlib import AsyncExitStack
 from collections.abc import Callable
@@ -13,7 +15,12 @@ from procrastinate.worker import Worker
 from .app import build_worker_apps
 from .config import CONTROL_LANE, WORK_LANE, WorkerLane, WorkerSettings
 from .http import close_worker_http, serve_worker_http
-from kohakuhub.operations.metrics import METRICS_REGISTRY
+from kohakuhub.operations.metrics import (
+    DB_POOL_SIZE,
+    DB_POOL_WAITING,
+    WORKER_EVENT_LOOP_LAG_SECONDS,
+    WORKER_RSS_BYTES,
+)
 from kohakuhub.operations.readiness import verify_operation_schema
 
 
@@ -84,6 +91,10 @@ class WorkerSupervisor:
                 ]
                 self._install_signal_handlers()
                 tasks = [asyncio.create_task(worker.run()) for worker in self._workers]
+                health_stop = asyncio.Event()
+                health_task = asyncio.create_task(
+                    self._observe_process_health(health_stop)
+                )
                 # Let both worker coroutines register their listeners before
                 # advertising readiness.  Production Worker instances expose a
                 # worker_id after PostgreSQL registration; lightweight fakes do
@@ -103,6 +114,8 @@ class WorkerSupervisor:
                     ready.clear()
                     self.stop()
                     await asyncio.gather(*tasks, return_exceptions=True)
+                    health_stop.set()
+                    await asyncio.gather(health_task, return_exceptions=True)
                     self._remove_signal_handlers()
                     self._workers.clear()
         finally:
@@ -142,7 +155,69 @@ class WorkerSupervisor:
             row = await connection.execute("SELECT 1")
             if await row.fetchone() != (1,):
                 raise RuntimeError("worker database readiness check failed")
+            row = await connection.execute(
+                "SELECT current_setting('max_connections')::integer"
+            )
+            max_connections = int((await row.fetchone())[0])
+            row = await connection.execute(
+                "SELECT count(*) FROM pg_stat_activity"
+            )
+            active_connections = int((await row.fetchone())[0])
+            configured_budget = int(
+                os.getenv(
+                    "KOHAKU_HUB_WORKER_CONNECTION_BUDGET",
+                    str(self.settings.configured_connection_budget),
+                )
+            )
+            if configured_budget < 1:
+                raise RuntimeError("worker connection budget must be positive")
+            headroom_limit = max_connections * 0.8
+            if configured_budget > headroom_limit:
+                raise RuntimeError(
+                    "worker PostgreSQL connection budget exceeds 80% headroom: "
+                    f"active={active_connections} configured={configured_budget} "
+                    f"max={max_connections}"
+                )
+            if active_connections > headroom_limit:
+                raise RuntimeError(
+                    "current PostgreSQL connections exceed 80% headroom: "
+                    f"active={active_connections} max={max_connections}"
+                )
             await verify_operation_schema(connection)
+
+    async def _observe_process_health(self, stop: asyncio.Event) -> None:
+        """Export process scheduling, RSS, and database-pool pressure."""
+
+        loop = asyncio.get_running_loop()
+        interval = 1.0
+        deadline = loop.time() + interval
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                continue
+            except asyncio.TimeoutError:
+                pass
+
+            now = loop.time()
+            WORKER_EVENT_LOOP_LAG_SECONDS.set(max(0.0, now - deadline))
+            deadline = now + interval
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # Linux reports KiB; macOS reports bytes.  Docker deployments use
+            # Linux, while the fallback keeps local development meaningful.
+            WORKER_RSS_BYTES.set(float(rss * 1024 if rss < 10**9 else rss))
+            for app, lane in zip(self._apps, self.lanes):
+                connector = getattr(app, "connector", None)
+                pool = getattr(connector, "pool", None)
+                get_stats = getattr(pool, "get_stats", None)
+                if get_stats is None:
+                    continue
+                stats = get_stats()
+                DB_POOL_SIZE.labels(lane=lane.name).set(
+                    float(stats.get("pool_size", 0))
+                )
+                DB_POOL_WAITING.labels(lane=lane.name).set(
+                    float(stats.get("requests_waiting", 0))
+                )
 
     def stop(self) -> None:
         self._stop_requested = True

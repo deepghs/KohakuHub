@@ -147,6 +147,8 @@ services:
       - KOHAKU_HUB_DATABASE_URL=postgresql://<user>:<password>@postgres:5432/kohakuhub
       - KOHAKU_HUB_WORKER_POOL_MIN=1
       - KOHAKU_HUB_WORKER_POOL_MAX=8
+      - KOHAKU_HUB_OPERATION_RETENTION_HOURS=168
+      - KOHAKU_HUB_OPERATION_RETENTION_BATCH=100
       - KOHAKU_HUB_WORKER_METRICS_HOST=0.0.0.0
       - KOHAKU_HUB_WORKER_METRICS_PORT=9108
       - KOHAKU_HUB_LAKEFS_ENDPOINT=http://lakefs:28000
@@ -158,8 +160,8 @@ services:
       - KOHAKU_HUB_S3_REGION=us-east-1
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds:ro
-    ports:
-      - "9108:9108"
+    expose:
+      - "9108"
     healthcheck:
       test:
         - CMD

@@ -15,6 +15,8 @@ from urllib.parse import parse_qsl, urlparse
 
 import psycopg
 
+from kohakuhub import lakefs_mutation_gateway as mutation_gateway
+
 from .registry import DEFAULT_REGISTRY, OperationRegistry
 from .store import OperationStore
 from .finalizer import finalize_commit_domain
@@ -92,6 +94,21 @@ _FORBIDDEN_PAYLOAD_KEYS = {
     "secret",
     "token",
 }
+
+_FENCE_LIMITERS: dict[str, tuple[int, asyncio.Semaphore]] = {}
+
+
+def _fence_connection_limiter(database_url: str) -> asyncio.Semaphore:
+    """Bound dedicated advisory-lock connections per API/worker process."""
+
+    limit = int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4"))
+    if limit < 1:
+        raise ValueError("KOHAKU_HUB_FENCE_MAX_CONNECTIONS must be positive")
+    current = _FENCE_LIMITERS.get(database_url)
+    if current is None or current[0] != limit:
+        current = (limit, asyncio.Semaphore(limit))
+        _FENCE_LIMITERS[database_url] = current
+    return current[1]
 
 
 def _normalized_payload_key(key: Any) -> str:
@@ -450,93 +467,163 @@ class OperationService:
 
         lock_ref = canonical_mutation_ref(ref)
         cutover = scope == "cutover" or lock_ref == "__repository__"
-        async with await psycopg.AsyncConnection.connect(
-            self.database_url, autocommit=True
-        ) as connection:
-            acquired: list[tuple[str, bool]] = []
-            try:
-                repository_key = f"khub-repository:v1:{int(repository_id)}"
-                if cutover:
-                    await connection.execute(
-                        "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
-                        (repository_key,),
-                    )
-                    acquired.append((repository_key, False))
-                    blocking = await self.store.get_blocking_repository_intent(
-                        connection,
-                        repository_id=repository_id,
-                        exclude_intent_id=exclude_intent_id,
-                    )
-                else:
-                    await connection.execute(
-                        "SELECT pg_advisory_lock_shared(hashtextextended(%s, 0))",
-                        (repository_key,),
-                    )
-                    acquired.append((repository_key, True))
-                    ref_key = (
-                        f"khub-repository-ref:v1:{int(repository_id)}:{lock_ref}"
-                    )
-                    await connection.execute(
-                        "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
-                        (ref_key,),
-                    )
-                    acquired.append((ref_key, False))
-                    candidates = [ref]
-                    if lock_ref not in candidates:
-                        candidates.append(lock_ref)
-                    if lock_ref.startswith("branch:"):
-                        raw_ref = lock_ref.removeprefix("branch:")
-                        if raw_ref not in candidates:
-                            candidates.append(raw_ref)
-                    blocking = None
-                    for candidate in candidates:
-                        blocking = await self.store.get_blocking_commit_intent(
+        limiter = _fence_connection_limiter(self.database_url)
+        await limiter.acquire()
+        try:
+            async with await psycopg.AsyncConnection.connect(
+                self.database_url, autocommit=True
+            ) as connection:
+                acquired: list[tuple[str, bool]] = []
+                capability_token = None
+                try:
+                    repository_key = f"khub-repository:v1:{int(repository_id)}"
+                    if cutover:
+                        await connection.execute(
+                            "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                            (repository_key,),
+                        )
+                        acquired.append((repository_key, False))
+                        blocking = await self.store.get_blocking_repository_intent(
                             connection,
                             repository_id=repository_id,
-                            ref=candidate,
                             exclude_intent_id=exclude_intent_id,
                         )
-                        if blocking is not None:
-                            break
-                if blocking is None:
-                    blocking = await self.store.get_blocking_repository_operation(
-                        connection,
-                        repository_id=repository_id,
-                        exclude_operation_id=exclude_operation_id,
-                    )
-                if blocking is not None:
-                    raise CommitInProgress(blocking)
-                # Expose the checked-out connection to callers that need to
-                # perform a short, fenced domain transaction after an
-                # external observation.  The connection remains owned by
-                # this context until the advisory locks are released.
-                yield connection
-            finally:
-                async def unlock() -> None:
-                    for key, shared in reversed(acquired):
-                        function = (
-                            "pg_advisory_unlock_shared"
-                            if shared
-                            else "pg_advisory_unlock"
+                    else:
+                        await connection.execute(
+                            "SELECT pg_advisory_lock_shared(hashtextextended(%s, 0))",
+                            (repository_key,),
+                        )
+                        acquired.append((repository_key, True))
+                        ref_key = (
+                            f"khub-repository-ref:v1:{int(repository_id)}:{lock_ref}"
                         )
                         await connection.execute(
-                            f"SELECT {function}(hashtextextended(%s, 0))",
-                            (key,),
+                            "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                            (ref_key,),
                         )
+                        acquired.append((ref_key, False))
+                        candidates = [ref]
+                        if lock_ref not in candidates:
+                            candidates.append(lock_ref)
+                        if lock_ref.startswith("branch:"):
+                            raw_ref = lock_ref.removeprefix("branch:")
+                            if raw_ref not in candidates:
+                                candidates.append(raw_ref)
+                        blocking = None
+                        for candidate in candidates:
+                            blocking = await self.store.get_blocking_commit_intent(
+                                connection,
+                                repository_id=repository_id,
+                                ref=candidate,
+                                exclude_intent_id=exclude_intent_id,
+                            )
+                            if blocking is not None:
+                                break
+                    if blocking is None:
+                        blocking = await self.store.get_blocking_repository_operation(
+                            connection,
+                            repository_id=repository_id,
+                            exclude_operation_id=exclude_operation_id,
+                        )
+                    if blocking is not None:
+                        raise CommitInProgress(blocking)
+                    capability_token = mutation_gateway.activate_capability(
+                        mutation_gateway.MutationCapability(
+                            repository_id=int(repository_id),
+                            ref="__repository__" if cutover else lock_ref,
+                            scope="cutover" if cutover else "mutation",
+                        )
+                    )
+                    # Expose the checked-out connection to callers that need to
+                    # perform a short, fenced domain transaction after an
+                    # external observation.  The connection remains owned by
+                    # this context until the advisory locks are released.
+                    yield connection
+                finally:
+                    if capability_token is not None:
+                        mutation_gateway.reset_capability(capability_token)
+                    async def unlock() -> None:
+                        for key, shared in reversed(acquired):
+                            function = (
+                                "pg_advisory_unlock_shared"
+                                if shared
+                                else "pg_advisory_unlock"
+                            )
+                            await connection.execute(
+                                f"SELECT {function}(hashtextextended(%s, 0))",
+                                (key,),
+                            )
 
-                # Cancellation must not return a pooled connection while a
-                # session advisory lock is still held. Wait for cleanup even
-                # when the handler/request is being cancelled.
-                cleanup = asyncio.create_task(unlock())
-                cancelled = False
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        cancelled = True
-                await cleanup
-                if cancelled:
-                    raise asyncio.CancelledError
+                    # Cancellation must not return a pooled connection while a
+                    # session advisory lock is still held. Wait for cleanup even
+                    # when the handler/request is being cancelled.
+                    cleanup = asyncio.create_task(unlock())
+                    cancelled = False
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    await cleanup
+                    if cancelled:
+                        raise asyncio.CancelledError
+        finally:
+            limiter.release()
+
+    @asynccontextmanager
+    async def repository_name_fence(self, resource_key: str):
+        """Fence allocation of a repository name before a row exists.
+
+        Repository creation has no stable ``Repository.id`` yet.  It therefore
+        uses a separate advisory namespace keyed by the normalized public
+        repository identity, and the gateway only permits
+        ``create_repository`` while this capability is active.
+        """
+
+        if not resource_key:
+            raise ValueError("repository fence key must be non-empty")
+        if not self.database_url:
+            raise RuntimeError("a dedicated PostgreSQL fence connection is required")
+
+        limiter = _fence_connection_limiter(self.database_url)
+        await limiter.acquire()
+        try:
+            async with await psycopg.AsyncConnection.connect(
+                self.database_url, autocommit=True
+            ) as connection:
+                lock_key = f"khub-repository-name:v1:{resource_key}"
+                await connection.execute(
+                    "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                    (lock_key,),
+                )
+                capability_token = mutation_gateway.activate_capability(
+                    mutation_gateway.MutationCapability(
+                        repository_id=None,
+                        ref="__repository_name__",
+                        scope="repository_name",
+                    )
+                )
+                try:
+                    yield connection
+                finally:
+                    mutation_gateway.reset_capability(capability_token)
+                    cleanup = asyncio.create_task(
+                        connection.execute(
+                            "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                            (lock_key,),
+                        )
+                    )
+                    cancelled = False
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    await cleanup
+                    if cancelled:
+                        raise asyncio.CancelledError
+        finally:
+            limiter.release()
 
     async def prepare_commit_intent(
         self,

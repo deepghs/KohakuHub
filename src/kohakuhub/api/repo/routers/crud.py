@@ -455,8 +455,34 @@ def _resolve_create_repo_private(payload: CreateRepoPayload) -> bool:
 
 @router.post("/repos/create")
 async def create_repo(
-    payload: CreateRepoPayload, user: User = Depends(get_current_user)
+    payload: CreateRepoPayload,
+    user: User = Depends(get_current_user),
+    request: Request = cast(Request, None),
 ):
+    """Create a repository while serializing its public-name allocation."""
+
+    namespace = payload.organization or user.username
+    state = getattr(getattr(request, "app", None), "state", None)
+    compatibility_mode = bool(getattr(state, "_khub_test_compatibility", False))
+    runtime = getattr(state, "operation_runtime", None)
+    service = getattr(runtime, "service", None)
+    if (
+        cfg.app.db_backend == "postgres"
+        and isinstance(request, Request)
+        and not compatibility_mode
+    ):
+        if service is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "mutation_fence_unavailable"},
+            )
+        resource_key = f"{payload.type}:{namespace}:{normalize_name(payload.name)}"
+        async with service.repository_name_fence(resource_key):
+            return await _create_repo_unlocked(payload, user)
+    return await _create_repo_unlocked(payload, user)
+
+
+async def _create_repo_unlocked(payload: CreateRepoPayload, user: User):
     """Create a new repository.
 
     Args:

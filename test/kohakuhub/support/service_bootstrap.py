@@ -133,6 +133,10 @@ def apply_service_test_env() -> None:
         "KOHAKU_HUB_LFS_MULTIPART_CHUNK_SIZE_BYTES": "500000",
         "KOHAKU_HUB_LFS_KEEP_VERSIONS": "5",
         "KOHAKU_HUB_LFS_AUTO_GC": "true",
+        # Direct route-unit tests intentionally bypass ASGI lifespan and
+        # therefore cannot enter the production PostgreSQL fence context.
+        # Keep that compatibility escape explicit and test-only.
+        "KOHAKU_HUB_TEST_COMPATIBILITY": "true",
     }
 
     default_env = {
