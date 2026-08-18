@@ -77,6 +77,12 @@ def _column_names(columns):
     return tuple(name.strip() for name in columns.replace("\n", " ").split(","))
 
 
+def test_store_mapping_row_preserves_mapping_rows():
+    row = {"id": "operation-id"}
+
+    assert store_module._mapping_row(row, "id") is row
+
+
 def _readiness_responses():
     expected_tables = set(operation_table_columns()) | readiness.PROCRASTINATE_TABLES | {
         "khub_schema_migrations"

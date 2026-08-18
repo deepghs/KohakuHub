@@ -252,6 +252,34 @@ async def test_mark_external_dispatch_refuses_cancelled_or_observed_rows(
 
 
 @pytest.mark.asyncio
+async def test_mark_external_dispatch_returns_false_when_row_disappears():
+    connection = _Connection(select_row=None)
+    operation, step = _records()
+
+    assert await executor._mark_external_dispatch(
+        _Pool(connection), operation, step, marker="missing-row"
+    ) is False
+    assert len(connection.queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_executor_returns_when_delivery_claim_disappears(monkeypatch):
+    pool = _Pool()
+    operation, step = _records()
+    store = _ExecutorStore(operation, step, started=False)
+    monkeypatch.setattr(executor, "OperationStore", lambda _pool: store)
+
+    await executor.execute_operation_step(
+        pool,
+        str(operation.id),
+        str(step.id),
+        registry=_registry(operation, lambda *_args: StepResult.succeeded()),
+    )
+
+    assert store.finished == []
+
+
+@pytest.mark.asyncio
 async def test_executor_ignores_delivery_that_was_not_claimed(monkeypatch):
     pool = _Pool()
     operation, step = _records()

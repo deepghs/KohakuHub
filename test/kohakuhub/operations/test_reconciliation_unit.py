@@ -644,6 +644,9 @@ async def test_stale_prepared_cleanup_resets_only_unchanged_branch(monkeypatch):
         {"expected_version": 3, "error_code": "stale_prepared_cleanup"}
     ]
 
+    current.state = "dispatch_started"
+    assert not await reconciliation._reset_stale_prepared_intent(Service(), intent)
+
 
 @pytest.mark.asyncio
 async def test_reconcile_once_returns_when_another_reconciler_holds_lock(monkeypatch):

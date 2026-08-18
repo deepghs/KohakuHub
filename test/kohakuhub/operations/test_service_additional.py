@@ -1007,3 +1007,476 @@ async def test_repository_name_fence_restores_name_capability_after_body(monkeyp
         "pg_advisory_unlock(hashtextextended" in query
         for query, _ in connection.queries
     )
+
+
+def test_payload_and_fence_validation_cover_non_http_and_invalid_limits():
+    with pytest.raises(ValueError, match="must be positive"):
+        service_module._fence_connection_limiter("postgresql://unit", 0)
+
+    with pytest.raises(ValueError, match="sensitive field"):
+        _canonical_payload({"headers": ["authorization", "secret"]})
+
+    value, _ = _canonical_payload({"callback": "ftp://example.test/hook"})
+    assert value["callback"].startswith("ftp://")
+
+
+@pytest.mark.asyncio
+async def test_observation_handle_creation_and_sync_are_idempotent_and_fail_closed(
+    monkeypatch,
+):
+    class ObservationStore:
+        def __init__(self, intent, *, current=None, bound=True, operation=None):
+            self.intent = intent
+            self.current = current
+            self.bound = bound
+            self.operation = operation or _operation(operation_id=uuid4())
+            self.commit_reads = 0
+            self.finished = []
+
+        async def get_commit_intent(self, _connection, _intent_id, **_kwargs):
+            self.commit_reads += 1
+            if self.commit_reads > 1 and self.current is not None:
+                return self.current
+            return self.intent
+
+        async def get_operation(self, _connection, _operation_id, **_kwargs):
+            return self.operation
+
+        async def bind_observation_operation(self, _connection, _intent_id, _operation_id):
+            return self.bound
+
+        async def finish_observation_operation(self, _connection, operation_id, **kwargs):
+            self.finished.append((operation_id, kwargs))
+            return _operation(operation_id=operation_id, state=kwargs["state"])
+
+    async def accept(*_args, **_kwargs):
+        return _operation(operation_id=uuid4())
+
+    missing = OperationService(_Pool(), _app())
+    missing.store = ObservationStore(None)
+    assert await missing.ensure_commit_observation_operation(uuid4()) is None
+
+    existing_intent = _intent(observation_operation_id=uuid4())
+    existing = OperationService(_Pool(), _app())
+    existing.store = ObservationStore(existing_intent)
+    assert await existing.ensure_commit_observation_operation(existing_intent.id) is not None
+
+    terminal_intent = _intent(state="abandoned")
+    terminal = OperationService(_Pool(), _app())
+    terminal.store = ObservationStore(terminal_intent)
+    assert await terminal.ensure_commit_observation_operation(terminal_intent.id) is None
+
+    created_intent = _intent()
+    created = OperationService(_Pool(), _app())
+    created.store = ObservationStore(created_intent, bound=True)
+    monkeypatch.setattr(created, "accept_in_transaction", accept)
+    created_operation = await created.ensure_commit_observation_operation(created_intent.id)
+    assert created_operation is not None
+
+    raced_intent = _intent()
+    raced_current = _intent(observation_operation_id=uuid4())
+    raced = OperationService(_Pool(), _app())
+    raced.store = ObservationStore(raced_intent, current=raced_current, bound=None)
+    monkeypatch.setattr(raced, "accept_in_transaction", accept)
+    raced_operation = await raced.ensure_commit_observation_operation(raced_intent.id)
+    assert raced_operation is not None
+
+    lost = OperationService(_Pool(), _app())
+    lost.store = ObservationStore(_intent(), current=None, bound=None)
+    monkeypatch.setattr(lost, "accept_in_transaction", accept)
+    with pytest.raises(IdempotencyConflict, match="binding was lost"):
+        await lost.ensure_commit_observation_operation(uuid4())
+
+    for state in ("finalized", "abandoned", "running"):
+        intent = _intent(
+            state=state,
+            observation_operation_id=uuid4(),
+            lakefs_commit_id="commit-1" if state == "finalized" else None,
+        )
+        service = OperationService(_Pool(), _app())
+        store = ObservationStore(intent)
+        service.store = store
+        result = await service.sync_commit_observation_operation(intent.id)
+        assert result is not None
+        if state != "running":
+            assert store.finished
+
+    no_handle = OperationService(_Pool(), _app())
+    no_handle.store = ObservationStore(_intent(observation_operation_id=None))
+    assert await no_handle.sync_commit_observation_operation(uuid4()) is None
+
+
+@pytest.mark.asyncio
+async def test_fence_configuration_errors_are_rejected_before_connection():
+    no_database = OperationService(None, _app())
+    with pytest.raises(RuntimeError, match="dedicated PostgreSQL"):
+        async with no_database.repository_ref_fence(7, "main"):
+            pass
+    with pytest.raises(ValueError, match="non-empty"):
+        async with no_database.repository_name_fence(""):
+            pass
+    with pytest.raises(RuntimeError, match="dedicated PostgreSQL"):
+        async with no_database.repository_name_fence("owner/repo"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_prepare_commit_handles_existing_payloads_and_blockers():
+    matching = _intent(request_hash="same-request")
+    service = OperationService(_Pool(), _app())
+    service.store = _IntentStore(existing_by_request=matching)
+    assert await service.prepare_commit_intent(
+        repository_id=7,
+        ref="main",
+        base_head="head",
+        payload={},
+        requested_by_user_id=3,
+        idempotency_key="key",
+        request_hash="same-request",
+    ) is matching
+
+    existing = _intent(payload_hash="different")
+    service.store = _IntentStore(intent=existing)
+    with pytest.raises(IdempotencyConflict, match="another payload"):
+        await service.prepare_commit_intent(
+            repository_id=7,
+            ref="main",
+            base_head="head",
+            payload={"value": 1},
+            intent_id=existing.id,
+        )
+
+    blocker = _intent(state="dispatch_started")
+    service.store = _IntentStore(blocking_intent=blocker)
+    with pytest.raises(CommitInProgress):
+        await service.prepare_commit_intent(
+            repository_id=7,
+            ref="main",
+            base_head="head",
+            payload={},
+        )
+
+    service.store = _IntentStore()
+    inserted = await service.prepare_commit_intent(
+        repository_id=7,
+        ref="main",
+        base_head="head",
+        payload={"files": []},
+    )
+    assert inserted.state == "prepared"
+
+    matching_intent = _intent(payload={"files": []})
+    matching_intent.payload_hash = _canonical_payload({"files": []})[1]
+    service.store = _IntentStore(intent=matching_intent)
+    assert await service.prepare_commit_intent(
+        repository_id=7,
+        ref="main",
+        base_head="head",
+        payload={"files": []},
+        intent_id=matching_intent.id,
+    ) is matching_intent
+
+
+@pytest.mark.asyncio
+async def test_prepared_staging_and_payload_updates_fail_on_compare_and_set_races():
+    intent = _intent(state="prepared")
+    service = OperationService(_Pool(), _app())
+    store = _IntentStore(intent=intent)
+    service.store = store
+
+    async def update_missing(*_args, **_kwargs):
+        return None
+
+    store.update_prepared_commit_payload = update_missing
+    with pytest.raises(IdempotencyConflict, match="recording staging"):
+        await service.record_prepared_staging_path(intent.id, path="staging/file")
+
+    intent = _intent(state="prepared")
+    service.store = _IntentStore(intent=intent)
+
+    async def refresh_missing(*_args, **_kwargs):
+        return None
+
+    service.store.refresh_prepared_deadline = refresh_missing
+    with pytest.raises(IdempotencyConflict, match="refreshing preparation"):
+        await service.record_prepared_staging_path(intent.id, path="staging/file")
+
+    with pytest.raises(ValueError, match="staging path"):
+        await service.record_prepared_staging_path(intent.id, path="")
+
+    service.store = _IntentStore(intent=None)
+    with pytest.raises(ValueError, match="does not exist"):
+        await service.update_prepared_commit_payload(uuid4(), payload={})
+
+    intent = _intent(state="prepared")
+    service.store = _IntentStore(intent=intent)
+    service.store.update_prepared_commit_payload = update_missing
+    with pytest.raises(IdempotencyConflict, match="finalization payload"):
+        await service.update_prepared_commit_payload(intent.id, payload={"files": []})
+
+
+@pytest.mark.asyncio
+async def test_quota_reservation_fails_closed_when_rows_disappear():
+    class QuotaConnection:
+        def __init__(self, intent_row, repo_row=None, owner_row=None):
+            self.intent_row = intent_row
+            self.repo_row = repo_row
+            self.owner_row = owner_row
+
+        async def execute(self, query, _params=None):
+            query = " ".join(str(query).split())
+            if "khub_commit_intents" in query:
+                return _Cursor(self.intent_row)
+            if "FROM repository" in query:
+                return _Cursor(self.repo_row)
+            if 'FROM "user"' in query:
+                return _Cursor(self.owner_row)
+            return _Cursor((0,))
+
+    service = OperationService(None, _app())
+    with pytest.raises(ValueError, match="intent disappeared"):
+        await service._reserve_commit_quota(
+            QuotaConnection(None), intent_id=uuid4(), quota_delta=1
+        )
+    with pytest.raises(ValueError, match="repository does not exist"):
+        await service._reserve_commit_quota(
+            QuotaConnection((7,), None), intent_id=uuid4(), quota_delta=1
+        )
+    with pytest.raises(ValueError, match="owner does not exist"):
+        await service._reserve_commit_quota(
+            QuotaConnection((7,), (False, 100, 0, 3), None),
+            intent_id=uuid4(),
+            quota_delta=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_uncertain_and_prepared_abandonment_cas_edges():
+    service = OperationService(_Pool(), _app())
+    service.store = _IntentStore(intent=None)
+    with pytest.raises(ValueError, match="does not exist"):
+        await service.mark_commit_intent_dispatch_started(uuid4())
+
+    invalid = _intent(state="finalized")
+    service.store = _IntentStore(intent=invalid)
+    assert await service.mark_commit_intent_dispatch_started(invalid.id) is invalid
+
+    invalid = _intent(state="accepted")
+    service.store = _IntentStore(intent=invalid)
+    with pytest.raises(OperationNotCancellable, match="before external"):
+        await service.mark_commit_intent_dispatch_started(invalid.id)
+
+    racing = _intent(state="prepared")
+    service.store = _IntentStore(intent=racing, update_result=None)
+    with pytest.raises(IdempotencyConflict, match="before external"):
+        await service.mark_commit_intent_dispatch_started(racing.id)
+
+    service.store = _IntentStore(intent=None)
+    assert await service.mark_commit_intent_uncertain(
+        uuid4(), error_code="missing", error_summary="missing"
+    ) is None
+
+    uncertain = _intent(state="dispatch_started")
+    service.store = _IntentStore(intent=uncertain)
+    assert await service.mark_commit_intent_uncertain(
+        uncertain.id, error_code="ambiguous", error_summary="ambiguous"
+    ) is uncertain
+
+    prepared = _intent(state="prepared", observation_operation_id=uuid4())
+    service.store = _IntentStore(intent=prepared)
+    assert await service.abandon_prepared_commit_intent(
+        prepared.id, expected_version=prepared.version, error_code="stale"
+    ) is True
+
+    for stale in (
+        _intent(state="dispatch_started"),
+        _intent(state="prepared", version=9),
+    ):
+        service.store = _IntentStore(intent=stale)
+        expected = stale.version - 1 if stale.version == 9 else stale.version
+        assert await service.abandon_prepared_commit_intent(
+            stale.id, expected_version=expected, error_code="stale"
+        ) is False
+
+    racing = _intent(state="prepared")
+    service.store = _IntentStore(intent=racing, update_result=None)
+    assert await service.abandon_prepared_commit_intent(
+        racing.id, expected_version=racing.version, error_code="race"
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_commit_finalization_handles_terminal_and_compare_and_set_edges(monkeypatch):
+    service = OperationService(_Pool(), _app())
+    service.store = _IntentStore(intent=None)
+    assert await service.mark_commit_intent_committed(
+        uuid4(), lakefs_commit_id="commit"
+    ) is None
+
+    finalized = _intent(state="finalized", lakefs_commit_id="commit")
+    service.store = _IntentStore(intent=finalized)
+    assert await service.mark_commit_intent_committed(
+        finalized.id, lakefs_commit_id="commit"
+    ) is finalized
+
+    finalized.lakefs_commit_id = "old-commit"
+    with pytest.raises(IdempotencyConflict, match="cannot change"):
+        await service.mark_commit_intent_committed(
+            finalized.id, lakefs_commit_id="new-commit"
+        )
+
+    finalized_operation = _operation(operation_id=uuid4())
+    finalized.operation_id = finalized_operation.id
+    finalized_store = _IntentStore(intent=finalized)
+
+    async def get_operation(*_args, **_kwargs):
+        return finalized_operation
+
+    finalized_store.get_operation = get_operation
+    service.store = finalized_store
+    assert await service.finalize_commit_intent(
+        finalized.id,
+        payload={},
+        result_json={},
+        requested_by_user_id=None,
+        idempotency_key="key",
+    ) is finalized_operation
+
+    for state in ("accepted", "cancelled"):
+        terminal = _intent(state=state, lakefs_commit_id="commit")
+        service.store = _IntentStore(intent=terminal)
+        assert await service.finalize_commit_intent(
+            terminal.id,
+            payload={},
+            result_json={},
+            requested_by_user_id=None,
+            idempotency_key="key",
+        ) is None
+
+    no_commit = _intent(state="committed", payload={"files": []})
+    service.store = _IntentStore(intent=no_commit)
+    with pytest.raises(ValueError, match="confirmed LakeFS"):
+        await service.finalize_commit_intent(
+            no_commit.id,
+            payload={"files": []},
+            result_json={},
+            requested_by_user_id=None,
+            idempotency_key="key",
+        )
+
+    committed = _intent(state="committed", payload={"files": []}, lakefs_commit_id="commit")
+    committed.payload_hash = _canonical_payload({"files": []})[1]
+    service.store = _IntentStore(intent=committed)
+    with pytest.raises(IdempotencyConflict, match="differs from the intent"):
+        await service.finalize_commit_intent(
+            committed.id,
+            payload={"files": [], "commit_id": "other"},
+            result_json={},
+            requested_by_user_id=None,
+            idempotency_key="key",
+        )
+    with pytest.raises(IdempotencyConflict, match="differs from the persisted"):
+        await service.finalize_commit_intent(
+            committed.id,
+            payload={"different": True},
+            result_json={},
+            requested_by_user_id=None,
+            idempotency_key="key",
+        )
+
+    observation_id = uuid4()
+    committed = _intent(
+        state="committed",
+        payload={"files": []},
+        lakefs_commit_id="commit",
+        observation_operation_id=observation_id,
+    )
+    committed.payload_hash = _canonical_payload({"files": []})[1]
+    service.store = _IntentStore(intent=committed)
+    operation = _operation(operation_id=committed.id, kind="commit.postprocess.v1")
+
+    async def accept(*_args, **_kwargs):
+        return operation
+
+    async def finalize_domain(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "accept_in_transaction", accept)
+    monkeypatch.setattr(service_module, "finalize_commit_domain", finalize_domain)
+    result = await service.finalize_commit_intent(
+        committed.id,
+        payload={"files": []},
+        result_json={"commitOid": "commit"},
+        requested_by_user_id=None,
+        idempotency_key="key",
+    )
+    assert result is operation
+    assert committed.state == "finalized"
+    assert service.store.finished_observations
+
+    compare_and_set = _intent(
+        state="committed", payload={"files": []}, lakefs_commit_id="commit"
+    )
+    compare_and_set.payload_hash = _canonical_payload({"files": []})[1]
+    service.store = _IntentStore(intent=compare_and_set, update_result=None)
+    monkeypatch.setattr(service, "accept_in_transaction", accept)
+    with pytest.raises(IdempotencyConflict, match="before finalization"):
+        await service.finalize_commit_intent(
+            compare_and_set.id,
+            payload={"files": []},
+            result_json={},
+            requested_by_user_id=None,
+            idempotency_key="key",
+        )
+
+
+@pytest.mark.asyncio
+async def test_finalize_commit_intent_returns_none_when_intent_disappears():
+    service = OperationService(_Pool(), _app())
+    service.store = _IntentStore(intent=None)
+
+    assert await service.finalize_commit_intent(
+        uuid4(),
+        payload={},
+        result_json={},
+        requested_by_user_id=None,
+        idempotency_key="missing-intent",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_missing_operation_steps_and_terminal_abandonment_are_safe():
+    operation = _operation(state="accepted")
+    service = OperationService(_Pool(), _app())
+    service.store = _OperationStore(operation=None)
+    assert await service.cancel(operation.id) is None
+
+    terminal_intent = _intent(state="finalized")
+    service.store = _IntentStore(intent=terminal_intent)
+    await service.abandon_commit_intent(terminal_intent.id, error_code="late")
+
+    missing_step = _OperationStore(operation=operation, step=None)
+    service.store = missing_step
+    with pytest.raises(ValueError, match="step does not exist"):
+        await service.mark_dispatch_started(
+            operation.id,
+            11,
+            expected_source="head-a",
+            expected_target="head-b",
+            remote_deadline=object(),
+            observe_not_before=object(),
+            external_marker="marker",
+        )
+
+    succeeded_step = _step(operation_id=operation.id, state="succeeded")
+    service.store = _OperationStore(operation=operation, step=succeeded_step)
+    with pytest.raises(OperationNotCancellable, match="before the external"):
+        await service.mark_dispatch_started(
+            operation.id,
+            succeeded_step.id,
+            expected_source="head-a",
+            expected_target="head-b",
+            remote_deadline=object(),
+            observe_not_before=object(),
+            external_marker="marker",
+        )

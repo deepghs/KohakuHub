@@ -1,5 +1,6 @@
 import pytest
 
+import kohakuhub.worker.config as worker_config
 from kohakuhub.worker.config import (
     CONTROL_LANE,
     CONTROL_QUEUE,
@@ -45,6 +46,35 @@ def test_worker_pool_split_must_fit_aggregate_budget(monkeypatch):
     monkeypatch.setenv("KOHAKU_HUB_WORKER_WORK_POOL_MAX", "6")
 
     with pytest.raises(ValueError, match="aggregate pool max"):
+        WorkerSettings.from_env()
+
+
+def test_worker_loads_valid_postgres_environment(monkeypatch):
+    monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KOHAKU_HUB_DATABASE_URL", "postgresql://user:pass@localhost/db"
+    )
+
+    settings = WorkerSettings.from_env()
+
+    assert settings.database_url.endswith("/db")
+
+
+def test_worker_rejects_non_positive_api_operation_pool_after_parsing(monkeypatch):
+    monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KOHAKU_HUB_DATABASE_URL", "postgresql://user:pass@localhost/db"
+    )
+    original_positive_int = worker_config._positive_int
+
+    def fake_positive_int(name, default):
+        if name == "KOHAKU_HUB_OPERATION_POOL_MAX":
+            return 0
+        return original_positive_int(name, default)
+
+    monkeypatch.setattr(worker_config, "_positive_int", fake_positive_int)
+
+    with pytest.raises(ValueError, match="API operation pool max size"):
         WorkerSettings.from_env()
 
 
