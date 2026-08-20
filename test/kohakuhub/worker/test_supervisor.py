@@ -88,6 +88,89 @@ async def test_supervisor_does_not_wait_forever_when_a_lane_exits_before_readine
 
 
 @pytest.mark.asyncio
+async def test_supervisor_times_out_and_cancels_lanes_that_never_register():
+    stopped = False
+
+    def stop_worker():
+        nonlocal stopped
+        stopped = True
+
+    supervisor = WorkerSupervisor(
+        WorkerSettings(
+            database_url="postgresql://user:pass@localhost/db",
+            startup_timeout_seconds=0.01,
+        )
+    )
+    supervisor._workers = [SimpleNamespace(worker_id=None, stop=stop_worker)]
+
+    async def blocked():
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(blocked())
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        await supervisor._wait_for_workers_started([task])
+
+    assert stopped
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_preserves_worker_timeout_errors_before_readiness():
+    supervisor = WorkerSupervisor(
+        WorkerSettings(
+            database_url="postgresql://user:pass@localhost/db",
+            startup_timeout_seconds=1,
+        )
+    )
+    supervisor._workers = [SimpleNamespace(worker_id=None, stop=lambda: None)]
+
+    async def fails_with_timeout():
+        raise asyncio.TimeoutError("database registration timed out")
+
+    task = asyncio.create_task(fails_with_timeout())
+    with pytest.raises(asyncio.TimeoutError, match="database registration"):
+        await supervisor._wait_for_workers_started([task])
+
+
+@pytest.mark.asyncio
+async def test_supervisor_applies_startup_deadline_to_app_open(monkeypatch):
+    runner = object()
+    closed = False
+
+    async def serve(*_args):
+        return runner
+
+    async def close(value):
+        nonlocal closed
+        assert value is runner
+        closed = True
+
+    class HangingContext:
+        async def __aenter__(self):
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    app = SimpleNamespace(open_async=lambda: HangingContext())
+    monkeypatch.setattr(supervisor_module, "serve_worker_http", serve)
+    monkeypatch.setattr(supervisor_module, "close_worker_http", close)
+
+    supervisor = WorkerSupervisor(
+        WorkerSettings(
+            database_url="postgresql://user:pass@localhost/db",
+            startup_timeout_seconds=0.01,
+        ),
+        app_factory=lambda _settings: app,
+    )
+
+    with pytest.raises(RuntimeError, match="startup did not complete"):
+        await supervisor.run()
+
+    assert closed
+
+
+@pytest.mark.asyncio
 async def test_supervisor_closes_http_when_app_construction_fails(monkeypatch):
     runner = object()
     closed = False

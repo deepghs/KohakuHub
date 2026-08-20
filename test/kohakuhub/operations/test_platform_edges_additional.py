@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from procrastinate.schema import SchemaManager
-
 import kohakuhub.operations.readiness as readiness
 import kohakuhub.operations.store as store_module
 import kohakuhub.worker.supervisor as supervisor_module
@@ -22,14 +19,16 @@ from kohakuhub.migrations.schema import (
     PROCRASTINATE_REQUIRED_INDEXES,
     PROCRASTINATE_TABLE_COLUMNS,
     PROCRASTINATE_TYPES,
-    REQUIRED_OPERATION_CONSTRAINTS,
     REQUIRED_OPERATION_INDEXES,
-    expected_table_columns,
-    signature_digest,
+)
+from kohakuhub.migrations.worker_contract import (
+    APPLICATION_SCHEMA_ADOPTION_CHECKSUM_V1,
+    WORKER_OPERATION_SCHEMA_CHECKSUM_V1,
+    WORKER_OPERATION_SCHEMA_VERSION_V1,
+    WORKER_PROCRASTINATE_SCHEMA_CHECKSUM_V390,
 )
 from kohakuhub.operations.registry import DEFAULT_REGISTRY, HandlerSpec, OperationRegistry
 from kohakuhub.operations.sql import (
-    OPERATION_SCHEMA_VERSION,
     operation_table_columns,
     operation_table_columns_for_version,
 )
@@ -92,17 +91,17 @@ def _readiness_responses():
         (
             "khub-current-adoption",
             1,
-            signature_digest(expected_table_columns(include_operations=False)),
+            APPLICATION_SCHEMA_ADOPTION_CHECKSUM_V1,
         ),
         (
             "procrastinate-3.9.0",
             1,
-            hashlib.sha256(SchemaManager.get_schema().encode("utf-8")).hexdigest(),
+            WORKER_PROCRASTINATE_SCHEMA_CHECKSUM_V390,
         ),
         (
-            f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}",
-            OPERATION_SCHEMA_VERSION,
-            signature_digest(operation_table_columns()),
+            f"khub-operation-kernel-v{WORKER_OPERATION_SCHEMA_VERSION_V1}",
+            WORKER_OPERATION_SCHEMA_VERSION_V1,
+            WORKER_OPERATION_SCHEMA_CHECKSUM_V1,
         ),
     ]
     operation_columns = [
@@ -954,7 +953,7 @@ async def test_supervisor_rejects_non_positive_connection_budget(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_supervisor_rejects_current_connections_over_headroom(monkeypatch):
-    monkeypatch.setenv("KOHAKU_HUB_WORKER_CONNECTION_BUDGET", "10")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_CONNECTION_BUDGET", "50")
     connection = _Connection(
         [_Rows(row=(1,)), _Rows(row=(100,)), _Rows(row=(81,))]
     )

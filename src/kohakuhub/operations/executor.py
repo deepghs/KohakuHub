@@ -8,11 +8,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+import psycopg
+
 from .registry import DEFAULT_REGISTRY, OperationRegistry
 from .store import OperationStore
 from .types import RetryableOperationError, StepResult, operation_max_attempts
 from .metrics import OPERATION_DELIVERIES, OPERATION_FAILURES
-from .service import OperationService
+from .service import CommitInProgress, OperationService
 
 
 async def _mark_external_dispatch(
@@ -269,6 +271,16 @@ async def execute_operation_step(
                         error_code="cancelled",
                         error_summary="operation cancelled before external dispatch",
                     )
+        raise
+    except CommitInProgress:
+        # A fence conflict is a domain-level concurrency signal.  Let the job
+        # lifecycle/reconciliation path observe it instead of misreporting it
+        # as a handler bug.
+        raise
+    except (psycopg.Error, ConnectionError, OSError, TimeoutError):
+        # Connection and dependency failures must remain visible to the task
+        # runner.  Turning them into a terminal handler_failed row would hide
+        # an infrastructure outage and prevent the normal retry/recovery path.
         raise
     except Exception:
         # External details are deliberately omitted from the durable public row.

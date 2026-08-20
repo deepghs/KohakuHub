@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
+from contextlib import suppress
 from typing import Any
 
 from psycopg_pool import AsyncConnectionPool
 from procrastinate.psycopg_connector import PsycopgConnector
 
 from kohakuhub.worker.app import build_worker_app
-from kohakuhub.worker.config import WorkerSettings
+from kohakuhub.worker.config import (
+    WorkerSettings,
+    api_fence_connection_limit_from_env,
+    api_operation_pool_max_size_from_env,
+)
 
 from .registry import DEFAULT_REGISTRY, OperationRegistry
 from .service import OperationService
@@ -31,41 +35,52 @@ class OperationRuntime:
         *,
         registry: OperationRegistry = DEFAULT_REGISTRY,
     ) -> "OperationRuntime":
+        api_pool_max_size = api_operation_pool_max_size_from_env()
         pool = AsyncConnectionPool(
             conninfo=database_url,
             min_size=1,
-            max_size=4,
+            max_size=api_pool_max_size,
             open=False,
         )
-        await pool.open(wait=True)
-        async with pool.connection() as connection:
-            await verify_operation_schema(connection)
-        connector = PsycopgConnector()
-        settings = WorkerSettings(database_url=database_url, pool_max_size=4)
-        worker_app = build_worker_app(
-            settings,
-            connector=connector,
-            registry=registry,
-        )
-        await worker_app.open_async(pool=pool)
-        return cls(
-            pool=pool,
-            connector=connector,
-            app=worker_app,
-            service=OperationService(
-                pool,
-                worker_app,
-                registry,
+        worker_app: Any | None = None
+        try:
+            await pool.open(wait=True)
+            async with pool.connection() as connection:
+                await verify_operation_schema(connection)
+            connector = PsycopgConnector()
+            settings = WorkerSettings(
                 database_url=database_url,
-                fence_connection_limit=int(
-                    os.getenv(
-                        "KOHAKU_HUB_API_FENCE_MAX_CONNECTIONS",
-                        os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4"),
-                    )
+                pool_max_size=api_pool_max_size,
+                api_pool_max_size=api_pool_max_size,
+            )
+            worker_app = build_worker_app(
+                settings,
+                connector=connector,
+                registry=registry,
+            )
+            await worker_app.open_async(pool=pool)
+            return cls(
+                pool=pool,
+                connector=connector,
+                app=worker_app,
+                service=OperationService(
+                    pool,
+                    worker_app,
+                    registry,
+                    database_url=database_url,
+                    fence_connection_limit=api_fence_connection_limit_from_env(),
                 ),
-            ),
-        )
+            )
+        except BaseException:
+            if worker_app is not None:
+                with suppress(Exception):
+                    await worker_app.close_async()
+            with suppress(Exception):
+                await pool.close()
+            raise
 
     async def close(self) -> None:
-        await self.app.close_async()
-        await self.pool.close()
+        try:
+            await self.app.close_async()
+        finally:
+            await self.pool.close()

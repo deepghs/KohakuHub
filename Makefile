@@ -9,7 +9,8 @@ TEST_RANGE = $(if $(strip $(RANGE_DIR)),$(TEST_ROOT)/$(RANGE_DIR),$(TEST_ROOT))
 MIGRATION_TEST_PATHS = \
 	$(TEST_ROOT)/test_db_migration_compatibility.py \
 	$(TEST_ROOT)/test_legacy_migration_edge_cases.py \
-	$(TEST_ROOT)/test_migration_history_matrix.py
+	$(TEST_ROOT)/test_migration_history_matrix.py \
+	$(TEST_ROOT)/operations/test_schema_contract.py
 UNIT_TEST_IGNORE_ARGS = $(foreach test,$(MIGRATION_TEST_PATHS),--ignore=$(test))
 COV_RANGE = $(if $(strip $(RANGE_DIR)),$(SOURCE_ROOT)/$(RANGE_DIR),$(SOURCE_ROOT))
 COV_FAIL_UNDER ?= $(if $(strip $(RANGE_DIR)),0,80)
@@ -162,7 +163,7 @@ test-ui-admin:
 	fi
 	pnpm run test:admin
 
-test: test-backend test-ui test-ui-admin
+test: test-backend test-migrations test-ui test-ui-admin
 
 status:
 	docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep 'kohakuhub-dev-' || true

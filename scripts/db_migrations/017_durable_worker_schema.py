@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from _migration_utils import should_skip_due_to_future_migrations
 from khub_migrate import (  # noqa: E402
     _PeeweeConnectionAdapter,
-    _verify_worker_schema,
     apply_worker_schema_migration,
     bootstrap_worker_application_compatibility,
     worker_schema_migration_is_applied,
@@ -56,6 +55,14 @@ def run() -> bool:
         if cfg.app.db_backend != "postgres":
             print("Migration 017: Not applicable to SQLite")
             return True
+        if not check_migration_needed():
+            # Once the immutable worker ledger exists, later numbered
+            # migrations own any schema extensions. Re-validating against the
+            # current application/kernel definitions here would let a future
+            # release make an already-applied 017 fail before its own code
+            # runs.
+            print("Migration 017: Already applied")
+            return True
         # Some application tables present on main were introduced through the
         # normal model bootstrap rather than a numbered legacy migration. Keep
         # the explicit compatibility bootstrap in the same PostgreSQL
@@ -63,11 +70,6 @@ def run() -> bool:
         # rejected schema cannot leave behind partial application tables.
         with db.atomic():
             bootstrap_worker_application_compatibility(_PeeweeConnectionAdapter(db))
-            if not check_migration_needed():
-                _verify_worker_schema(_PeeweeConnectionAdapter(db))
-                print("Migration 017: Already applied")
-                return True
-
             print("Migration 017: Installing durable PostgreSQL worker schema...")
             apply_worker_schema_migration(_PeeweeConnectionAdapter(db))
         print("Migration 017: Completed")

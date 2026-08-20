@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kohakuhub.migrations.schema import expected_table_columns, signature_digest
+from kohakuhub.migrations.schema import signature_digest
 from scripts import run_migrations
 from scripts import khub_migrate
 from scripts.db_migrations import _migration_utils
@@ -94,12 +94,26 @@ def test_017_treats_a_missing_worker_ledger_as_not_applied():
     )
 
 
-def test_017_application_schema_checksum_is_frozen():
-    assert signature_digest(expected_table_columns(include_operations=False)) == (
-        APPLICATION_SCHEMA_CHECKSUM_WORKER
+def test_017_does_not_revalidate_current_schema_after_ledger_install(monkeypatch):
+    migration = _load_migration_017()
+    database = _Database()
+    calls = []
+
+    monkeypatch.setattr(migration, "cfg", _config("postgres"))
+    monkeypatch.setattr(migration, "db", database)
+    monkeypatch.setattr(migration, "check_migration_needed", lambda: False)
+    monkeypatch.setattr(
+        migration,
+        "bootstrap_worker_application_compatibility",
+        lambda _connection: calls.append("bootstrap"),
     )
-    assert set(APPLICATION_TABLE_COLUMNS_WORKER) == set(
-        expected_table_columns(include_operations=False)
+    assert migration.run() is True
+    assert calls == []
+
+
+def test_017_application_schema_checksum_is_frozen():
+    assert signature_digest(APPLICATION_TABLE_COLUMNS_WORKER) == (
+        APPLICATION_SCHEMA_CHECKSUM_WORKER
     )
 
 
@@ -116,7 +130,7 @@ def test_017_rejects_extra_application_schema_objects(monkeypatch):
 def test_017_application_adoption_allows_known_operation_tables(monkeypatch):
     actual = dict(APPLICATION_TABLE_COLUMNS_WORKER)
     actual.update(
-        khub_migrate.operation_table_columns_for_version(
+        khub_migrate._operation_table_columns_for_version(
             khub_migrate.OPERATION_SCHEMA_VERSION_WORKER
         )
     )
@@ -125,18 +139,15 @@ def test_017_application_adoption_allows_known_operation_tables(monkeypatch):
     khub_migrate._assert_worker_application_schema(object())
 
 
-def test_017_application_adoption_allows_current_model_extensions(monkeypatch):
+def test_017_application_adoption_rejects_current_model_extensions(monkeypatch):
     actual = dict(APPLICATION_TABLE_COLUMNS_WORKER)
     actual["user"] = (*actual["user"], "future_model_column")
     actual["future_model_table"] = ("id",)
 
-    current = dict(expected_table_columns(include_operations=False))
-    current["user"] = (*current["user"], "future_model_column")
-    current["future_model_table"] = ("id",)
-    monkeypatch.setattr(khub_migrate, "expected_table_columns", lambda **_: current)
     monkeypatch.setattr(khub_migrate, "read_table_columns", lambda _connection: actual)
 
-    khub_migrate._assert_worker_application_schema(object())
+    with pytest.raises(RuntimeError, match="extra"):
+        khub_migrate._assert_worker_application_schema(object())
 
 
 def test_historical_supersession_check_does_not_mask_loader_errors(monkeypatch):
@@ -173,6 +184,11 @@ def test_fresh_database_continues_to_numbered_migration_017(monkeypatch):
     monkeypatch.setattr(run_migrations, "cfg", _config("postgres"))
     monkeypatch.setattr(run_migrations, "migration_lock", nullcontext)
     monkeypatch.setattr(run_migrations, "is_database_initialized", lambda: False)
+    monkeypatch.setattr(
+        run_migrations,
+        "bootstrap_pre_017_application_schema",
+        lambda _database, _backend: calls.append("bootstrap_pre_017"),
+    )
     monkeypatch.setattr(run_migrations, "init_db", lambda: calls.append("init_db"))
     monkeypatch.setattr(
         run_migrations,
@@ -186,7 +202,7 @@ def test_fresh_database_continues_to_numbered_migration_017(monkeypatch):
     )
 
     assert run_migrations.run_migrations() is True
-    assert calls == ["init_db", "017", "init_db"]
+    assert calls == ["bootstrap_pre_017", "017", "init_db"]
 
 
 def test_initialized_main_database_uses_the_numbered_chain(monkeypatch):

@@ -8,14 +8,26 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from procrastinate.schema import SchemaManager
-
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from db_migrations._017_schema import (  # noqa: E402
+    EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS_V8,
+    EXPECTED_OPERATION_INDEX_DEFINITIONS_V8,
+    HISTORICAL_OPERATION_TABLE_COLUMNS_V2,
+    HISTORICAL_OPERATION_TABLE_COLUMNS_V3,
+    OPERATION_COLUMN_CONTRACT_V8,
+    OPERATION_SCHEMA_SQL_V8,
+    OPERATION_TABLE_COLUMNS_V6,
+    OPERATION_TABLE_COLUMNS_V7,
+    OPERATION_TABLE_COLUMNS_V8,
+    PROCRASTINATE_SCHEMA_SQL_V390,
+    PROCRASTINATE_REQUIRED_INDEXES_V390,
+    PROCRASTINATE_TABLE_COLUMNS_V390,
+    PROCRASTINATE_TYPES_V390,
+)
 from kohakuhub.migrations.schema import (  # noqa: E402
-    expected_table_columns,
     kernel_semantic_diff,
     operation_schema_object_diff,
     procrastinate_schema_diff,
@@ -23,13 +35,12 @@ from kohakuhub.migrations.schema import (  # noqa: E402
     schema_diff,
     signature_digest,
 )
-from kohakuhub.operations.sql import (  # noqa: E402
-    OPERATION_SCHEMA_SQL,
-    OPERATION_SCHEMA_VERSION,
-    operation_table_columns,
-    operation_table_columns_for_version,
+from kohakuhub.migrations.worker_contract import (  # noqa: E402
+    APPLICATION_SCHEMA_ADOPTION_CHECKSUM_V1,
+    WORKER_OPERATION_SCHEMA_CHECKSUM_V1,
+    WORKER_OPERATION_SCHEMA_VERSION_V1,
+    WORKER_PROCRASTINATE_SCHEMA_CHECKSUM_V390,
 )
-
 
 LOCK_KEY = "kohakuhub.schema.lifecycle.v1"
 RELEASED_OPERATION_SCHEMA_CHECKSUMS = {
@@ -42,9 +53,7 @@ RELEASED_OPERATION_SCHEMA_CHECKSUMS = {
 # Migration 017 has a fixed post-016 application-schema precondition. It must
 # not be recomputed from live Peewee models: model-only tables can be added by
 # the runner's final init_db() pass after this migration.
-APPLICATION_SCHEMA_CHECKSUM_WORKER = (
-    "4e38e499aec1d9ccf55323ab3e4fa9ed58d7cd183dbe07d4bd3d8d8b89e663f8"
-)
+APPLICATION_SCHEMA_CHECKSUM_WORKER = APPLICATION_SCHEMA_ADOPTION_CHECKSUM_V1
 APPLICATION_TABLE_COLUMNS_WORKER = {
     "commit": (
         "author_id",
@@ -213,18 +222,20 @@ APPLICATION_TABLE_COLUMNS_WORKER = {
     ),
     "userorganization": ("created_at", "id", "organization_id", "role", "user_id"),
 }
-PROCRASTINATE_SCHEMA_CHECKSUM_WORKER = (
-    "c70ec4b400a60ad9592787653aae5ae77ae41bf801d56b5bd2712751a07f2009"
-)
-OPERATION_SCHEMA_VERSION_WORKER = 8
-OPERATION_SCHEMA_CHECKSUM_WORKER = (
-    "3143de9bba6022a7f4372a3be8cb2c8a7bd7c3e2ecb0a1b46ca046652118afd3"
-)
+PROCRASTINATE_SCHEMA_CHECKSUM_WORKER = WORKER_PROCRASTINATE_SCHEMA_CHECKSUM_V390
+OPERATION_SCHEMA_VERSION_WORKER = WORKER_OPERATION_SCHEMA_VERSION_V1
+OPERATION_SCHEMA_CHECKSUM_WORKER = WORKER_OPERATION_SCHEMA_CHECKSUM_V1
 
 KNOWN_OPERATION_TABLES_WORKER = frozenset(
     table
-    for version in (2, 3, 6, 7, OPERATION_SCHEMA_VERSION_WORKER)
-    for table in operation_table_columns_for_version(version)
+    for signature in (
+        HISTORICAL_OPERATION_TABLE_COLUMNS_V2,
+        HISTORICAL_OPERATION_TABLE_COLUMNS_V3,
+        OPERATION_TABLE_COLUMNS_V6,
+        OPERATION_TABLE_COLUMNS_V7,
+        OPERATION_TABLE_COLUMNS_V8,
+    )
+    for table in signature
 )
 
 LEDGER_DDL = """
@@ -299,11 +310,11 @@ class _PeeweeConnectionAdapter:
 
 
 def _schema_checksum() -> str:
-    return signature_digest(operation_table_columns())
+    return OPERATION_SCHEMA_CHECKSUM_WORKER
 
 
 def _procrastinate_schema_checksum() -> str:
-    return hashlib.sha256(SchemaManager.get_schema().encode("utf-8")).hexdigest()
+    return PROCRASTINATE_SCHEMA_CHECKSUM_WORKER
 
 
 def bootstrap_worker_application_compatibility(connection: Any) -> None:
@@ -319,22 +330,14 @@ def _worker_application_schema_diff(connection: Any) -> dict[str, Any]:
     # Known durable-kernel tables may already exist when a pre-release worker
     # schema is being recognized; their exact shape is checked separately by
     # ``_apply_operation_schema`` and ``_verify_worker_schema``.
-    # Model-defined additions from a later numbered migration are allowed when
-    # the current code already knows about them. Unknown tables/columns remain
-    # an error so a corrupted or unrelated schema cannot pass this boundary.
-    frozen_tables = set(APPLICATION_TABLE_COLUMNS_WORKER)
-    current_tables = expected_table_columns(include_operations=False)
-    current_extra_tables = set(current_tables) - frozen_tables
-    actual = {}
-    for table, columns in read_table_columns(connection).items():
-        if table in KNOWN_OPERATION_TABLES_WORKER or table in current_extra_tables:
-            continue
-        allowed_extra_columns = set(current_tables.get(table, ())) - set(
-            APPLICATION_TABLE_COLUMNS_WORKER.get(table, ())
-        )
-        actual[table] = tuple(
-            column for column in columns if column not in allowed_extra_columns
-        )
+    # This is an adoption boundary, so it must stay independent of the current
+    # Peewee model. Future application tables and columns belong to a later
+    # numbered migration and must not be silently accepted by 017.
+    actual = {
+        table: columns
+        for table, columns in read_table_columns(connection).items()
+        if table not in KNOWN_OPERATION_TABLES_WORKER
+    }
     return schema_diff(APPLICATION_TABLE_COLUMNS_WORKER, actual)
 
 
@@ -348,10 +351,15 @@ def _assert_worker_application_schema(connection: Any) -> None:
 
 
 def _assert_worker_runtime_inputs() -> None:
-    operation_checksum = _schema_checksum()
-    procrastinate_checksum = _procrastinate_schema_checksum()
+    """Verify the immutable schema snapshot used by migration 017."""
+
+    application_checksum = signature_digest(APPLICATION_TABLE_COLUMNS_WORKER)
+    operation_checksum = signature_digest(OPERATION_TABLE_COLUMNS_V8)
+    procrastinate_checksum = hashlib.sha256(
+        PROCRASTINATE_SCHEMA_SQL_V390.encode("utf-8")
+    ).hexdigest()
     if (
-        OPERATION_SCHEMA_VERSION != OPERATION_SCHEMA_VERSION_WORKER
+        application_checksum != APPLICATION_SCHEMA_CHECKSUM_WORKER
         or operation_checksum != OPERATION_SCHEMA_CHECKSUM_WORKER
         or procrastinate_checksum != PROCRASTINATE_SCHEMA_CHECKSUM_WORKER
     ):
@@ -411,17 +419,32 @@ def _assert_recorded_checksum(
 def _historical_operation_schema_checksum(version: int) -> str:
     """Return a checksum for a released kernel schema, never infer one."""
 
-    try:
-        signature = operation_table_columns_for_version(version)
-    except ValueError as exc:
-        raise RuntimeError(
-            "unsupported historical operation schema version "
-            f"{version}; upgrade from a supported durable-kernel release"
-        ) from exc
+    signature = _operation_table_columns_for_version(version)
     released_checksum = RELEASED_OPERATION_SCHEMA_CHECKSUMS.get(version)
     if released_checksum is not None:
         return released_checksum
     return signature_digest(signature)
+
+
+def _operation_table_columns_for_version(
+    version: int,
+) -> dict[str, tuple[str, ...]]:
+    """Return the frozen operation table contract for a released version."""
+
+    contracts = {
+        2: HISTORICAL_OPERATION_TABLE_COLUMNS_V2,
+        3: HISTORICAL_OPERATION_TABLE_COLUMNS_V3,
+        6: OPERATION_TABLE_COLUMNS_V6,
+        7: OPERATION_TABLE_COLUMNS_V7,
+        OPERATION_SCHEMA_VERSION_WORKER: OPERATION_TABLE_COLUMNS_V8,
+    }
+    try:
+        return contracts[version]
+    except KeyError as exc:
+        raise RuntimeError(
+            "unsupported historical operation schema version "
+            f"{version}; upgrade from a supported durable-kernel release"
+        ) from exc
 
 
 def _apply_procrastinate_schema(connection: Any) -> None:
@@ -458,7 +481,12 @@ def _apply_procrastinate_schema(connection: Any) -> None:
                 "partial Procrastinate schema; refusing to guess DDL: "
                 f"missing_tables={missing_tables}, missing_types={missing_types}"
             )
-        catalog_diff = procrastinate_schema_diff(connection)
+        catalog_diff = procrastinate_schema_diff(
+            connection,
+            table_columns=PROCRASTINATE_TABLE_COLUMNS_V390,
+            required_indexes=PROCRASTINATE_REQUIRED_INDEXES_V390,
+            types=PROCRASTINATE_TYPES_V390,
+        )
         if any(catalog_diff.values()):
             raise RuntimeError(
                 "partial or incompatible Procrastinate schema; refusing to guess DDL: "
@@ -477,7 +505,7 @@ def _apply_procrastinate_schema(connection: Any) -> None:
         )
         return
 
-    schema_sql = SchemaManager.get_schema()
+    schema_sql = PROCRASTINATE_SCHEMA_SQL_V390
     with connection.cursor() as cursor:
         cursor.execute(schema_sql)
     _record(
@@ -489,7 +517,7 @@ def _apply_procrastinate_schema(connection: Any) -> None:
 
 
 def _apply_operation_schema(connection: Any) -> None:
-    current_name = f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}"
+    current_name = f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION_WORKER}"
     ledger_rows = connection.execute(
         """SELECT migration_name, version, checksum
            FROM khub_schema_migrations
@@ -532,7 +560,7 @@ def _apply_operation_schema(connection: Any) -> None:
                 "operation tables exist without a known migration ledger record; "
                 "refusing to run operation DDL"
             )
-        expected = operation_table_columns_for_version(recorded[1])
+        expected = _operation_table_columns_for_version(recorded[1])
         expected_tables = set(expected)
         if operation_tables != expected_tables:
             raise RuntimeError(
@@ -569,11 +597,11 @@ def _apply_operation_schema(connection: Any) -> None:
                 f"recorded={recorded[2]} expected={expected_checksum}"
             )
     with connection.cursor() as cursor:
-        cursor.execute(OPERATION_SCHEMA_SQL)
+        cursor.execute(OPERATION_SCHEMA_SQL_V8)
     _record(
         connection,
         current_name,
-        OPERATION_SCHEMA_VERSION,
+        OPERATION_SCHEMA_VERSION_WORKER,
         _schema_checksum(),
     )
 
@@ -583,17 +611,29 @@ def _verify_worker_schema(
 ) -> None:
     if verify_application_schema:
         _assert_worker_application_schema(connection)
-    procrastinate_diff = procrastinate_schema_diff(connection)
+    procrastinate_diff = procrastinate_schema_diff(
+        connection,
+        table_columns=PROCRASTINATE_TABLE_COLUMNS_V390,
+        required_indexes=PROCRASTINATE_REQUIRED_INDEXES_V390,
+        types=PROCRASTINATE_TYPES_V390,
+    )
     if any(procrastinate_diff.values()):
         raise RuntimeError(
             f"Procrastinate schema mismatch after migration: {procrastinate_diff}"
         )
-    object_diff = operation_schema_object_diff(connection)
+    object_diff = operation_schema_object_diff(
+        connection,
+        index_definitions=EXPECTED_OPERATION_INDEX_DEFINITIONS_V8,
+        constraint_definitions=EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS_V8,
+    )
     if any(object_diff.values()):
         raise RuntimeError(
             f"operation schema object mismatch after migration: {object_diff}"
         )
-    semantic_diff = kernel_semantic_diff(connection)
+    semantic_diff = kernel_semantic_diff(
+        connection,
+        column_contract=OPERATION_COLUMN_CONTRACT_V8,
+    )
     if any(semantic_diff.values()):
         raise RuntimeError(
             f"operation schema semantic mismatch after migration: {semantic_diff}"

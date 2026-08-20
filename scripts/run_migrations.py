@@ -22,10 +22,14 @@ from pathlib import Path
 # Add src to path
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
+sys.path.insert(0, str(SCRIPT_DIR))
 
 # Import after path setup
 from kohakuhub.db import db, init_db  # noqa: E402
 from kohakuhub.config import cfg  # noqa: E402
+from db_migrations._017_schema import (  # noqa: E402
+    bootstrap_pre_017_application_schema,
+)
 
 
 MIGRATION_LOCK_KEY = "kohakuhub.schema.lifecycle.v1"
@@ -143,10 +147,10 @@ def _run_migrations_locked():
     # PostgreSQL-only migrations such as 017, which init_db() cannot install.
     if not is_database_initialized():
         print("Database is uninitialized (User table doesn't exist)")
-        print("Initializing the current schema before numbered migrations")
+        print("Initializing the frozen pre-017 schema before numbered migrations")
         print("\nInitializing database (creating all tables)...")
-        init_db()
-        print("✓ Database initialized with current schema\n")
+        bootstrap_pre_017_application_schema(db, cfg.app.db_backend)
+        print("✓ Database initialized with frozen pre-017 schema\n")
     else:
         print("Database is initialized, checking for pending migrations...\n")
 

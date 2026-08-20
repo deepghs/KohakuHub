@@ -466,7 +466,12 @@ def _normalize_catalog_sql(value: str) -> str:
     return " ".join(value.lower().split())
 
 
-def operation_schema_object_diff(connection: Any) -> dict[str, list[str]]:
+def operation_schema_object_diff(
+    connection: Any,
+    *,
+    index_definitions: dict[str, str] | None = None,
+    constraint_definitions: dict[str, tuple[str, str]] | None = None,
+) -> dict[str, list[str]]:
     """Return missing operation indexes and constraints.
 
     Column presence alone is insufficient for the durable kernel: dropping a
@@ -474,6 +479,16 @@ def operation_schema_object_diff(connection: Any) -> dict[str, list[str]]:
     jobs or invalid state transitions while all table-column checks still pass.
     """
 
+    index_definitions = (
+        EXPECTED_OPERATION_INDEX_DEFINITIONS
+        if index_definitions is None
+        else index_definitions
+    )
+    constraint_definitions = (
+        EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS
+        if constraint_definitions is None
+        else constraint_definitions
+    )
     index_rows = connection.execute(
         """
         SELECT p.indexname, p.indexdef, i.indisvalid
@@ -499,49 +514,65 @@ def operation_schema_object_diff(connection: Any) -> dict[str, list[str]]:
     invalid_indexes = sorted(
         name
         for name, definition, valid in index_rows
-        if name in EXPECTED_OPERATION_INDEX_DEFINITIONS
+        if name in index_definitions
         and (
             not valid
             or _normalize_catalog_sql(definition)
-            != _normalize_catalog_sql(EXPECTED_OPERATION_INDEX_DEFINITIONS[name])
+            != _normalize_catalog_sql(index_definitions[name])
         )
     )
     invalid_constraints = sorted(
         name
         for name, contype, validated, definition in constraint_rows
-        if name in EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS
+        if name in constraint_definitions
         and (
             not validated
             or (contype, _normalize_catalog_sql(definition))
             != (
-                EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS[name][0],
-                _normalize_catalog_sql(EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS[name][1]),
+                constraint_definitions[name][0],
+                _normalize_catalog_sql(constraint_definitions[name][1]),
             )
         )
     )
     return {
-        "missing_indexes": sorted(REQUIRED_OPERATION_INDEXES - indexes),
-        "missing_constraints": sorted(REQUIRED_OPERATION_CONSTRAINTS - constraints),
+        "missing_indexes": sorted(set(index_definitions) - indexes),
+        "missing_constraints": sorted(set(constraint_definitions) - constraints),
         "invalid_indexes": invalid_indexes,
         "invalid_constraints": invalid_constraints,
     }
 
 
-def procrastinate_schema_diff(connection: Any) -> dict[str, list[str]]:
+def procrastinate_schema_diff(
+    connection: Any,
+    *,
+    table_columns: dict[str, set[str]] | None = None,
+    required_indexes: set[str] | None = None,
+    types: dict[str, tuple[str, tuple]] | None = None,
+) -> dict[str, list[str]]:
     """Check the durable Procrastinate catalog beyond object names."""
+
+    table_columns = (
+        PROCRASTINATE_TABLE_COLUMNS if table_columns is None else table_columns
+    )
+    required_indexes = (
+        PROCRASTINATE_REQUIRED_INDEXES
+        if required_indexes is None
+        else required_indexes
+    )
+    types = PROCRASTINATE_TYPES if types is None else types
 
     table_rows = connection.execute(
         """SELECT table_name, column_name
            FROM information_schema.columns
            WHERE table_schema = 'public' AND table_name = ANY(%s)""",
-        (sorted(PROCRASTINATE_TABLE_COLUMNS),),
+        (sorted(table_columns),),
     ).fetchall()
     actual_columns: dict[str, set[str]] = {}
     for table, column in table_rows:
         actual_columns.setdefault(table, set()).add(column)
     missing_columns = [
         f"{table}.{column}"
-        for table, columns in PROCRASTINATE_TABLE_COLUMNS.items()
+        for table, columns in table_columns.items()
         for column in sorted(columns - actual_columns.get(table, set()))
     ]
 
@@ -549,7 +580,7 @@ def procrastinate_schema_diff(connection: Any) -> dict[str, list[str]]:
         """SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"""
     ).fetchall()
     missing_indexes = sorted(
-        PROCRASTINATE_REQUIRED_INDEXES - {row[0] for row in index_rows}
+        required_indexes - {row[0] for row in index_rows}
     )
 
     type_rows = connection.execute(
@@ -559,7 +590,7 @@ def procrastinate_schema_diff(connection: Any) -> dict[str, list[str]]:
            LEFT JOIN pg_enum AS e ON e.enumtypid = t.oid
            WHERE n.nspname = 'public' AND t.typname = ANY(%s)
            ORDER BY t.typname, e.enumsortorder""",
-        (sorted(PROCRASTINATE_TYPES),),
+        (sorted(types),),
     ).fetchall()
     actual_types: dict[str, tuple[str, list[str]]] = {}
     for name, type_code, enum_label in type_rows:
@@ -567,10 +598,10 @@ def procrastinate_schema_diff(connection: Any) -> dict[str, list[str]]:
         entry = actual_types.setdefault(name, (type_name, []))
         if enum_label is not None:
             entry[1].append(enum_label)
-    missing_types = sorted(set(PROCRASTINATE_TYPES) - set(actual_types))
+    missing_types = sorted(set(types) - set(actual_types))
     invalid_types = sorted(
         name
-        for name, (expected_kind, expected_values) in PROCRASTINATE_TYPES.items()
+        for name, (expected_kind, expected_values) in types.items()
         if name in actual_types
         and (
             actual_types[name][0] != expected_kind
@@ -586,7 +617,11 @@ def procrastinate_schema_diff(connection: Any) -> dict[str, list[str]]:
     }
 
 
-def kernel_semantic_diff(connection: Any) -> dict[str, list[str]]:
+def kernel_semantic_diff(
+    connection: Any,
+    *,
+    column_contract: dict[str, dict[str, tuple[str, bool, str | None]]] | None = None,
+) -> dict[str, list[str]]:
     """Compare durable-kernel types, nullability, and defaults.
 
     Defaults are normalized by PostgreSQL's ``pg_get_expr`` representation;
@@ -594,7 +629,10 @@ def kernel_semantic_diff(connection: Any) -> dict[str, list[str]]:
     guess whether the change is compatible with an existing deployment.
     """
 
-    expected_tables = tuple(KERNEL_COLUMN_CONTRACT)
+    column_contract = (
+        KERNEL_COLUMN_CONTRACT if column_contract is None else column_contract
+    )
+    expected_tables = tuple(column_contract)
     rows = connection.execute(
         """
         SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
@@ -615,7 +653,7 @@ def kernel_semantic_diff(connection: Any) -> dict[str, list[str]]:
         for table, column, type_name, nullable, default in rows
     }
     diffs: list[str] = []
-    for table, columns in KERNEL_COLUMN_CONTRACT.items():
+    for table, columns in column_contract.items():
         for column, expected in columns.items():
             value = actual.get((table, column))
             if value is None:

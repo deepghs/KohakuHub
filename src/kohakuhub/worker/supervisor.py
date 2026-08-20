@@ -7,7 +7,7 @@ import os
 import resource
 import signal
 from contextlib import AsyncExitStack
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from procrastinate.worker import Worker
@@ -49,14 +49,21 @@ class WorkerSupervisor:
     async def run(self) -> None:
         self._stop_requested = False
         ready = asyncio.Event()
-        http_runner = await serve_worker_http(
-            self.settings.metrics_host, self.settings.metrics_port, ready
+        startup_deadline = (
+            asyncio.get_running_loop().time() + self.settings.startup_timeout_seconds
         )
+        http_runner: Any | None = None
         tasks: list[asyncio.Task[Any]] = []
         health_stop: asyncio.Event | None = None
         health_task: asyncio.Task[Any] | None = None
         signal_handlers_installed = False
         try:
+            http_runner = await self._await_startup(
+                serve_worker_http(
+                    self.settings.metrics_host, self.settings.metrics_port, ready
+                ),
+                startup_deadline,
+            )
             built = self.app_factory(self.settings)
             if isinstance(built, (tuple, list)):
                 apps = tuple(built)
@@ -72,10 +79,14 @@ class WorkerSupervisor:
                 for app in apps:
                     if id(app) in opened:
                         continue
-                    await stack.enter_async_context(app.open_async())
+                    await self._await_startup(
+                        stack.enter_async_context(app.open_async()), startup_deadline
+                    )
                     opened.add(id(app))
                 for app in apps:
-                    await self._verify_readiness(app)
+                    await self._await_startup(
+                        self._verify_readiness(app), startup_deadline
+                    )
                 self._workers = []
                 for app, lane in zip(apps, self.lanes):
                     self._workers.append(
@@ -106,14 +117,17 @@ class WorkerSupervisor:
                 # advertising readiness.  Production Worker instances expose a
                 # worker_id after PostgreSQL registration; lightweight fakes do
                 # not, so they are considered started after one event-loop turn.
-                await self._wait_for_workers_started(tasks)
+                await self._wait_for_workers_started(
+                    tasks, deadline=startup_deadline
+                )
                 ready.set()
                 done, _ = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
                 )
                 failures = [task.exception() for task in done if not task.cancelled()]
-                if failures and failures[0] is not None:
-                    raise failures[0]
+                failure = next((error for error in failures if error is not None), None)
+                if failure is not None:
+                    raise failure
                 if not self._stop_requested:
                     raise RuntimeError("khub-worker lane exited unexpectedly")
         finally:
@@ -129,13 +143,41 @@ class WorkerSupervisor:
                 self._remove_signal_handlers()
             self._workers.clear()
             self._apps = ()
-            await close_worker_http(http_runner)
+            if http_runner is not None:
+                await close_worker_http(http_runner)
 
-    async def _wait_for_workers_started(self, tasks: list[asyncio.Task[Any]]) -> None:
+    async def _await_startup(
+        self, awaitable: Awaitable[Any], deadline: float
+    ) -> Any:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise RuntimeError(
+                "khub-worker startup did not complete within "
+                f"{self.settings.startup_timeout_seconds:g} seconds"
+            )
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "khub-worker startup did not complete within "
+                f"{self.settings.startup_timeout_seconds:g} seconds"
+            ) from exc
+
+    async def _wait_for_workers_started(
+        self,
+        tasks: list[asyncio.Task[Any]],
+        *,
+        deadline: float | None = None,
+    ) -> None:
         """Wait for registration and fail promptly when a lane exits early."""
 
+        loop = asyncio.get_running_loop()
+        deadline = deadline or loop.time() + self.settings.startup_timeout_seconds
         while True:
-            if all(getattr(worker, "worker_id", None) is not None for worker in self._workers):
+            if all(
+                getattr(worker, "worker_id", None) is not None
+                for worker in self._workers
+            ):
                 return
             done_tasks = [task for task in tasks if task.done()]
             if done_tasks:
@@ -143,12 +185,26 @@ class WorkerSupervisor:
                     return
                 for task in done_tasks:
                     if task.cancelled():
-                        raise RuntimeError("khub-worker lane was cancelled before readiness")
+                        raise RuntimeError(
+                            "khub-worker lane was cancelled before readiness"
+                        )
                     error = task.exception()
                     if error is not None:
                         raise error
                 raise RuntimeError("khub-worker lane exited before readiness")
-            await asyncio.sleep(0)
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self.stop()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise RuntimeError(
+                    "khub-worker did not become ready within "
+                    f"{self.settings.startup_timeout_seconds:g} seconds"
+                )
+            await asyncio.sleep(min(0.05, remaining))
 
     async def _verify_readiness(self, app: Any) -> None:
         """Fail startup before ready if the durable control plane is absent."""
@@ -179,6 +235,12 @@ class WorkerSupervisor:
             )
             if configured_budget < 1:
                 raise RuntimeError("worker connection budget must be positive")
+            required_budget = self.settings.configured_connection_budget
+            if configured_budget < required_budget:
+                raise RuntimeError(
+                    "worker connection budget is below configured allocation: "
+                    f"configured={configured_budget} required={required_budget}"
+                )
             headroom_limit = max_connections * 0.8
             if configured_budget > headroom_limit:
                 raise RuntimeError(

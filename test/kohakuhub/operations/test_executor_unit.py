@@ -192,6 +192,35 @@ async def test_executor_redacts_unexpected_handler_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_executor_does_not_turn_connection_failure_into_handler_failure(monkeypatch):
+    pool = _Pool()
+    operation, step = _records()
+    store = _Store(pool, operation, step)
+    monkeypatch.setattr(executor, "OperationStore", lambda _pool: store)
+
+    async def fail(_operation, _step):
+        raise ConnectionError("database connection dropped")
+
+    registry = _registry(
+        HandlerSpec(
+            kind=operation.kind,
+            version="1",
+            task_name="test.task",
+            queue="control-v1",
+            priority=1,
+            handler=fail,
+        )
+    )
+
+    with pytest.raises(ConnectionError, match="database connection dropped"):
+        await executor.execute_operation_step(
+            pool, str(operation.id), str(step.id), registry=registry
+        )
+
+    assert store.finished == []
+
+
+@pytest.mark.asyncio
 async def test_executor_moves_non_replayable_external_failure_to_observing(monkeypatch):
     pool = _Pool()
     operation, step = _records()

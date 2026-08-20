@@ -1000,6 +1000,48 @@ async def test_commit_unlocked_maps_commit_in_progress_to_observation_response(m
 
 
 @pytest.mark.asyncio
+async def test_commit_route_maps_outer_fence_conflict_to_observation_response(monkeypatch):
+    repo = SimpleNamespace(
+        id=1, owner=SimpleNamespace(username="owner"), private=False
+    )
+    client = _FakeLakeFSClient()
+    blocking_intent = _intent(id="blocking-intent")
+    service = _FakeOperationService(intent=_intent())
+
+    class Fence:
+        async def __aenter__(self):
+            raise commit_ops.CommitInProgress(blocking_intent)
+
+        async def __aexit__(self, *_args):
+            return False
+
+    service.repository_ref_fence = lambda *_args, **_kwargs: Fence()
+    _commit_dependencies(monkeypatch, client, repo)
+    monkeypatch.setattr(commit_ops, "Request", _FakeRequest)
+    monkeypatch.setattr(commit_ops.cfg.app, "db_backend", "postgres")
+
+    request = _FakeRequest(
+        b"",
+        app=SimpleNamespace(
+            state=SimpleNamespace(operation_runtime=SimpleNamespace(service=service))
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await commit_ops.commit(
+            commit_ops.RepoType.model,
+            "owner",
+            "repo",
+            "main",
+            request,
+            SimpleNamespace(id=7, username="owner"),
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["operation_id"] == "observation-1"
+
+
+@pytest.mark.asyncio
 async def test_commit_unlocked_maps_quota_exceeded_to_http_413(monkeypatch):
     repo = SimpleNamespace(
         id=1, owner=SimpleNamespace(username="owner"), private=False

@@ -9,14 +9,16 @@ from kohakuhub.migrations.schema import (
     signature_digest,
 )
 from kohakuhub.operations.sql import (
-    HISTORICAL_OPERATION_TABLE_COLUMNS_V2,
-    HISTORICAL_OPERATION_TABLE_COLUMNS_V3,
-    OPERATION_SCHEMA_SQL,
-    OPERATION_SCHEMA_VERSION,
     operation_column_contract,
     operation_table_columns,
     operation_table_columns_for_version,
 )
+from scripts.db_migrations._017_schema import (
+    HISTORICAL_OPERATION_TABLE_COLUMNS_V2,
+    HISTORICAL_OPERATION_TABLE_COLUMNS_V3,
+    OPERATION_SCHEMA_SQL_V8,
+)
+from scripts.khub_migrate import OPERATION_SCHEMA_VERSION_WORKER
 from scripts.khub_migrate import (
     _apply_operation_schema,
     _historical_operation_schema_checksum,
@@ -159,9 +161,11 @@ def test_real_v2_ledger_is_upgraded_to_current_operation_schema():
 
     _apply_operation_schema(connection)
 
-    assert connection.schema_statements == [OPERATION_SCHEMA_SQL]
-    assert connection.ledger[f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}"] == (
-        OPERATION_SCHEMA_VERSION,
+    assert connection.schema_statements == [OPERATION_SCHEMA_SQL_V8]
+    assert connection.ledger[
+        f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION_WORKER}"
+    ] == (
+        OPERATION_SCHEMA_VERSION_WORKER,
         _schema_checksum(),
     )
     assert connection.ledger["khub-operation-kernel"] == (
@@ -183,8 +187,10 @@ def test_newer_versioned_operation_ledger_is_used_as_upgrade_baseline():
 
     _apply_operation_schema(connection)
 
-    assert connection.ledger[f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}"] == (
-        OPERATION_SCHEMA_VERSION,
+    assert connection.ledger[
+        f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION_WORKER}"
+    ] == (
+        OPERATION_SCHEMA_VERSION_WORKER,
         _schema_checksum(),
     )
 

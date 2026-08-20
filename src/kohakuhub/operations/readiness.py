@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 from kohakuhub.migrations.schema import (
@@ -15,14 +14,16 @@ from kohakuhub.migrations.schema import (
     REQUIRED_OPERATION_CONSTRAINTS,
     REQUIRED_OPERATION_INDEXES,
     _normalize_catalog_sql,
-    expected_table_columns,
-    signature_digest,
+)
+from kohakuhub.migrations.worker_contract import (
+    APPLICATION_SCHEMA_ADOPTION_CHECKSUM_V1,
+    WORKER_OPERATION_SCHEMA_CHECKSUM_V1,
+    WORKER_OPERATION_SCHEMA_VERSION_V1,
+    WORKER_PROCRASTINATE_SCHEMA_CHECKSUM_V390,
 )
 from kohakuhub.operations.sql import (
-    OPERATION_SCHEMA_VERSION,
     operation_table_columns,
 )
-from procrastinate.schema import SchemaManager
 
 
 PROCRASTINATE_TABLES = {
@@ -58,7 +59,7 @@ async def verify_operation_schema(connection: Any) -> None:
             [
                 "khub-current-adoption",
                 "procrastinate-3.9.0",
-                f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}",
+                f"khub-operation-kernel-v{WORKER_OPERATION_SCHEMA_VERSION_V1}",
             ],
         ),
     )
@@ -69,15 +70,15 @@ async def verify_operation_schema(connection: Any) -> None:
     expected_ledger = {
         "khub-current-adoption": (
             1,
-            signature_digest(expected_table_columns(include_operations=False)),
+            APPLICATION_SCHEMA_ADOPTION_CHECKSUM_V1,
         ),
         "procrastinate-3.9.0": (
             1,
-            hashlib.sha256(SchemaManager.get_schema().encode("utf-8")).hexdigest(),
+            WORKER_PROCRASTINATE_SCHEMA_CHECKSUM_V390,
         ),
-        f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}": (
-            OPERATION_SCHEMA_VERSION,
-            signature_digest(operation_table_columns()),
+        f"khub-operation-kernel-v{WORKER_OPERATION_SCHEMA_VERSION_V1}": (
+            WORKER_OPERATION_SCHEMA_VERSION_V1,
+            WORKER_OPERATION_SCHEMA_CHECKSUM_V1,
         ),
     }
     ledger_errors = [

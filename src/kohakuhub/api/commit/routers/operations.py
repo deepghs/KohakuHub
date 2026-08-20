@@ -16,13 +16,10 @@ from kohakuhub.config import cfg
 from kohakuhub.db import File, LFSObjectHistory, Repository, User
 from kohakuhub.db_operations import (
     create_commit,
-    create_file,
-    delete_file,
     get_effective_lfs_threshold,
     get_file,
     get_organization,
     should_use_lfs,
-    update_file,
 )
 from kohakuhub.logger import get_logger
 from kohakuhub.auth.dependencies import get_current_user
@@ -218,7 +215,9 @@ async def _estimate_commit_quota_delta(
                 .where(
                     (File.repository == repo)
                     & (File.path_in_repo.startswith(folder_path))
-                    & (File.is_deleted == False)
+                    # Peewee builds SQL expressions from this comparison; a
+                    # Python ``not`` would evaluate the field immediately.
+                    & (File.is_deleted == False)  # noqa: E712
                 )
                 .tuples()
             ):
@@ -538,9 +537,7 @@ async def process_lfs_file(
             f"(path: {path}, bucket: {cfg.s3.bucket}, key: {lfs_key})",
             e,
         )
-        logger.warning(
-            f"Could not verify S3 object metadata, continuing without size check"
-        )
+        logger.warning("Could not verify S3 object metadata, continuing without size check")
 
     # Link the physical S3 object to LakeFS
     try:
@@ -806,7 +803,7 @@ async def process_copy_file(
     """
     if not src_path:
         raise HTTPException(
-            400, detail={"error": f"Missing srcPath for copyFile operation"}
+            400, detail={"error": "Missing srcPath for copyFile operation"}
         )
 
     logger.info(
@@ -934,9 +931,16 @@ async def commit(
                         status_code=503,
                         detail={"error": "mutation_fence_unavailable"},
                     )
-                async with repository_ref_fence(repo_row.id, revision):
-                    return await _commit_unlocked(
-                        repo_type, namespace, name, revision, request, user
+                try:
+                    async with repository_ref_fence(repo_row.id, revision):
+                        return await _commit_unlocked(
+                            repo_type, namespace, name, revision, request, user
+                        )
+                except CommitInProgress as exc:
+                    await _raise_commit_observing(
+                        operation_service,
+                        exc.intent,
+                        message="Another commit for this ref is still being observed",
                     )
     return await _commit_unlocked(repo_type, namespace, name, revision, request, user)
 

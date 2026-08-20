@@ -60,6 +60,18 @@ def test_worker_loads_valid_postgres_environment(monkeypatch):
     assert settings.database_url.endswith("/db")
 
 
+def test_worker_loads_startup_timeout_from_environment(monkeypatch):
+    monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KOHAKU_HUB_DATABASE_URL", "postgresql://user:pass@localhost/db"
+    )
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_STARTUP_TIMEOUT_SECONDS", "12.5")
+
+    settings = WorkerSettings.from_env()
+
+    assert settings.startup_timeout_seconds == 12.5
+
+
 def test_worker_rejects_non_positive_api_operation_pool_after_parsing(monkeypatch):
     monkeypatch.setenv("KOHAKU_HUB_DB_BACKEND", "postgres")
     monkeypatch.setenv(

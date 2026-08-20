@@ -10,6 +10,8 @@ CONTROL_QUEUE = "control-v1"
 SYNC_QUEUE = "sync-v1"
 BULK_QUEUE = "bulk-v1"
 CLEANUP_QUEUE = "cleanup-v1"
+API_OPERATION_POOL_MAX_ENV = "KOHAKU_HUB_OPERATION_POOL_MAX"
+DEFAULT_API_OPERATION_POOL_MAX = 4
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class WorkerSettings:
     polling_interval_seconds: float = 5.0
     heartbeat_interval_seconds: float = 10.0
     stalled_worker_timeout_seconds: float = 30.0
+    startup_timeout_seconds: float = 60.0
     operation_retention_hours: int = 168
     operation_retention_batch_size: int = 100
     api_processes: int = 4
@@ -94,6 +97,9 @@ class WorkerSettings:
             stalled_worker_timeout_seconds=_positive_float(
                 "KOHAKU_HUB_WORKER_STALLED_SECONDS", 30.0
             ),
+            startup_timeout_seconds=_positive_float(
+                "KOHAKU_HUB_WORKER_STARTUP_TIMEOUT_SECONDS", 60.0
+            ),
             operation_retention_hours=_positive_int(
                 "KOHAKU_HUB_OPERATION_RETENTION_HOURS", 168
             ),
@@ -101,11 +107,8 @@ class WorkerSettings:
                 "KOHAKU_HUB_OPERATION_RETENTION_BATCH", 100
             ),
             api_processes=_positive_int("KOHAKU_HUB_WORKERS", 4),
-            api_pool_max_size=_positive_int("KOHAKU_HUB_OPERATION_POOL_MAX", 4),
-            api_fence_max_connections=_positive_int(
-                "KOHAKU_HUB_API_FENCE_MAX_CONNECTIONS",
-                int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4")),
-            ),
+            api_pool_max_size=api_operation_pool_max_size_from_env(),
+            api_fence_max_connections=api_fence_connection_limit_from_env(),
             worker_fence_max_connections=_positive_int(
                 "KOHAKU_HUB_WORKER_FENCE_MAX_CONNECTIONS",
                 int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4")),
@@ -152,6 +155,24 @@ def _positive_int(name: str, default: int) -> int:
     if value < 1:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def api_operation_pool_max_size_from_env() -> int:
+    """Read the API operation-pool limit used by API and worker budgeting."""
+
+    return _positive_int(
+        API_OPERATION_POOL_MAX_ENV,
+        DEFAULT_API_OPERATION_POOL_MAX,
+    )
+
+
+def api_fence_connection_limit_from_env() -> int:
+    """Read the positive per-API-process mutation-fence connection limit."""
+
+    return _positive_int(
+        "KOHAKU_HUB_API_FENCE_MAX_CONNECTIONS",
+        int(os.getenv("KOHAKU_HUB_FENCE_MAX_CONNECTIONS", "4")),
+    )
 
 
 def _positive_float(name: str, default: float) -> float:
