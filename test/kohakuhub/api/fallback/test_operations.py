@@ -516,6 +516,9 @@ async def test_try_fallback_resolve_head_non_lfs_307_follows_for_content_length(
     # Content-Length / ETag replaced with the final hop's values.
     assert response.headers["content-length"] == "308468"
     assert response.headers["etag"] == '"deadbeef"'
+    # Newer huggingface_hub versions ignore Content-Length on redirects and
+    # require the linked-size metadata instead.
+    assert response.headers["x-linked-size"] == "308468"
     # X-Repo-Commit / X-Linked-Etag kept from the initial 307.
     assert response.headers["x-repo-commit"] == "abc123"
     assert response.headers["x-linked-etag"] == '"deadbeef"'

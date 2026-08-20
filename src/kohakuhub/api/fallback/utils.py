@@ -555,15 +555,16 @@ async def apply_resolve_head_postprocess(
        the HF origin. Rewriting against ``response.request.url`` keeps
        clients following the redirect on the upstream rather than
        bouncing it back to KohakuHub.
-    2. **Extra HEAD on non-LFS 3xx for Content-Length/ETag.** HF's 307
+    2. **Extra HEAD on non-LFS 3xx for size/ETag metadata.** HF's 307
        on a small file carries the redirect body's Content-Length
        (~278 bytes), not the file's. Without ``X-Linked-Size`` the
-       hf_hub client trusts that bogus Content-Length and fails its
-       post-download consistency check (observed in
-       ``imgutils.get_wd14_tags`` on ``selected_tags.csv``). A second
-       HEAD against the rewritten Location picks up the real
-       ``content-length`` / ``etag`` / ``x-repo-commit``. LFS files
-       already carry ``X-Linked-Size``; hf_hub prefers it over
+       hf_hub client either trusts that bogus value (older clients) or,
+       since ``huggingface_hub`` 1.28, ignores redirect ``Content-Length``
+       entirely and reports missing metadata. A second HEAD against the
+       rewritten Location picks up the real ``content-length`` /
+       ``etag`` / ``x-repo-commit``; the real size is exposed through both
+       ``Content-Length`` and ``X-Linked-Size`` for old and new clients.
+       LFS files already carry ``X-Linked-Size``; hf_hub prefers it over
        Content-Length so we skip the follow there.
 
     Plus the universal post-processing every fallback HEAD response
@@ -637,6 +638,16 @@ async def apply_resolve_head_postprocess(
             for k, v in follow_resp.headers.items():
                 if k.lower() in replace_keys:
                     resp_headers[k] = v
+            # ``huggingface_hub`` 1.28+ deliberately ignores
+            # redirect-body Content-Length. Advertise the final hop's
+            # actual size through the linked-size header as well, while
+            # keeping Content-Length for older client versions.
+            follow_size = (
+                follow_resp.headers.get("x-linked-size")
+                or follow_resp.headers.get("content-length")
+            )
+            if follow_size:
+                resp_headers["x-linked-size"] = follow_size
             has_commit = any(
                 k.lower() == "x-repo-commit" for k in resp_headers
             )

@@ -778,6 +778,7 @@ async def test_resolve_postprocess_runs_follow_head_for_non_lfs(monkeypatch):
     # Real values from follow-HEAD overwrote the redirect-body bogus ones.
     assert out.get("content-length") == "999999"
     assert out.get("etag") == '"real-etag"'
+    assert out.get("x-linked-size") == "999999"
     assert out.get("x-repo-commit") == "real-sha"
 
 
@@ -841,4 +842,3 @@ async def test_resolve_postprocess_strips_xet_and_adds_x_source():
     assert out.get("X-Source") == "Mirror"
     assert out.get("X-Source-URL") == "https://mirror.example"
     assert out.get("X-Source-Status") == "200"
-
