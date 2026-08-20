@@ -227,6 +227,11 @@ class _FakeOperationService:
         self.calls.append(("abandon_commit_intent", args, kwargs))
 
 
+class _BatchFakeOperationService(_FakeOperationService):
+    async def record_prepared_staging_paths(self, *args, **kwargs):
+        self.calls.append(("record_prepared_staging_paths", args, kwargs))
+
+
 def _intent(**overrides):
     values = {
         "id": "intent-1",
@@ -817,6 +822,44 @@ async def test_commit_unlocked_returns_503_when_base_head_cannot_be_resolved(mon
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail == {"error": "Unable to resolve commit base head"}
+
+
+@pytest.mark.asyncio
+async def test_commit_unlocked_returns_503_when_file_metadata_cannot_be_loaded(monkeypatch):
+    repo = SimpleNamespace(id=1, owner=SimpleNamespace(username="owner"))
+    client = _FakeLakeFSClient()
+    service = _BatchFakeOperationService()
+    _commit_dependencies(monkeypatch, client, repo)
+    monkeypatch.setattr(commit_ops.cfg.app, "db_backend", "postgres")
+
+    def fail_file_map(*_args):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        commit_ops,
+        "get_repo_file_map",
+        fail_file_map,
+    )
+    request = _FakeRequest(
+        _commit_body(_file_operation()),
+        app=SimpleNamespace(
+            state=SimpleNamespace(operation_runtime=SimpleNamespace(service=service))
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await commit_ops._commit_unlocked(
+            commit_ops.RepoType.model,
+            "owner",
+            "repo",
+            "main",
+            request,
+            SimpleNamespace(id=7, username="owner"),
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == {"error": "Unable to load commit file metadata"}
+    assert exc_info.value.headers == {"Retry-After": "30"}
 
 
 @pytest.mark.asyncio

@@ -482,6 +482,37 @@ def get_repo_file_metadata_map(
     }
 
 
+def get_repo_file_map(
+    repo: Repository, paths: Iterable[str]
+) -> dict[str, File]:
+    """Load all file rows needed by one mutation batch in a single query.
+
+    Unlike :func:`get_file`, this includes soft-deleted rows because commit
+    handlers need them to distinguish a restore from a new path.  Callers
+    that retain the active-only ``get_file`` semantics can filter the result
+    by ``is_deleted`` before passing a row to a helper.
+    """
+    path_list = list(dict.fromkeys(str(path) for path in paths if path))
+    if not path_list:
+        return {}
+
+    return {
+        row.path_in_repo: row
+        for row in File.select(
+            File.path_in_repo,
+            File.size,
+            File.sha256,
+            File.lfs,
+            File.is_deleted,
+        )
+        .where(
+            (File.repository == repo)
+            & File.path_in_repo.in_(path_list)
+        )
+        .iterator()
+    }
+
+
 def get_repo_file_sha256_map(repo: Repository) -> dict[str, str]:
     """Map every active file path in a repo to its stored sha256, in one query.
 

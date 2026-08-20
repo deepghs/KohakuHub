@@ -660,6 +660,57 @@ async def test_finalize_commit_domain_marks_deleted_main_file_on_supplied_connec
 
 
 @pytest.mark.asyncio
+async def test_finalize_commit_domain_batches_distinct_main_file_upserts():
+    connection = _Connection()
+    mutations = [
+        {
+            "path": f"items/file-{index}.txt",
+            "size": index + 1,
+            "sha256": f"sha-{index}",
+            "lfs": False,
+            "action": "upsert",
+        }
+        for index in range(4)
+    ]
+
+    await finalize_commit_domain(
+        connection,
+        payload=_finalizer_payload(file_mutations=mutations),
+    )
+
+    file_inserts = [
+        entry for entry in connection.queries if entry[0].lower().startswith("insert into file")
+    ]
+    assert len(file_inserts) == 1
+    assert file_inserts[0][1] == (
+        7,
+        "items/file-0.txt",
+        1,
+        "sha-0",
+        False,
+        3,
+        7,
+        "items/file-1.txt",
+        2,
+        "sha-1",
+        False,
+        3,
+        7,
+        "items/file-2.txt",
+        3,
+        "sha-2",
+        False,
+        3,
+        7,
+        "items/file-3.txt",
+        4,
+        "sha-3",
+        False,
+        3,
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("is_private", "expected_namespace_params"),
     (

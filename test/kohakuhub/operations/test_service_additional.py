@@ -866,6 +866,32 @@ async def test_record_staging_path_rejects_intent_after_preparation_boundary():
 
 
 @pytest.mark.asyncio
+async def test_record_prepared_staging_paths_rewrites_intent_once_for_a_batch():
+    intent = _intent(payload={"quota_delta": 0, "staging_paths": []})
+    store = _IntentStore(intent=intent)
+    service = OperationService(_Pool(), _app())
+    service.store = store
+
+    updated = await service.record_prepared_staging_paths(
+        intent.id,
+        paths=(
+            {"path": "items/file-0.txt", "recursive": False},
+            {"path": "items/file-1.txt", "recursive": False},
+            {"path": "items", "recursive": True},
+        ),
+    )
+
+    assert updated is intent
+    assert intent.payload_json["staging_paths"] == [
+        {"path": "items/file-0.txt", "recursive": False},
+        {"path": "items/file-1.txt", "recursive": False},
+        {"path": "items", "recursive": True},
+    ]
+    assert len(store.payload_updates) == 1
+    assert len(store.deadline_updates) == 1
+
+
+@pytest.mark.asyncio
 async def test_mark_commit_intent_uncertain_keeps_terminal_intent_unchanged():
     intent = _intent(state="finalized")
     store = _IntentStore(intent=intent)

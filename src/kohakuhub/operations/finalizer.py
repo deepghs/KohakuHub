@@ -65,42 +65,106 @@ async def finalize_commit_domain(
     # feature branch commit is still recorded in ``commit`` but must not
     # overwrite main's file view or billing totals.
     if str(payload["branch"]) == "main":
+        # The normal commit preflight rejects duplicate paths, so file
+        # mutations can be grouped safely without changing their outcome.  A
+        # defensive fallback retains the old ordered behavior for direct
+        # callers that supply duplicate paths.
+        normalized_mutations = []
+        seen_paths: set[str] = set()
+        has_duplicate_path = False
         for mutation in mutations:
             path = str(mutation["path"])
+            has_duplicate_path = has_duplicate_path or path in seen_paths
+            seen_paths.add(path)
             action = mutation.get("action", "upsert")
-            if action == "delete":
-                await connection.execute(
-                    """UPDATE file
-                       SET is_deleted = TRUE, updated_at = CURRENT_TIMESTAMP
-                       WHERE repository_id = %s AND path_in_repo = %s""",
-                    (repository_id, path),
-                )
-                continue
-            if action != "upsert":
+            if action not in {"delete", "upsert"}:
                 raise ValueError(f"unsupported commit file mutation: {action}")
-            await connection.execute(
-                """
-                INSERT INTO file
-                    (repository_id, path_in_repo, size, sha256, lfs, is_deleted,
-                     owner_id, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, FALSE, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT (repository_id, path_in_repo) DO UPDATE SET
-                    size = EXCLUDED.size,
-                    sha256 = EXCLUDED.sha256,
-                    lfs = EXCLUDED.lfs,
-                    is_deleted = FALSE,
-                    owner_id = EXCLUDED.owner_id,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    repository_id,
-                    path,
-                    int(mutation["size"]),
-                    str(mutation["sha256"]),
-                    bool(mutation["lfs"]),
-                    owner_id,
-                ),
-            )
+            normalized_mutations.append((path, action, mutation))
+
+        if has_duplicate_path:
+            for path, action, mutation in normalized_mutations:
+                if action == "delete":
+                    await connection.execute(
+                        """UPDATE file
+                           SET is_deleted = TRUE, updated_at = CURRENT_TIMESTAMP
+                           WHERE repository_id = %s AND path_in_repo = %s""",
+                        (repository_id, path),
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        INSERT INTO file
+                            (repository_id, path_in_repo, size, sha256, lfs, is_deleted,
+                             owner_id, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, FALSE, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ON CONFLICT (repository_id, path_in_repo) DO UPDATE SET
+                            size = EXCLUDED.size,
+                            sha256 = EXCLUDED.sha256,
+                            lfs = EXCLUDED.lfs,
+                            is_deleted = FALSE,
+                            owner_id = EXCLUDED.owner_id,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            repository_id,
+                            path,
+                            int(mutation["size"]),
+                            str(mutation["sha256"]),
+                            bool(mutation["lfs"]),
+                            owner_id,
+                        ),
+                    )
+        else:
+            delete_paths = [path for path, action, _ in normalized_mutations if action == "delete"]
+            upserts = [mutation for _, action, mutation in normalized_mutations if action == "upsert"]
+            if delete_paths:
+                if len(delete_paths) == 1:
+                    await connection.execute(
+                        """UPDATE file
+                           SET is_deleted = TRUE, updated_at = CURRENT_TIMESTAMP
+                           WHERE repository_id = %s AND path_in_repo = %s""",
+                        (repository_id, delete_paths[0]),
+                    )
+                else:
+                    await connection.execute(
+                        """UPDATE file
+                           SET is_deleted = TRUE, updated_at = CURRENT_TIMESTAMP
+                           WHERE repository_id = %s AND path_in_repo = ANY(%s)""",
+                        (repository_id, delete_paths),
+                    )
+            if upserts:
+                values_sql = ", ".join(
+                    "(%s, %s, %s, %s, %s, FALSE, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    for _ in upserts
+                )
+                params = []
+                for mutation in upserts:
+                    params.extend(
+                        (
+                            repository_id,
+                            str(mutation["path"]),
+                            int(mutation["size"]),
+                            str(mutation["sha256"]),
+                            bool(mutation["lfs"]),
+                            owner_id,
+                        )
+                    )
+                await connection.execute(
+                    f"""
+                    INSERT INTO file
+                        (repository_id, path_in_repo, size, sha256, lfs, is_deleted,
+                         owner_id, created_at, updated_at)
+                    VALUES {values_sql}
+                    ON CONFLICT (repository_id, path_in_repo) DO UPDATE SET
+                        size = EXCLUDED.size,
+                        sha256 = EXCLUDED.sha256,
+                        lfs = EXCLUDED.lfs,
+                        is_deleted = FALSE,
+                        owner_id = EXCLUDED.owner_id,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    tuple(params),
+                )
 
     # Keep the denormalized counters current at the same commit boundary as
     # the authoritative Commit/File rows. Replaying finalization is guarded by

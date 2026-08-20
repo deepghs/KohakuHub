@@ -18,6 +18,7 @@ from kohakuhub.db_operations import (
     create_commit,
     get_effective_lfs_threshold,
     get_file,
+    get_repo_file_map,
     get_organization,
     should_use_lfs,
 )
@@ -37,6 +38,8 @@ from kohakuhub.operations.service import (
 
 logger = get_logger("FILE")
 router = APIRouter()
+COMMIT_STAGE_CONCURRENCY = 8
+_UNSET_FILE = object()
 
 
 def _log_commit_payload_debug(lines: list[str], raw: bytes) -> None:
@@ -147,6 +150,7 @@ async def _estimate_commit_quota_delta(
     operations: list[dict],
     client,
     lakefs_repo: str,
+    existing_files: dict[str, File] | None = None,
 ) -> int:
     """Estimate the positive net storage delta before LakeFS staging.
 
@@ -178,9 +182,15 @@ async def _estimate_commit_quota_delta(
 
     delta = 0
 
+    def active_file(path: str) -> File | None:
+        if existing_files is None:
+            return get_file(repo, path)
+        existing = existing_files.get(path)
+        return existing if existing is not None and not existing.is_deleted else None
+
     def subtract_current(path: str) -> None:
         nonlocal delta
-        existing = get_file(repo, path)
+        existing = active_file(path)
         if existing and not existing.is_deleted and not existing.lfs:
             delta -= int(existing.size)
 
@@ -195,7 +205,7 @@ async def _estimate_commit_quota_delta(
         elif key == "lfsFile":
             oid = value.get("oid")
             size = int(value.get("size") or 0)
-            existing = get_file(repo, path)
+            existing = active_file(path)
             if existing and not existing.is_deleted and existing.lfs and existing.sha256 == oid:
                 continue
             lfs_key = f"lfs/{oid[:2]}/{oid[2:4]}/{oid}"
@@ -225,7 +235,7 @@ async def _estimate_commit_quota_delta(
                     delta -= int(existing[0])
         elif key == "copyFile":
             subtract_current(path)
-            source = get_file(repo, value.get("srcPath"))
+            source = active_file(value.get("srcPath"))
             if source is None:
                 source_object = await client.stat_object(
                     repository=lakefs_repo,
@@ -259,6 +269,7 @@ async def process_regular_file(
     lakefs_repo: str,
     revision: str,
     file_mutations: list[dict] | None = None,
+    existing_file: File | None | object = _UNSET_FILE,
 ) -> bool:
     """Process regular file with inline base64 content.
 
@@ -311,7 +322,7 @@ async def process_regular_file(
     git_blob_sha1 = calculate_git_blob_sha1(data)
 
     # Check if file unchanged (deduplication)
-    existing = get_file(repo, path)
+    existing = get_file(repo, path) if existing_file is _UNSET_FILE else existing_file
     if existing and existing.sha256 == git_blob_sha1 and existing.size == len(data):
         if existing.is_deleted:
             # File was deleted, now being restored - need to re-upload to LakeFS
@@ -365,6 +376,7 @@ async def process_lfs_file(
     lakefs_repo: str,
     revision: str,
     file_mutations: list[dict] | None = None,
+    existing_file: File | None | object = _UNSET_FILE,
 ) -> tuple[bool, dict | None]:
     """Process LFS file that was uploaded to S3.
 
@@ -387,7 +399,11 @@ async def process_lfs_file(
         raise HTTPException(400, detail={"error": f"Missing OID for LFS file {path}"})
 
     # Check for existing file (including deleted files to detect re-upload)
-    existing = File.get_or_none((File.repository == repo) & (File.path_in_repo == path))
+    existing = (
+        File.get_or_none((File.repository == repo) & (File.path_in_repo == path))
+        if existing_file is _UNSET_FILE
+        else existing_file
+    )
 
     # Track old LFS object for potential deletion
     old_lfs_oid = None
@@ -784,6 +800,7 @@ async def process_copy_file(
     lakefs_repo: str,
     revision: str,
     file_mutations: list[dict] | None = None,
+    source_file: File | None | object = _UNSET_FILE,
 ) -> bool:
     """Process file copy operation.
 
@@ -840,7 +857,7 @@ async def process_copy_file(
 
         # Capture metadata for post-commit finalization.  Direct helper calls
         # still use the old Peewee path for compatibility.
-        src_file = get_file(repo, src_path)
+        src_file = get_file(repo, src_path) if source_file is _UNSET_FILE else source_file
 
         if src_file:
             _record_file_upsert(
@@ -1088,6 +1105,7 @@ async def _commit_unlocked(
     files_changed = False
     pending_lfs_tracking = []
     file_mutations: list[dict] = []
+    existing_files: dict[str, File] | None = None
     request_headers = getattr(request, "headers", {})
     idempotency_key = request_headers.get("x-khub-idempotency-key") or request_headers.get(
         "idempotency-key"
@@ -1106,14 +1124,49 @@ async def _commit_unlocked(
         ).encode()
     ).hexdigest()
     intent = None
+    batch_staging_supported = callable(
+        getattr(operation_service, "record_prepared_staging_paths", None)
+    )
+    if cfg.app.db_backend == "postgres" and batch_staging_supported:
+        lookup_paths = {
+            str(candidate).strip("/")
+            for operation in operations
+            for candidate in (
+                operation.get("value", {}).get("path"),
+                operation.get("value", {}).get("srcPath")
+                if operation.get("key") == "copyFile"
+                else None,
+            )
+            if candidate
+        }
+        try:
+            existing_files = get_repo_file_map(repo_row, lookup_paths)
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                detail={"error": "Unable to load commit file metadata"},
+                headers={"Retry-After": "30"},
+            ) from exc
     if (
         callable(getattr(operation_service, "prepare_commit_intent", None))
         and cfg.app.db_backend == "postgres"
     ):
         try:
-            quota_delta = await _estimate_commit_quota_delta(
-                repo_row, operations, client, lakefs_repo
-            )
+            if existing_files is None:
+                # Keep the lightweight route/test doubles on the original
+                # call shape; production PostgreSQL runtimes use the shared
+                # batch map above.
+                quota_delta = await _estimate_commit_quota_delta(
+                    repo_row, operations, client, lakefs_repo
+                )
+            else:
+                quota_delta = await _estimate_commit_quota_delta(
+                    repo_row,
+                    operations,
+                    client,
+                    lakefs_repo,
+                    existing_files=existing_files,
+                )
         except ValueError as exc:
             raise HTTPException(
                 400,
@@ -1212,16 +1265,96 @@ async def _commit_unlocked(
                 detail={"error": "Storage quota exceeded"},
             ) from exc
 
+    # Record every target before the first LakeFS staging mutation.  The batch
+    # write is important for large HF commits: recovery needs the full target
+    # set, but it should not turn one request into one JSONB rewrite per file.
+    use_batch_staging = intent is not None and batch_staging_supported
+    if use_batch_staging:
+        intent = await operation_service.record_prepared_staging_paths(
+            intent.id,
+            paths=[
+                {
+                    "path": str(operation["value"].get("path")),
+                    "recursive": operation["key"] == "deletedFolder",
+                }
+                for operation in operations
+                if operation["value"].get("path")
+            ],
+        )
+
     # Process operations using match-case.  The ref fence acquired by the
     # route wrapper is held for this complete staging and commit sequence.
 
-    for op in operations:
+    index = 0
+    while index < len(operations):
+        op = operations[index]
         key = op["key"]
         value = op["value"]
         path = value.get("path")
         logger.info(f"Processing {key}: {path}")
 
-        if intent is not None and path:
+        # Independent regular-file uploads commute because overlapping paths
+        # were rejected by the quota preflight.  Keep a small cap so a large
+        # HF commit uses the pooled LakeFS client without overwhelming it.
+        if key == "file":
+            group_end = index + 1
+            while group_end < len(operations) and operations[group_end]["key"] == "file":
+                group_end += 1
+            group = operations[index:group_end]
+            if not use_batch_staging and intent is not None:
+                for group_op in group:
+                    group_path = group_op["value"].get("path")
+                    if group_path:
+                        await operation_service.record_prepared_staging_path(
+                            intent.id,
+                            path=str(group_path),
+                            recursive=False,
+                        )
+
+            async def stage_regular_file(group_op: dict) -> tuple[bool, list[dict]]:
+                local_mutations: list[dict] = []
+                group_value = group_op["value"]
+                existing = (
+                    existing_files.get(group_value.get("path"))
+                    if existing_files is not None
+                    else _UNSET_FILE
+                )
+                if existing is not _UNSET_FILE and existing is not None and existing.is_deleted:
+                    existing = None
+                async with stage_semaphore:
+                    changed = await process_regular_file(
+                        path=group_value.get("path"),
+                        content_b64=group_value.get("content"),
+                        encoding=(group_value.get("encoding") or "").lower(),
+                        repo=repo_row,
+                        lakefs_repo=lakefs_repo,
+                        revision=revision,
+                        file_mutations=local_mutations,
+                        existing_file=existing,
+                    )
+                return changed, local_mutations
+
+            stage_semaphore = asyncio.Semaphore(COMMIT_STAGE_CONCURRENCY)
+            if len(group) > 1 and existing_files is not None:
+                staged = await asyncio.gather(
+                    *(stage_regular_file(group_op) for group_op in group),
+                    return_exceptions=True,
+                )
+                for result in staged:
+                    if isinstance(result, BaseException):
+                        raise result
+                    changed, mutations = result
+                    files_changed = files_changed or changed
+                    file_mutations.extend(mutations)
+            else:
+                for group_op in group:
+                    changed, mutations = await stage_regular_file(group_op)
+                    files_changed = files_changed or changed
+                    file_mutations.extend(mutations)
+            index = group_end
+            continue
+
+        if intent is not None and path and not use_batch_staging:
             # Record the target before the first LakeFS staging mutation so a
             # stale prepared intent can reset the unchanged branch safely.
             await operation_service.record_prepared_staging_path(
@@ -1231,19 +1364,6 @@ async def _commit_unlocked(
             )
 
         match key:
-            case "file":
-                # Regular file with inline content
-                changed = await process_regular_file(
-                    path=path,
-                    content_b64=value.get("content"),
-                    encoding=(value.get("encoding") or "").lower(),
-                    repo=repo_row,
-                    lakefs_repo=lakefs_repo,
-                    revision=revision,
-                    file_mutations=file_mutations,
-                )
-                files_changed = files_changed or changed
-
             case "lfsFile":
                 # LFS file already in S3
                 changed, lfs_info = await process_lfs_file(
@@ -1255,6 +1375,9 @@ async def _commit_unlocked(
                     lakefs_repo=lakefs_repo,
                     revision=revision,
                     file_mutations=file_mutations,
+                    existing_file=(
+                        existing_files.get(path) if existing_files is not None else _UNSET_FILE
+                    ),
                 )
                 files_changed = files_changed or changed
                 if lfs_info:
@@ -1293,6 +1416,15 @@ async def _commit_unlocked(
 
             case "copyFile":
                 # Copy file
+                source_file = (
+                    existing_files.get(value.get("srcPath"))
+                    if existing_files is not None
+                    else _UNSET_FILE
+                )
+                if source_file is not _UNSET_FILE and (
+                    source_file is None or source_file.is_deleted
+                ):
+                    source_file = None
                 changed = await process_copy_file(
                     dest_path=path,
                     src_path=value.get("srcPath"),
@@ -1301,8 +1433,11 @@ async def _commit_unlocked(
                     lakefs_repo=lakefs_repo,
                     revision=revision,
                     file_mutations=file_mutations,
+                    source_file=source_file,
                 )
                 files_changed = files_changed or changed
+
+        index += 1
 
     # If no files changed, return early
     if not files_changed:

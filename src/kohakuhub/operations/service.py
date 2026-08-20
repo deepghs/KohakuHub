@@ -8,7 +8,7 @@ import asyncio
 import os
 import weakref
 from contextlib import asynccontextmanager
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -750,14 +750,35 @@ class OperationService:
         path: str,
         recursive: bool = False,
     ) -> CommitIntentRecord:
-        """Record a staging target before mutating the LakeFS branch.
+        """Record one staging target before mutating the LakeFS branch."""
+
+        return await self.record_prepared_staging_paths(
+            intent_id,
+            paths=({"path": path, "recursive": recursive},),
+        )
+
+    async def record_prepared_staging_paths(
+        self,
+        intent_id: UUID,
+        *,
+        paths: Sequence[Mapping[str, Any]],
+    ) -> CommitIntentRecord:
+        """Record all staging targets before mutating the LakeFS branch.
 
         This gives stale-preparation recovery enough information to reset the
-        unchanged branch safely after an API process dies mid-preparation.
+        unchanged branch safely after an API process dies mid-preparation,
+        while keeping one commit from doing a database round-trip per file.
         """
 
-        if not path:
-            raise ValueError("staging path is required")
+        entries = []
+        for target in paths:
+            path = str(target.get("path", ""))
+            if not path:
+                raise ValueError("staging path is required")
+            entries.append({"path": path, "recursive": bool(target.get("recursive", False))})
+        if not entries:
+            raise ValueError("at least one staging path is required")
+
         async with self.pool.connection() as connection:
             async with connection.transaction():
                 intent = await self.store.get_commit_intent(
@@ -769,9 +790,9 @@ class OperationService:
                     )
                 payload = dict(intent.payload_json)
                 paths = list(payload.get("staging_paths", []))
-                entry = {"path": path, "recursive": bool(recursive)}
-                if entry not in paths:
-                    paths.append(entry)
+                for entry in entries:
+                    if entry not in paths:
+                        paths.append(entry)
                 payload["staging_paths"] = paths
                 canonical, payload_hash = _canonical_payload(payload)
                 updated = await self.store.update_prepared_commit_payload(
