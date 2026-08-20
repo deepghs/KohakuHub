@@ -132,6 +132,22 @@ jobs:
             python -m pip install --upgrade "huggingface_hub==${HUGGINGFACE_HUB_VERSION}"
           fi
 
+      - name: Defer PostgreSQL checkpoints during the test suite
+        run: |
+          python - <<'PY'
+          import psycopg2
+
+          connection = psycopg2.connect(
+              "postgresql://hub_test:hub_test_password@127.0.0.1:25432/postgres"
+          )
+          connection.autocommit = True
+          with connection.cursor() as cursor:
+              cursor.execute("ALTER SYSTEM SET checkpoint_timeout = '30min'")
+              cursor.execute("ALTER SYSTEM SET max_wal_size = '4GB'")
+              cursor.execute("SELECT pg_reload_conf()")
+          connection.close()
+          PY
+
       - name: Run backend tests with coverage
         run: |
           make test-backend
@@ -258,6 +274,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
           python -m pip install --upgrade huggingface_hub
+
+      - name: Defer PostgreSQL checkpoints during the test suite
+        run: |
+          python - <<'PY'
+          import psycopg2
+
+          connection = psycopg2.connect(
+              "postgresql://hub_test:hub_test_password@127.0.0.1:25432/postgres"
+          )
+          connection.autocommit = True
+          with connection.cursor() as cursor:
+              cursor.execute("ALTER SYSTEM SET checkpoint_timeout = '30min'")
+              cursor.execute("ALTER SYSTEM SET max_wal_size = '4GB'")
+              cursor.execute("SELECT pg_reload_conf()")
+          connection.close()
+          PY
 
       - name: Run backend tests with cache disabled
         run: |

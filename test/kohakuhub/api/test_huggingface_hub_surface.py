@@ -272,9 +272,11 @@ async def test_repo_info_raises_named_error_after_delete(
     api = _api(live_server_url, hf_api_token)
     repo_id = "owner/hf-surf-delete-reraise"
     await _run(api.create_repo, repo_id)
-    from huggingface_hub.errors import HfHubHTTPError
+    # ``huggingface_hub.errors`` is unavailable in the oldest supported
+    # client; ``utils`` remains the cross-version import path.
+    from huggingface_hub.utils import HfHubHTTPError
 
-    with pytest.raises(HfHubHTTPError, match="503 Service Unavailable"):
+    with pytest.raises(HfHubHTTPError, match="Service Unavailable"):
         await _run(api.delete_repo, repo_id)
     assert await _run(api.repo_exists, repo_id) is True
 

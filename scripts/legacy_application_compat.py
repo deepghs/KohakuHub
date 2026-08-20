@@ -1089,6 +1089,32 @@ def migrate_postgres() -> bool:
     _postgres_rename_legacy_column(cursor, "emailverification", "user", "user_id")
     _postgres_rename_legacy_column(cursor, "invitation", "created_by", "created_by_id")
     _postgres_rename_legacy_column(cursor, "invitation", "used_by", "used_by_id")
+    # The pre-008 invitation schema made created_by mandatory.  The current
+    # contract permits system-created invitations, so make it nullable before
+    # normalizing dangling legacy references and installing the foreign keys.
+    cursor.execute(
+        "ALTER TABLE invitation ALTER COLUMN created_by_id DROP NOT NULL"
+    )
+    cursor.execute(
+        """
+        UPDATE invitation
+        SET created_by_id = NULL
+        WHERE created_by_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM "user" WHERE "user".id = invitation.created_by_id
+          )
+        """
+    )
+    cursor.execute(
+        """
+        UPDATE invitation
+        SET used_by_id = NULL
+        WHERE used_by_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM "user" WHERE "user".id = invitation.used_by_id
+          )
+        """
+    )
 
     _postgres_add_column(cursor, "file", "repository_id", "INTEGER")
     _postgres_add_column(cursor, "file", "owner_id", "INTEGER")

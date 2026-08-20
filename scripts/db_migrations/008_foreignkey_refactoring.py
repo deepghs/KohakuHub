@@ -56,26 +56,24 @@ def is_applied(db, cfg):
 
     NOTE: We implement this inline without importing check_column_exists
     to avoid any potential issues with circular imports or schema mismatches.
+    A known-absent signature returns False; database and metadata errors are
+    allowed to propagate so earlier migrations cannot be skipped silently.
     """
-    try:
-        cursor = db.cursor()
-        if cfg.app.db_backend == "postgres":
-            cursor.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name='user' AND column_name='is_org'
-            """,
-            )
-            return cursor.fetchone() is not None
-        else:
-            # SQLite
-            cursor.execute("PRAGMA table_info(user)")
-            columns = [row[1] for row in cursor.fetchall()]
-            return "is_org" in columns
-    except Exception:
-        # Error = treat as applied (safe fallback to skip this migration)
-        return True
+    cursor = db.cursor()
+    if cfg.app.db_backend == "postgres":
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name='user' AND column_name='is_org'
+        """,
+        )
+        return cursor.fetchone() is not None
+
+    # SQLite
+    cursor.execute("PRAGMA table_info(user)")
+    columns = [row[1] for row in cursor.fetchall()]
+    return "is_org" in columns
 
 
 def check_migration_needed():

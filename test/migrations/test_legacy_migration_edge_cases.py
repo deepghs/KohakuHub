@@ -10,6 +10,8 @@ from kohakuhub.utils.lakefs import lakefs_repo_name
 from scripts import legacy_application_compat, legacy_invitation_compat
 
 from test.migrations.support.migration_history_database import (
+    CURRENT_RUNNER,
+    IsolatedPostgresDatabase,
     ROOT_DIR,
     _initialize_archived_schema,
     _run_archived_migrations,
@@ -18,6 +20,7 @@ from test.migrations.support.migration_history_database import (
     archive_parent,
     archive_release,
     create_sqlite_database,
+    postgres_dsn,
     seed_database,
     snapshot_database,
 )
@@ -60,6 +63,43 @@ def _historical_sqlite(tmp_path, slug):
     )
     assert result.succeeded, result.diagnostic()
     return database
+
+
+def test_postgres_008_nulls_dangling_invitation_references(tmp_path):
+    dsn = postgres_dsn()
+    if dsn is None:
+        pytest.skip(
+            "set KOHAKU_HUB_MIGRATION_HISTORY_DSN to enable PostgreSQL migration coverage"
+        )
+
+    import psycopg
+
+    release = next(release for release in HISTORICAL_RELEASES if release.slug == "v007")
+    with IsolatedPostgresDatabase(dsn) as database:
+        archive_root = archive_release(release, tmp_path / "archive")
+        base_root = archive_parent(release, tmp_path / "base")
+        _initialize_archived_schema(base_root, database)
+        seed_database(database)
+        legacy_run = _run_archived_migrations(
+            archive_root,
+            database,
+            release.migration_numbers[-1],
+        )
+        assert legacy_run.succeeded, legacy_run.diagnostic()
+
+        with psycopg.connect(database.url) as connection:
+            connection.execute(
+                "UPDATE invitation SET created_by = 999, used_by = 999 WHERE id = 1"
+            )
+            connection.commit()
+
+        result = _run_script(CURRENT_RUNNER, database, cwd=ROOT_DIR)
+
+        assert result.succeeded, result.diagnostic()
+        with psycopg.connect(database.url) as connection:
+            assert connection.execute(
+                "SELECT created_by_id, used_by_id FROM invitation WHERE id = 1"
+            ).fetchone() == (None, None)
 
 
 def _run_current_runner(database):

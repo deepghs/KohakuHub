@@ -413,9 +413,12 @@ async def test_hf_api_likes_visibility_move_delete_and_list_liked_repos(
     # its durable cleanup handler lands.  Keep the expected HF wire behavior
     # explicit here instead of turning the disabled operation into a hidden
     # compatibility regression.
-    from huggingface_hub.errors import HfHubHTTPError
+    # ``huggingface_hub.errors`` was introduced after the oldest client in
+    # the compatibility matrix.  ``utils`` is the stable import path across
+    # all supported releases.
+    from huggingface_hub.utils import HfHubHTTPError
 
-    with pytest.raises(HfHubHTTPError, match="503 Service Unavailable"):
+    with pytest.raises(HfHubHTTPError, match="Service Unavailable"):
         await asyncio.to_thread(
             lambda: api.delete_repo("owner/hf-lifecycle-renamed")
         )

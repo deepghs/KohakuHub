@@ -164,6 +164,19 @@ def test_historical_supersession_check_does_not_mask_loader_errors(monkeypatch):
         _migration_utils.should_skip_due_to_future_migrations(1, None, None)
 
 
+def test_historical_supersession_check_does_not_mask_metadata_errors():
+    class BrokenDatabase:
+        def cursor(self):
+            raise RuntimeError("migration metadata unavailable")
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        _migration_utils.should_skip_due_to_future_migrations(
+            1,
+            BrokenDatabase(),
+            _config("postgres"),
+        )
+
+
 def test_017_is_a_sqlite_no_op(monkeypatch):
     migration = _load_migration_017()
     database = _Database()
