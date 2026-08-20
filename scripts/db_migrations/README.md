@@ -12,10 +12,20 @@ schema. Their numbering and order remain the historical compatibility contract;
 the few corrections described below preserve that contract while making the
 old path executable on real data.
 
-There is no `018` migration in the current repository. That number remains
-available for the next independent schema change. The released `main` schema
-is the pre-worker boundary: historical checks are no-ops there and the first
-effective change is `017`.
+No migration follows `017` in the current repository. A later independent
+schema change should receive the next migration number after this boundary.
+The released `main` schema is the pre-worker boundary: historical checks are
+no-ops there and the first effective change is `017`.
+
+Before releasing a change to this stream, run the static numbering check:
+
+```bash
+python scripts/verify_migration_sequence.py
+```
+
+The check validates continuity, duplicate numbers, and each file's declared
+`MIGRATION_NUMBER`. It accepts migrations after `017`; a new `018` or later
+file extends the stream instead of being rejected by a unit test.
 
 The numbering and upgrade order of `001`-`016` are unchanged. A small number
 of existing scripts contain compatibility corrections required to complete

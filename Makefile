@@ -4,6 +4,13 @@ TEST_ROOT ?= test/kohakuhub
 SOURCE_ROOT ?= src/kohakuhub
 RANGE_DIR ?=
 TEST_RANGE = $(if $(strip $(RANGE_DIR)),$(TEST_ROOT)/$(RANGE_DIR),$(TEST_ROOT))
+# Historical migration tests exercise scripts/ and real database upgrades;
+# they run in the dedicated migration-validation job, not the unit suite.
+MIGRATION_TEST_PATHS = \
+	$(TEST_ROOT)/test_db_migration_compatibility.py \
+	$(TEST_ROOT)/test_legacy_migration_edge_cases.py \
+	$(TEST_ROOT)/test_migration_history_matrix.py
+UNIT_TEST_IGNORE_ARGS = $(foreach test,$(MIGRATION_TEST_PATHS),--ignore=$(test))
 COV_RANGE = $(if $(strip $(RANGE_DIR)),$(SOURCE_ROOT)/$(RANGE_DIR),$(SOURCE_ROOT))
 COV_FAIL_UNDER ?= $(if $(strip $(RANGE_DIR)),0,80)
 COV_TYPES ?= xml term-missing
@@ -15,8 +22,8 @@ UI_ADMIN_TEST_ROOT ?= test/kohaku-hub-admin
 
 .PHONY: help init-env install-backend install-frontend install infra-up infra-down \
 	backend seed-demo reset-local-data reset-and-seed ui ui-only admin status \
-	logs-postgres logs-minio logs-lakefs test test-backend test-ui test-ui-admin \
-	verify-seed-demo
+	logs-postgres logs-minio logs-lakefs test test-backend test-migrations test-ui test-ui-admin \
+	verify-seed-demo verify-migration-sequence
 
 help:
 	@echo "Local development targets:"
@@ -28,6 +35,7 @@ help:
 	@echo "  make infra-down       Stop local infra containers but keep persisted data"
 	@echo "  make seed-demo        Run migrations + first-run demo seed without starting uvicorn"
 	@echo "  make verify-seed-demo Verify the local demo seed fixtures without starting uvicorn"
+	@echo "  make verify-migration-sequence Check the numbered migration stream"
 	@echo "  make reset-local-data Dangerously clear local KohakuHub dev data through the local reset helper"
 	@echo "  make reset-and-seed   Reset persisted local data, then bootstrap fresh demo data"
 	@echo "  make backend          Run FastAPI backend in reload mode"
@@ -38,6 +46,7 @@ help:
 	@echo "                        Example: make test-backend RANGE_DIR=api"
 	@echo "                        Example: make test-backend RANGE_DIR=api/repo/routers"
 	@echo "                        Options: COV_TYPES='xml term-missing'"
+	@echo "  make test-migrations  Run historical migration and upgrade validation separately"
 	@echo "  make test-ui          Run the main UI Vitest suite with coverage"
 	@echo "  make test-ui-admin    Run the admin UI Vitest suite with coverage"
 	@echo "  make test             Run backend tests, then main UI tests, then admin UI tests"
@@ -123,7 +132,13 @@ test-backend:
 		echo "Missing coverage range: $(COV_RANGE)" >&2; \
 		exit 1; \
 	fi
-	$(PYTHON) -m pytest $(TEST_RANGE) $(PYTEST_ARGS)
+	$(PYTHON) -m pytest $(TEST_RANGE) $(UNIT_TEST_IGNORE_ARGS) $(PYTEST_ARGS)
+
+test-migrations:
+	$(PYTHON) -m pytest $(MIGRATION_TEST_PATHS) $(MIGRATION_PYTEST_ARGS)
+
+verify-migration-sequence:
+	$(PYTHON) scripts/verify_migration_sequence.py
 
 test-ui:
 	@if [[ ! -d "$(UI_DIR)" ]]; then \

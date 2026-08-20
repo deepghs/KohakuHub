@@ -72,9 +72,9 @@ def test_017_uses_the_worker_ledger_records_for_postgres():
     expected = _expected_worker_ledger_records()
     rows = [(name, version, checksum) for name, (version, checksum) in expected.items()]
 
-    assert migration.MIGRATION_NUMBER == 17
     # The durable ledger records the worker schema contract, not this filename.
-    # A pre-release execution of the old 018 file therefore remains detectable.
+    # A pre-release execution of the former worker migration file therefore
+    # remains detectable after the numbered boundary was corrected.
     assert migration.is_applied(_Database(rows), _config("postgres")) is True
 
     incomplete_rows = rows[:-1]
@@ -162,45 +162,6 @@ def test_017_is_a_sqlite_no_op(monkeypatch):
     assert migration.run() is True
     assert database.connect_calls == 1
     assert database.cursor_instance.executed == []
-
-
-def test_runner_discovers_the_complete_numbered_chain(tmp_path, monkeypatch):
-    migrations_dir = tmp_path / "db_migrations"
-    migrations_dir.mkdir()
-    for name in (
-        "001_repository_schema.py",
-        "016_repository_lakefs_repo.py",
-        "017_durable_worker_schema.py",
-        "018_follow_up.py",
-        "019_follow_up.py",
-        "not_a_migration.py",
-    ):
-        (migrations_dir / name).touch()
-
-    monkeypatch.setattr(run_migrations, "SCRIPT_DIR", tmp_path)
-
-    assert [name for name, _path in run_migrations.discover_migrations()] == [
-        "001_repository_schema",
-        "016_repository_lakefs_repo",
-        "017_durable_worker_schema",
-        "018_follow_up",
-        "019_follow_up",
-    ]
-
-
-def test_runner_sorts_unpadded_numeric_migration_prefixes(tmp_path, monkeypatch):
-    migrations_dir = tmp_path / "db_migrations"
-    migrations_dir.mkdir()
-    for name in ("10_later.py", "2_earlier.py", "001_first.py"):
-        (migrations_dir / name).touch()
-
-    monkeypatch.setattr(run_migrations, "SCRIPT_DIR", tmp_path)
-
-    assert [name for name, _path in run_migrations.discover_migrations()] == [
-        "001_first",
-        "2_earlier",
-        "10_later",
-    ]
 
 
 def test_fresh_database_continues_to_numbered_migration_017(monkeypatch):

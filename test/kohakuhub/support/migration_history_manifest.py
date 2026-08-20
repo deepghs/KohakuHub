@@ -46,13 +46,3 @@ def migration_history_releases() -> tuple[HistoricalRelease, ...]:
     """Return all historical numbered checkpoints followed by ``main``."""
 
     return HISTORICAL_RELEASES + (MAIN_RELEASE,)
-
-
-def covered_migration_numbers() -> set[int]:
-    """Return the numbered historical migrations represented by the matrix."""
-
-    return {
-        number
-        for release in HISTORICAL_RELEASES
-        for number in release.migration_numbers
-    }

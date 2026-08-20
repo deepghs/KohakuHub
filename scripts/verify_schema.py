@@ -11,8 +11,8 @@ import psycopg
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
 
-from kohakuhub.config import cfg
-from kohakuhub.migrations.schema import (
+from kohakuhub.config import cfg  # noqa: E402
+from kohakuhub.migrations.schema import (  # noqa: E402
     is_exact_current_schema,
     kernel_semantic_diff,
     operation_schema_object_diff,

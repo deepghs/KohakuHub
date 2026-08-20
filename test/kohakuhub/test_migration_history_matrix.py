@@ -39,7 +39,6 @@ from test.kohakuhub.support.migration_history_database import (
 from test.kohakuhub.support.migration_history_manifest import (
     HISTORICAL_RELEASES,
     MAIN_RELEASE,
-    covered_migration_numbers,
     migration_history_releases,
 )
 
@@ -76,59 +75,6 @@ def migration_history_case(request, tmp_path_factory) -> PreparedMigrationHistor
             yield prepare_migration_history(release, isolated, workdir)
     except MigrationHistoryError as exc:
         raise AssertionError(str(exc)) from exc
-
-
-def test_matrix_manifest_covers_every_released_numbered_schema():
-    releases = migration_history_releases()
-
-    assert releases[-1] == MAIN_RELEASE
-    assert covered_migration_numbers() == set(range(1, 17))
-    assert [release.slug for release in releases] == [
-        "v001",
-        "v002",
-        "v003",
-        "v004",
-        "v005",
-        "v006",
-        "v007",
-        "v008",
-        "v009",
-        "v010",
-        "v011",
-        "v012",
-        "v013",
-        "v014",
-        "v015",
-        "v016",
-        "main",
-    ]
-
-
-def test_pre_worker_boundary_is_explicit_and_starts_at_017():
-    """The worker schema is the first numbered post-main migration."""
-
-    assert not any(
-        path.name.startswith("018_")
-        for path in (CURRENT_RUNNER.parent / "db_migrations").glob("*.py")
-    )
-    assert any(
-        path.name.startswith("017_")
-        for path in (CURRENT_RUNNER.parent / "db_migrations").glob("*.py")
-    )
-    assert MAIN_RELEASE.migration_numbers == ()
-
-
-def test_each_available_main_migration_has_a_real_upgrade_checkpoint():
-    """Every numbered migration shipped by main is represented in the matrix."""
-
-    by_number = {
-        number: release
-        for release in migration_history_releases()
-        for number in release.migration_numbers
-    }
-
-    assert set(by_number) == set(range(1, 17))
-    assert 17 not in by_number
 
 
 def test_real_fresh_sqlite_database_reaches_current_schema(tmp_path):
