@@ -92,14 +92,15 @@ async def _retry_cancel_requested_deliveries(
     retried = 0
     for delivery in deliveries:
         try:
-            await cancel_job(delivery["job_id"], abort=True)
+            cancelled = await cancel_job(delivery["job_id"], abort=True)
         except Exception as exc:
             logger.warning(
                 "Failed to retry cancellation for Procrastinate job "
                 f"{delivery['job_id']} (operation {delivery['operation_id']}): {exc}"
             )
             continue
-        retried += 1
+        if cancelled:
+            retried += 1
     return retried
 
 
@@ -645,7 +646,7 @@ async def reconcile_once(
     if retention_batch_size < 1:
         raise ValueError("retention_batch_size must be positive")
     try:
-        await _recover_stalled_deliveries(
+        recovered_stalled_job_ids = await _recover_stalled_deliveries(
             app,
             seconds_since_heartbeat=stalled_timeout_seconds,
             limit=limit,
@@ -663,9 +664,6 @@ async def reconcile_once(
                 if not row or not row[0]:
                     RECONCILIATION_RUNS.labels(result="locked").inc()
                     return 0
-                repaired += await store.finalize_cancelled_pending_steps(
-                    connection, limit=limit
-                )
                 missing_jobs = await store.list_steps_missing_jobs(
                     connection, limit=limit, for_update=True
                 )
@@ -687,6 +685,12 @@ async def reconcile_once(
                     await store.set_job_id(connection, item["step_id"], job_id)
                     OPERATION_JOBS_REPAIRED.labels(kind=item["kind"]).inc()
                     repaired += 1
+
+                # Cancellation is a local durable transition.  Complete it
+                # before commit observation can fail or spend time in LakeFS.
+                repaired += await store.finalize_cancelled_pending_steps(
+                    connection, limit=limit
+                )
 
         async with pool.connection() as connection:
             intents = await store.list_recoverable_commit_intents(
@@ -780,6 +784,7 @@ async def reconcile_once(
                        FROM khub_repository_operations o
                        JOIN khub_operation_steps s ON s.operation_id = o.id
                        WHERE s.state IN ('running', 'observing', 'dispatch_started')
+                         AND o.state <> 'cancel_requested'
                          AND s.heartbeat_at < CURRENT_TIMESTAMP
                              - (%s * INTERVAL '1 second')
                          AND (
@@ -788,11 +793,16 @@ async def reconcile_once(
                                    SELECT 1
                                    FROM procrastinate_jobs j
                                    WHERE j.id = s.procrastinate_job_id
-                                     AND j.status = 'doing'
+                                     AND j.status IN ('todo', 'doing')
                                )
+                               OR s.procrastinate_job_id = ANY(%s::bigint[])
                          )
                        LIMIT %s FOR UPDATE SKIP LOCKED""",
-                    (stalled_timeout_seconds, limit),
+                    (
+                        stalled_timeout_seconds,
+                        sorted(recovered_stalled_job_ids),
+                        limit,
+                    ),
                 )
                 stale_rows = await cursor.fetchall()
                 for operation_id, kind, step_id, external_marker in stale_rows:

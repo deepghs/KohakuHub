@@ -1085,6 +1085,38 @@ async def test_reconcile_repairs_jobs_intents_stale_deliveries_and_retention(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["false", "raises"])
+async def test_cancel_requested_delivery_retry_does_not_claim_terminal_progress(
+    monkeypatch, mode
+):
+    class Store:
+        def __init__(self, _pool):
+            pass
+
+        async def list_cancel_requested_deliveries(self, _connection, **_kwargs):
+            return [{"operation_id": "operation", "step_id": 1, "job_id": 9}]
+
+    class Manager:
+        def __init__(self):
+            self.calls = []
+
+        async def cancel_job_by_id_async(self, job_id, *, abort):
+            self.calls.append((job_id, abort))
+            if mode == "raises":
+                raise RuntimeError("cancel endpoint unavailable")
+            return False
+
+    manager = Manager()
+    monkeypatch.setattr(reconciliation, "OperationStore", Store)
+    app = SimpleNamespace(job_manager=manager)
+
+    assert await reconciliation._retry_cancel_requested_deliveries(
+        _Pool(SimpleNamespace()), app, limit=10
+    ) == 0
+    assert manager.calls == [(9, True)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mode",
     ["missing", "early", "no_marker", "branch_error", "log_error", "non_dict", "no_id"],

@@ -7,8 +7,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
-from kohakuhub.config import cfg
-
 
 class MutationFenceRequired(RuntimeError):
     """Raised when a production LakeFS mutation lacks a repository fence."""
@@ -48,6 +46,12 @@ def test_compatibility():
         _TEST_COMPATIBILITY.reset(token)
 
 
+def test_compatibility_enabled() -> bool:
+    """Return whether the current context explicitly opted into test mode."""
+
+    return _TEST_COMPATIBILITY.get()
+
+
 def activate_capability(capability: MutationCapability):
     """Activate a capability for the current async context."""
 
@@ -76,10 +80,7 @@ def bind_repository(repository: str) -> None:
 
     capability = _ACTIVE_CAPABILITY.get()
     if capability is None:
-        if (
-            _TEST_COMPATIBILITY.get()
-            or cfg.app.db_backend != "postgres"
-        ):
+        if test_compatibility_enabled():
             return
         raise MutationFenceRequired("cannot bind a LakeFS repository without a fence")
     if capability.scope not in {"repository_name", "cutover", "test_compatibility"}:
@@ -114,10 +115,7 @@ def require_capability(operation: str, kwargs: dict[str, Any]) -> MutationCapabi
     """
 
     capability = _ACTIVE_CAPABILITY.get()
-    if capability is None and (
-        _TEST_COMPATIBILITY.get()
-        or cfg.app.db_backend != "postgres"
-    ):
+    if capability is None and test_compatibility_enabled():
         return MutationCapability(
             None,
             "__test__",

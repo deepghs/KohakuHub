@@ -845,6 +845,65 @@ async def test_cancelled_queued_job_converges_without_worker(runtime):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("job_state", ["failed", "cancelled", "aborted", "missing"])
+async def test_cancel_requested_running_step_converges_after_delivery_is_terminal_or_missing(
+    runtime, job_state
+):
+    operation = await runtime.service.accept(
+        kind="maintenance.noop.v1",
+        resource_key=f"test:cancel-terminal-job:{job_state}:{uuid4()}",
+        payload={},
+        requested_by_user_id=None,
+        trigger="system",
+    )
+    async with runtime.pool.connection() as connection:
+        step = await runtime.service.store.get_step_for_operation(
+            connection, operation.id, 0
+        )
+    assert step is not None and step.procrastinate_job_id is not None
+
+    async with runtime.pool.connection() as connection:
+        async with connection.transaction():
+            if job_state == "missing":
+                await connection.execute(
+                    "DELETE FROM procrastinate_jobs WHERE id = %s",
+                    (step.procrastinate_job_id,),
+                )
+            else:
+                await connection.execute(
+                    "UPDATE procrastinate_jobs SET status = %s WHERE id = %s",
+                    (job_state, step.procrastinate_job_id),
+                )
+            await connection.execute(
+                """UPDATE khub_operation_steps
+                   SET state = 'running', external_marker = NULL,
+                       heartbeat_at = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (step.id,),
+            )
+            await connection.execute(
+                """UPDATE khub_repository_operations
+                   SET state = 'cancel_requested',
+                       cancel_requested_at = CURRENT_TIMESTAMP,
+                       phase = 'cancelling', finished_at = NULL
+                   WHERE id = %s""",
+                (operation.id,),
+            )
+
+    await reconcile_once(runtime.pool, runtime.app)
+
+    async with runtime.pool.connection() as connection:
+        current_operation = await runtime.service.store.get_operation(
+            connection, operation.id
+        )
+        current_step = await runtime.service.store.get_step_for_operation(
+            connection, operation.id, 0
+        )
+    assert current_operation is not None and current_operation.state == "cancelled"
+    assert current_step is not None and current_step.state == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_first_idempotency_requests_converge(runtime):
     key = f"concurrent-{uuid4()}"
     resource = f"test:concurrent:{uuid4()}"
@@ -1046,7 +1105,6 @@ async def test_failed_enqueue_rolls_back_domain_rows(runtime):
     from kohakuhub.operations.service import OperationService
 
     service = OperationService(runtime.pool, FailingApp())
-    operation_id = None
     with pytest.raises(RuntimeError, match="injected"):
         await service.accept(
             kind="maintenance.noop.v1",

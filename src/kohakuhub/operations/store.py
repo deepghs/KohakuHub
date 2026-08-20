@@ -634,39 +634,51 @@ class OperationStore:
     async def finalize_cancelled_pending_steps(
         self, connection: psycopg.AsyncConnection, *, limit: int = 100
     ) -> int:
-        """Finalize queued cancellations after Procrastinate stops delivery."""
+        """Finalize pre-dispatch cancellations after delivery is no longer active.
+
+        A failed cancellation request must not race an active Procrastinate
+        delivery.  ``todo`` and ``doing`` remain retryable; a missing or
+        terminal job means that no worker can still cross the external
+        dispatch boundary for a step without a marker.
+        """
 
         cursor = await connection.execute(
             """SELECT o.id, s.id
                FROM khub_repository_operations o
                JOIN khub_operation_steps s ON s.operation_id = o.id
                WHERE o.state = 'cancel_requested'
-                 AND s.state = 'pending'
+                 AND s.state IN ('pending', 'running', 'failed')
+                 AND s.external_marker IS NULL
                  AND (
                        s.procrastinate_job_id IS NULL
-                       OR EXISTS (
+                       OR NOT EXISTS (
                            SELECT 1
                            FROM procrastinate_jobs j
                            WHERE j.id = s.procrastinate_job_id
-                             AND j.status IN ('cancelled', 'aborted')
+                             AND j.status IN ('todo', 'doing')
                        )
                  )
                ORDER BY s.updated_at
                LIMIT %s
-               FOR UPDATE OF s SKIP LOCKED""",
+               FOR UPDATE OF o, s SKIP LOCKED""",
             (limit,),
         )
         rows = await cursor.fetchall()
         for operation_id, step_id in rows:
-            await connection.execute(
+            step_cursor = await connection.execute(
                 """UPDATE khub_operation_steps
                    SET state = 'cancelled', finished_at = CURRENT_TIMESTAMP,
                        error_code = 'cancelled',
                        error_summary = 'operation cancelled before delivery',
                        updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND state = 'pending'""",
-                (step_id,),
+                   WHERE id = %s AND operation_id = %s
+                     AND state IN ('pending', 'running', 'failed')
+                     AND external_marker IS NULL
+                   RETURNING id""",
+                (step_id, operation_id),
             )
+            if await step_cursor.fetchone() is None:
+                continue
             await connection.execute(
                 """UPDATE khub_repository_operations
                    SET state = 'cancelled', phase = 'cancelled',
@@ -693,6 +705,12 @@ class OperationStore:
                WHERE o.state = 'cancel_requested'
                  AND s.state IN ('pending', 'running')
                  AND s.procrastinate_job_id IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1
+                     FROM procrastinate_jobs j
+                     WHERE j.id = s.procrastinate_job_id
+                       AND j.status IN ('todo', 'doing')
+                 )
                ORDER BY s.updated_at
                LIMIT %s""",
             (limit,),

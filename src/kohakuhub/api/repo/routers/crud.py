@@ -13,9 +13,7 @@ from pydantic import BaseModel
 from kohakuhub.config import cfg
 from kohakuhub.async_utils import run_in_s3_executor
 from kohakuhub.db import (
-    File,
     Repository,
-    StagingUpload,
     User,
     db,
 )
@@ -36,7 +34,7 @@ from kohakuhub.utils.lakefs import (
     get_lakefs_client,
     resolve_lakefs_repo,
 )
-from kohakuhub.utils.s3 import copy_s3_folder, get_s3_client
+from kohakuhub.utils.s3 import get_s3_client
 from kohakuhub.lakefs_rest_client import StagingLocation, StagingMetadata
 from kohakuhub.api.repo.utils.hf import (
     HFErrorCode,
@@ -82,18 +80,16 @@ async def _run_fenced_repository_mutation(
     runtime_present = app_state is not None and hasattr(app_state, "operation_runtime")
     compatibility_mode = bool(
         getattr(app_state, "_khub_test_compatibility", False)
-    )
+    ) and mutation_gateway.test_compatibility_enabled()
     runtime = app_state
     runtime = getattr(runtime, "operation_runtime", None)
     service = getattr(runtime, "service", None)
     token = _repository_mutation_fence_active.set(True)
     try:
-        # Direct function calls without an ASGI request are the supported
-        # SQLite/unit-test compatibility path. Production HTTP requests must
-        # provide the PostgreSQL operation runtime.
+        # Direct function calls are the supported unit-test compatibility path.
+        # Production HTTP requests must provide the durable operation runtime.
         if (
-            cfg.app.db_backend == "postgres"
-            and isinstance(request, Request)
+            isinstance(request, Request)
             and not compatibility_mode
         ):
             if not runtime_present:
@@ -176,10 +172,9 @@ def _reject_non_durable_repository_delete(request: Request | None) -> None:
     state = getattr(getattr(request, "app", None), "state", None)
     compatibility_mode = bool(
         getattr(state, "_khub_test_compatibility", False)
-    )
+    ) and mutation_gateway.test_compatibility_enabled()
     if (
-        cfg.app.db_backend == "postgres"
-        and request is not None
+        request is not None
         and not compatibility_mode
     ):
         raise HTTPException(
@@ -463,12 +458,13 @@ async def create_repo(
 
     namespace = payload.organization or user.username
     state = getattr(getattr(request, "app", None), "state", None)
-    compatibility_mode = bool(getattr(state, "_khub_test_compatibility", False))
+    compatibility_mode = bool(
+        getattr(state, "_khub_test_compatibility", False)
+    ) and mutation_gateway.test_compatibility_enabled()
     runtime = getattr(state, "operation_runtime", None)
     service = getattr(runtime, "service", None)
     if (
-        cfg.app.db_backend == "postgres"
-        and isinstance(request, Request)
+        isinstance(request, Request)
         and not compatibility_mode
     ):
         if service is None:

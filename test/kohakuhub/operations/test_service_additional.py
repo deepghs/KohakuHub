@@ -98,14 +98,16 @@ class _Task:
 
 
 class _JobManager:
-    def __init__(self, error: Exception | None = None):
+    def __init__(self, error: Exception | None = None, result: bool = True):
         self.error = error
+        self.result = result
         self.calls: list[tuple[int, bool]] = []
 
     async def cancel_job_by_id_async(self, job_id, *, abort):
         self.calls.append((job_id, abort))
         if self.error is not None:
             raise self.error
+        return self.result
 
 
 def _app(*, task=None, job_manager=None):
@@ -674,6 +676,25 @@ async def test_cancel_keeps_state_result_when_delivery_cancellation_fails():
     assert result is requested
     assert store.request_cancel_calls == 1
     assert manager.calls == [(77, True)]
+
+
+@pytest.mark.asyncio
+async def test_cancel_keeps_durable_state_when_delivery_cancellation_returns_false():
+    operation = _operation(state="running")
+    requested = _operation(
+        state="cancel_requested", operation_id=operation.id, kind=operation.kind
+    )
+    step = _step(operation_id=operation.id, state="running", job_id=78)
+    store = _OperationStore(operation=operation, step=step, cancel_result=requested)
+    manager = _JobManager(result=False)
+    service = OperationService(_Pool(), _app(job_manager=manager))
+    service.store = store
+
+    result = await service.cancel(operation.id)
+
+    assert result is requested
+    assert store.request_cancel_calls == 1
+    assert manager.calls == [(78, True)]
 
 
 @pytest.mark.asyncio

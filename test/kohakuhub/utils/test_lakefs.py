@@ -14,6 +14,34 @@ from kohakuhub.utils.lakefs import (
 from test.kohakuhub.support.fakes import FakeLakeFSClient, FakeS3Service
 
 
+class _FakeLakeFSClientWithTags(FakeLakeFSClient):
+    async def list_tags(self, repository, after=None, amount=None):
+        repo = self.repositories[repository]
+        return {
+            "results": [
+                {"id": tag_name, "commit_id": commit_id}
+                for tag_name, commit_id in repo["tags"].items()
+            ]
+        }
+
+
+class _PaginatedFakeLakeFSClient(_FakeLakeFSClientWithTags):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.list_tags_calls = []
+
+    async def list_tags(self, repository, after=None, amount=None):
+        self.list_tags_calls.append((after, amount))
+        payload = await super().list_tags(repository, after=after, amount=amount)
+        tags = payload["results"]
+        if after is None:
+            return {
+                "results": tags[:1],
+                "pagination": {"has_more": True, "next_offset": "page-2"},
+            }
+        return {"results": tags[1:], "pagination": {"has_more": False}}
+
+
 def test_sanitize_repo_id_replaces_invalid_characters():
     assert _sanitize_repo_id("Org/My_Repo.v2!") == "org-my-repo-v2"
 
@@ -131,7 +159,7 @@ async def test_allocate_lakefs_repo_name_raises_when_every_generation_is_taken()
 @pytest.mark.asyncio
 async def test_resolve_revision_prefers_branch_then_commit():
     s3 = FakeS3Service()
-    lakefs = FakeLakeFSClient(s3_service=s3, default_bucket="test-bucket")
+    lakefs = _FakeLakeFSClientWithTags(s3_service=s3, default_bucket="test-bucket")
     await lakefs.create_repository(
         name="m-owner-demo",
         storage_namespace="s3://test-bucket/m-owner-demo",
@@ -151,9 +179,51 @@ async def test_resolve_revision_prefers_branch_then_commit():
 
 
 @pytest.mark.asyncio
+async def test_resolve_revision_resolves_tag():
+    s3 = FakeS3Service()
+    lakefs = _PaginatedFakeLakeFSClient(s3_service=s3, default_bucket="test-bucket")
+    await lakefs.create_repository(
+        name="m-owner-demo",
+        storage_namespace="s3://test-bucket/m-owner-demo",
+        default_branch="main",
+    )
+    branch = await lakefs.get_branch("m-owner-demo", "main")
+    await lakefs.create_tag(
+        repository="m-owner-demo", id="v1.0", ref=branch["commit_id"]
+    )
+    await lakefs.create_tag(
+        repository="m-owner-demo", id="v2.0", ref=branch["commit_id"]
+    )
+
+    commit_id, commit_info = await resolve_revision(lakefs, "m-owner-demo", "v2.0")
+
+    assert commit_id == branch["commit_id"]
+    assert commit_info["id"] == branch["commit_id"]
+    assert lakefs.list_tags_calls == [(None, None), ("page-2", None)]
+
+
+@pytest.mark.asyncio
+async def test_resolve_revision_raises_for_missing_tag():
+    s3 = FakeS3Service()
+    lakefs = _FakeLakeFSClientWithTags(s3_service=s3, default_bucket="test-bucket")
+    await lakefs.create_repository(
+        name="m-owner-demo",
+        storage_namespace="s3://test-bucket/m-owner-demo",
+        default_branch="main",
+    )
+    branch = await lakefs.get_branch("m-owner-demo", "main")
+    await lakefs.create_tag(
+        repository="m-owner-demo", id="v1.0", ref=branch["commit_id"]
+    )
+
+    with pytest.raises(ValueError, match="branch, tag, or commit"):
+        await resolve_revision(lakefs, "m-owner-demo", "missing-tag")
+
+
+@pytest.mark.asyncio
 async def test_resolve_revision_raises_for_missing_revision():
     s3 = FakeS3Service()
-    lakefs = FakeLakeFSClient(s3_service=s3, default_bucket="test-bucket")
+    lakefs = _FakeLakeFSClientWithTags(s3_service=s3, default_bucket="test-bucket")
     await lakefs.create_repository(
         name="m-owner-demo",
         storage_namespace="s3://test-bucket/m-owner-demo",

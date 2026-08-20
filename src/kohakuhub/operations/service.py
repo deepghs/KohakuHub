@@ -1322,7 +1322,12 @@ class OperationService:
             cancel_job = getattr(manager, "cancel_job_by_id_async", None)
             if cancel_job is not None:
                 try:
-                    await cancel_job(job_id, abort=True)
+                    cancelled = await cancel_job(job_id, abort=True)
+                    if not cancelled:
+                        logger.info(
+                            f"Procrastinate job {job_id} was already terminal or "
+                            f"missing for cancelled operation {operation_id}"
+                        )
                 except Exception as exc:
                     # The durable state remains cancel_requested so the
                     # reconciler can retry delivery cancellation.  Do not

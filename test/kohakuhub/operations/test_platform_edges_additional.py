@@ -456,6 +456,44 @@ async def test_store_returns_false_when_stalled_external_step_update_matches_no_
 
 
 @pytest.mark.asyncio
+async def test_store_finalizes_cancelled_pre_dispatch_step_after_terminal_job():
+    operation_id = uuid4()
+    connection = _Connection(
+        [_Rows(rows=[(operation_id, 12)]), _Rows(row=(12,)), _Rows()]
+    )
+
+    result = await OperationStore(None).finalize_cancelled_pending_steps(
+        connection, limit=10
+    )
+
+    assert result == 1
+    select_query, select_params = connection.calls[0]
+    assert "s.state IN ('pending', 'running', 'failed')" in select_query
+    assert "s.external_marker IS NULL" in select_query
+    assert "j.status IN ('todo', 'doing')" in select_query
+    assert select_params == (10,)
+    assert connection.calls[1][1] == (12, operation_id)
+    assert connection.calls[2][1] == (operation_id,)
+
+
+@pytest.mark.asyncio
+async def test_store_retries_only_active_cancel_requested_deliveries():
+    operation_id = uuid4()
+    connection = _Connection([_Rows(rows=[(operation_id, 12, 99)])])
+
+    result = await OperationStore(None).list_cancel_requested_deliveries(
+        connection, limit=10
+    )
+
+    assert result == [
+        {"operation_id": operation_id, "step_id": 12, "job_id": 99}
+    ]
+    query, params = connection.calls[0]
+    assert "j.status IN ('todo', 'doing')" in query
+    assert params == (10,)
+
+
+@pytest.mark.asyncio
 async def test_store_requeues_retryable_step_and_operation():
     operation_id = uuid4()
     connection = _Connection([_Rows(), _Rows()])

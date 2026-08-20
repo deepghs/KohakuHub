@@ -7,7 +7,7 @@ from typing import Any, Optional, cast
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from kohakuhub.db import Repository, User
+from kohakuhub.db import User
 from kohakuhub.db_operations import create_commit, get_repository
 from kohakuhub.config import cfg
 from kohakuhub.logger import get_logger
@@ -24,7 +24,6 @@ from kohakuhub.utils.lakefs import (
 )
 from kohakuhub.api.repo.utils.gc import (
     check_commit_range_recoverability,
-    check_lfs_recoverability,
     sync_file_table_with_commit,
     track_commit_lfs_objects,
 )
@@ -57,18 +56,17 @@ async def _run_fenced_mutation(
     runtime_present = app_state is not None and hasattr(app_state, "operation_runtime")
     compatibility_mode = bool(
         getattr(app_state, "_khub_test_compatibility", False)
-    )
+    ) and mutation_gateway.test_compatibility_enabled()
     runtime = app_state
     runtime = getattr(runtime, "operation_runtime", None)
     service = getattr(runtime, "service", None)
     token = _mutation_fence_active.set(True)
     try:
-        # Direct function calls without an ASGI request are the supported
-        # SQLite/unit-test compatibility path. Every production HTTP request
-        # supplies Request and must have the durable runtime.
+        # Direct function calls are the supported unit-test compatibility path.
+        # Every production HTTP request supplies Request and must have the
+        # durable runtime, regardless of the metadata backend.
         if (
-            cfg.app.db_backend == "postgres"
-            and isinstance(request, Request)
+            isinstance(request, Request)
             and not compatibility_mode
         ):
             if not runtime_present:

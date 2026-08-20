@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from kohakuhub import lakefs_mutation_gateway as gateway
+from kohakuhub.config import cfg
 from kohakuhub.operations.service import _fence_connection_limiter
 
 
@@ -68,6 +69,29 @@ async def test_gateway_rejects_mutation_without_a_fence(monkeypatch):
 
     with pytest.raises(gateway.MutationFenceRequired):
         await gateway.commit(_Client(), repository="repo", branch="main")
+
+
+@pytest.mark.asyncio
+async def test_gateway_does_not_infer_compatibility_from_sqlite(monkeypatch):
+    monkeypatch.setattr(cfg.app, "db_backend", "sqlite")
+
+    with pytest.raises(gateway.MutationFenceRequired):
+        await gateway.commit(_Client(), repository="repo", branch="main")
+
+    with gateway.test_compatibility():
+        assert await gateway.commit(
+            _Client(), repository="repo", branch="main"
+        ) == {"repository": "repo", "branch": "main"}
+
+
+def test_gateway_bind_requires_explicit_test_compatibility_for_sqlite(monkeypatch):
+    monkeypatch.setattr(cfg.app, "db_backend", "sqlite")
+
+    with pytest.raises(gateway.MutationFenceRequired):
+        gateway.bind_repository("repo")
+
+    with gateway.test_compatibility():
+        gateway.bind_repository("repo")
 
 
 @pytest.mark.asyncio

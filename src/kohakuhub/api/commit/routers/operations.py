@@ -927,10 +927,9 @@ async def commit(
             operation_service = getattr(runtime, "service", None)
             compatibility_mode = bool(
                 getattr(request_state, "_khub_test_compatibility", False)
-            )
+            ) and mutation_gateway.test_compatibility_enabled()
             if (
-                cfg.app.db_backend == "postgres"
-                and isinstance(request, Request)
+                isinstance(request, Request)
                 and not compatibility_mode
             ):
                 if not runtime_present or operation_service is None:
@@ -942,8 +941,7 @@ async def commit(
                 operation_service, "repository_ref_fence", None
             )
             if (
-                cfg.app.db_backend == "postgres"
-                and isinstance(request, Request)
+                isinstance(request, Request)
                 and not compatibility_mode
             ):
                 if not callable(repository_ref_fence):

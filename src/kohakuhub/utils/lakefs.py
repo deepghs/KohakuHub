@@ -20,52 +20,115 @@ def get_lakefs_client() -> LakeFSRestClient:
 async def resolve_revision(
     client: LakeFSRestClient, lakefs_repo: str, revision: str
 ) -> tuple[str, dict | None]:
-    """Resolve a revision (branch name or commit hash) to commit ID and info.
+    """Resolve a revision (branch, tag, or commit) to commit ID and info.
 
     HuggingFace datasets library and other clients may use either branch names
-    (e.g., "main") or commit hashes as revision identifiers. This function
-    handles both cases by first trying to resolve as a branch, then as a commit.
+    (e.g., "main"), tag names, or commit hashes as revision identifiers. This
+    function checks those references in that order.
 
     Args:
         client: LakeFS REST client instance
         lakefs_repo: LakeFS repository name
-        revision: Branch name or commit hash
+        revision: Branch name, tag name, or commit hash
 
     Returns:
         Tuple of (commit_id, commit_info dict or None)
 
     Raises:
-        ValueError: If revision cannot be resolved as either branch or commit
+        ValueError: If revision cannot be resolved as a branch, tag, or commit
     """
+    def is_not_found_error(error: Exception) -> bool:
+        error_str = str(error).lower()
+        return "404" in error_str or "not found" in error_str
+
+    async def get_commit_info(commit_id: str) -> dict | None:
+        try:
+            return await client.get_commit(
+                repository=lakefs_repo, commit_id=commit_id
+            )
+        except Exception:
+            return None
+
     # Try resolving as a branch first
     try:
         branch = await client.get_branch(repository=lakefs_repo, branch=revision)
         commit_id = branch["commit_id"]
-        # Get commit details
-        try:
-            commit_info = await client.get_commit(
-                repository=lakefs_repo, commit_id=commit_id
-            )
-        except Exception:
-            commit_info = None
-        return commit_id, commit_info
+        return commit_id, await get_commit_info(commit_id)
     except Exception as branch_error:
         # Check if it's a "not found" error (branch doesn't exist)
-        error_str = str(branch_error).lower()
-        if "404" not in error_str and "not found" not in error_str:
+        if not is_not_found_error(branch_error):
             # Some other error, re-raise
             raise branch_error
 
-    # Branch not found, try resolving as a commit hash
+    async def find_tag_commit_id() -> str | None:
+        after: str | None = None
+        while True:
+            if after is None:
+                tag_payload = await client.list_tags(repository=lakefs_repo)
+            else:
+                tag_payload = await client.list_tags(
+                    repository=lakefs_repo, after=after
+                )
+
+            if isinstance(tag_payload, list):
+                tag_items = tag_payload
+            elif isinstance(tag_payload, dict):
+                tag_items = tag_payload.get("results", [])
+            else:
+                raise TypeError("LakeFS list_tags returned an unsupported payload")
+
+            for tag in tag_items:
+                if not isinstance(tag, dict):
+                    continue
+                tag_name = tag.get("id") or tag.get("name")
+                if tag_name != revision:
+                    continue
+
+                commit = tag.get("commit")
+                commit_id = (
+                    commit.get("id")
+                    or commit.get("commit_id")
+                    or commit.get("commitId")
+                    if isinstance(commit, dict)
+                    else tag.get("commit_id")
+                    or tag.get("commitId")
+                    or tag.get("hash")
+                )
+                if not commit_id:
+                    raise ValueError(f"Tag '{revision}' does not reference a commit")
+                return commit_id
+
+            if isinstance(tag_payload, list):
+                return None
+            pagination = tag_payload.get("pagination") or {}
+            if not pagination.get("has_more"):
+                return None
+            next_after = pagination.get("next_offset")
+            if not next_after or next_after == after:
+                return None
+            after = next_after
+
+    # Branch not found, try resolving as a tag.
+    try:
+        tag_commit_id = await find_tag_commit_id()
+    except Exception as tag_error:
+        if not is_not_found_error(tag_error):
+            raise tag_error
+    else:
+        if tag_commit_id is not None:
+            return tag_commit_id, await get_commit_info(tag_commit_id)
+
+    # Branch and tag not found, try resolving as a commit hash.
     try:
         commit_info = await client.get_commit(
             repository=lakefs_repo, commit_id=revision
         )
         return commit_info["id"], commit_info
     except Exception as commit_error:
-        # Neither branch nor commit found
+        if not is_not_found_error(commit_error):
+            raise commit_error
         raise ValueError(
-            f"Revision '{revision}' not found as branch or commit"
+            f"Revision '{revision}' not found as branch, tag, or commit"
         ) from commit_error
 
 

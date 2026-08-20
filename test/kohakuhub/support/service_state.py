@@ -321,20 +321,23 @@ class ServiceTestState:
         # The seed intentionally exercises the direct SQLite/unit-test
         # compatibility path without a lifespan-owned operation runtime.
         self.modules.config_module.cfg.app.db_backend = "sqlite"
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://testserver",
-            follow_redirects=False,
-        ) as client:
-            try:
-                report("seeding the backend baseline")
-                await build_baseline(
-                    client,
-                    self.s3_client,
-                    self.modules.config_module.cfg,
-                )
-            finally:
-                self.modules.config_module.cfg.app.db_backend = previous_db_backend
+        from kohakuhub import lakefs_mutation_gateway
+
+        try:
+            with lakefs_mutation_gateway.test_compatibility():
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                    follow_redirects=False,
+                ) as client:
+                    report("seeding the backend baseline")
+                    await build_baseline(
+                        client,
+                        self.s3_client,
+                        self.modules.config_module.cfg,
+                    )
+        finally:
+            self.modules.config_module.cfg.app.db_backend = previous_db_backend
         self.modules.fallback_cache_module.get_cache().clear()
         report("baseline restore completed")
 
