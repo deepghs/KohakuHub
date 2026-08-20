@@ -53,6 +53,8 @@ from kohakuhub.api.repo.utils.hf import (
 logger = get_logger("FILE")
 router = APIRouter()
 
+SAMPLE_COMPARE_CONCURRENCY = 8
+
 
 class RepoType(str, Enum):
     """Repository type enumeration."""
@@ -139,6 +141,90 @@ async def check_file_by_sample(
     return False
 
 
+async def _sample_matches_known_file(
+    file_info: dict,
+    *,
+    existing_files: dict[str, tuple[str, int]],
+    lakefs_repo: str,
+    revision: str,
+    semaphore: asyncio.Semaphore,
+) -> bool:
+    """Compare a sample only after the SQL metadata found a real candidate.
+
+    The HF client sends only ``sample`` for some commit versions.  Probing
+    LakeFS with ``stat`` for every such path turns one preupload request into
+    an N+1 remote fan-out.  The metadata mirror already tells us which paths
+    can exist and whether their sizes match, so only those candidates need a
+    content read.
+    """
+
+    path = file_info.get("path") or file_info.get("path_in_repo")
+    size = int(file_info.get("size") or 0)
+    existing = existing_files.get(path)
+    if existing is None or existing[1] != size:
+        return False
+
+    try:
+        sample_data = base64.b64decode(file_info.get("sample", ""))
+        async with semaphore:
+            client = get_lakefs_client()
+            object_data = await client.get_object(
+                repository=lakefs_repo,
+                ref=revision,
+                path=path,
+            )
+        return hashlib.sha256(object_data).hexdigest() == hashlib.sha256(
+            sample_data
+        ).hexdigest()
+    except Exception:
+        # Preupload is advisory.  A failed comparison must leave the file
+        # uploadable; the commit path performs the authoritative check.
+        return False
+
+
+async def _build_sample_match_map(
+    files: list[dict],
+    *,
+    repo: Repository,
+    existing_files: dict[str, tuple[str, int]],
+    lakefs_repo: str,
+    revision: str,
+) -> dict[str, bool]:
+    """Resolve sample-based deduplication without an unbounded LakeFS fan-out."""
+
+    candidates = [
+        file_info
+        for file_info in files
+        if file_info.get("sample")
+        and not file_info.get("sha256")
+        and not should_use_lfs(
+            repo,
+            file_info.get("path") or file_info.get("path_in_repo"),
+            int(file_info.get("size") or 0),
+        )
+    ]
+    if not candidates:
+        return {}
+
+    semaphore = asyncio.Semaphore(SAMPLE_COMPARE_CONCURRENCY)
+    results = await asyncio.gather(
+        *[
+            _sample_matches_known_file(
+                file_info,
+                existing_files=existing_files,
+                lakefs_repo=lakefs_repo,
+                revision=revision,
+                semaphore=semaphore,
+            )
+            for file_info in candidates
+        ]
+    )
+    return {
+        (file_info.get("path") or file_info.get("path_in_repo")): matched
+        for file_info, matched in zip(candidates, results, strict=True)
+    }
+
+
 async def process_preupload_file(
     file_info: dict,
     repo: Repository,
@@ -148,6 +234,7 @@ async def process_preupload_file(
     threshold: int,  # Kept for backward compatibility, not used
     *,
     existing_files: dict[str, tuple[str, int]] | None = None,
+    sample_matches: dict[str, bool] | None = None,
 ) -> dict:
     """Process single file for preupload check.
 
@@ -184,9 +271,12 @@ async def process_preupload_file(
             )
     elif sample and upload_mode == "regular":
         # For small files, compare sample content if no sha256 provided
-        should_ignore = await check_file_by_sample(
-            repo_id, path, sample, size, lakefs_repo, revision
-        )
+        if sample_matches is None:
+            should_ignore = await check_file_by_sample(
+                repo_id, path, sample, size, lakefs_repo, revision
+            )
+        else:
+            should_ignore = bool(sample_matches.get(path, False))
 
     return {
         "path": path,
@@ -274,12 +364,31 @@ async def preupload(
     # entry. Load only the requested paths once; a database failure propagates
     # as it did for the old ``get_file`` path instead of silently reintroducing
     # N+1 queries.
-    sha_paths = {
+    metadata_paths = {
         file_info.get("path") or file_info.get("path_in_repo")
         for file_info in files
         if file_info.get("sha256")
+        or (
+            file_info.get("sample")
+            and not should_use_lfs(
+                repo_row,
+                file_info.get("path") or file_info.get("path_in_repo"),
+                int(file_info.get("size") or 0),
+            )
+        )
     }
-    existing_files = get_repo_file_metadata_map(repo_row, sha_paths) if sha_paths else {}
+    existing_files = (
+        get_repo_file_metadata_map(repo_row, metadata_paths)
+        if metadata_paths
+        else {}
+    )
+    sample_matches = await _build_sample_match_map(
+        files,
+        repo=repo_row,
+        existing_files=existing_files,
+        lakefs_repo=lakefs_repo,
+        revision=revision,
+    )
 
     # Process all files in parallel
     result_files = await asyncio.gather(
@@ -292,6 +401,7 @@ async def preupload(
                 revision,
                 threshold,
                 existing_files=existing_files,
+                sample_matches=sample_matches,
             )
             for f in files
         ]
