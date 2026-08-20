@@ -176,6 +176,9 @@ def test_postgres_017_rejects_extra_application_schema_and_rolls_back(tmp_path):
         _complete_main_016_backfill(database)
 
         with psycopg.connect(database.url) as connection:
+            # Force 017's compatibility bootstrap to do real work before the
+            # boundary check rejects the intentionally unexpected table.
+            connection.execute("DROP TABLE fallbacksource")
             connection.execute(
                 "CREATE TABLE unexpected_application_table (id BIGINT PRIMARY KEY)"
             )

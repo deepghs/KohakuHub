@@ -407,13 +407,10 @@ def _postgres_contract_complete(cursor) -> bool:
 def is_applied(database, config) -> bool:
     """Return true only for the complete relation contract."""
 
-    try:
-        cursor = database.cursor()
-        if config.app.db_backend == "postgres":
-            return _postgres_contract_complete(cursor)
-        return _sqlite_contract_complete(cursor)
-    except Exception:
-        return False
+    cursor = database.cursor()
+    if config.app.db_backend == "postgres":
+        return _postgres_contract_complete(cursor)
+    return _sqlite_contract_complete(cursor)
 
 
 def check_migration_needed() -> bool:

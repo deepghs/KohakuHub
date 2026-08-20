@@ -15,6 +15,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from kohakuhub.migrations.schema import (  # noqa: E402
+    expected_table_columns,
     kernel_semantic_diff,
     operation_schema_object_diff,
     procrastinate_schema_diff,
@@ -235,6 +236,49 @@ CREATE TABLE IF NOT EXISTS khub_schema_migrations (
 )
 """
 
+# ``fallbacksource`` was owned by the application model before it had a
+# numbered migration. It is the only model-owned table that a database from
+# the early 001-016 compatibility path can legitimately lack at the 017
+# boundary. Keep this bootstrap list frozen and explicit: calling the current
+# ``init_db()`` here would create tables belonging to a future migration before
+# that migration gets a chance to run.
+WORKER_APPLICATION_COMPATIBILITY_SQL = (
+    """
+    CREATE TABLE IF NOT EXISTS fallbacksource (
+        id SERIAL PRIMARY KEY,
+        namespace VARCHAR(255) NOT NULL DEFAULT '',
+        url VARCHAR(255) NOT NULL,
+        token VARCHAR(255),
+        priority INTEGER NOT NULL DEFAULT 100,
+        name VARCHAR(255) NOT NULL,
+        source_type VARCHAR(255) NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS fallbacksource_namespace
+    ON fallbacksource(namespace)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS fallbacksource_priority
+    ON fallbacksource(priority)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS fallbacksource_enabled
+    ON fallbacksource(enabled)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS fallbacksource_namespace_priority
+    ON fallbacksource(namespace, priority)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS fallbacksource_enabled_priority
+    ON fallbacksource(enabled, priority)
+    """,
+)
+
 
 class _PeeweeConnectionAdapter:
     """Expose the psycopg-like interface required by the schema helpers."""
@@ -262,16 +306,35 @@ def _procrastinate_schema_checksum() -> str:
     return hashlib.sha256(SchemaManager.get_schema().encode("utf-8")).hexdigest()
 
 
+def bootstrap_worker_application_compatibility(connection: Any) -> None:
+    """Create only the known pre-017 model table missing from old releases."""
+
+    with connection.cursor() as cursor:
+        for statement in WORKER_APPLICATION_COMPATIBILITY_SQL:
+            cursor.execute(statement)
+
+
 def _worker_application_schema_diff(connection: Any) -> dict[str, Any]:
     # The application adoption record is scoped to the model-owned tables.
     # Known durable-kernel tables may already exist when a pre-release worker
     # schema is being recognized; their exact shape is checked separately by
     # ``_apply_operation_schema`` and ``_verify_worker_schema``.
-    actual = {
-        table: columns
-        for table, columns in read_table_columns(connection).items()
-        if table not in KNOWN_OPERATION_TABLES_WORKER
-    }
+    # Model-defined additions from a later numbered migration are allowed when
+    # the current code already knows about them. Unknown tables/columns remain
+    # an error so a corrupted or unrelated schema cannot pass this boundary.
+    frozen_tables = set(APPLICATION_TABLE_COLUMNS_WORKER)
+    current_tables = expected_table_columns(include_operations=False)
+    current_extra_tables = set(current_tables) - frozen_tables
+    actual = {}
+    for table, columns in read_table_columns(connection).items():
+        if table in KNOWN_OPERATION_TABLES_WORKER or table in current_extra_tables:
+            continue
+        allowed_extra_columns = set(current_tables.get(table, ())) - set(
+            APPLICATION_TABLE_COLUMNS_WORKER.get(table, ())
+        )
+        actual[table] = tuple(
+            column for column in columns if column not in allowed_extra_columns
+        )
     return schema_diff(APPLICATION_TABLE_COLUMNS_WORKER, actual)
 
 
@@ -552,17 +615,27 @@ def worker_schema_migration_is_applied(connection: Any) -> bool:
     """Return whether migration 017's immutable ledger records exist."""
 
     expected = _expected_worker_ledger_records()
-    try:
-        rows = connection.execute(
-            """
-            SELECT migration_name, version, checksum
-            FROM khub_schema_migrations
-            WHERE migration_name = ANY(%s)
-            """,
-            (list(expected),),
-        ).fetchall()
-    except Exception:
+    # A missing ledger is the normal first-run state. Query its existence via
+    # information_schema first; selecting from a missing table would abort the
+    # caller's PostgreSQL transaction before the installer can create it.
+    ledger_exists = connection.execute(
+        """
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name = 'khub_schema_migrations'
+        """
+    ).fetchone()
+    if ledger_exists is None:
         return False
+    rows = connection.execute(
+        """
+        SELECT migration_name, version, checksum
+        FROM khub_schema_migrations
+        WHERE migration_name = ANY(%s)
+        """,
+        (list(expected),),
+    ).fetchall()
     actual = {name: (int(version), checksum) for name, version, checksum in rows}
     return actual == expected
 

@@ -10,6 +10,7 @@ import pytest
 from kohakuhub.migrations.schema import expected_table_columns, signature_digest
 from scripts import run_migrations
 from scripts import khub_migrate
+from scripts.db_migrations import _migration_utils
 from scripts.khub_migrate import (
     APPLICATION_TABLE_COLUMNS_WORKER,
     APPLICATION_SCHEMA_CHECKSUM_WORKER,
@@ -37,6 +38,9 @@ class _Cursor:
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
 
     def fetchall(self):
         return self.rows
@@ -79,6 +83,17 @@ def test_017_uses_the_worker_ledger_records_for_postgres():
     )
 
 
+def test_017_treats_a_missing_worker_ledger_as_not_applied():
+    migration = _load_migration_017()
+    database = _Database()
+
+    assert migration.is_applied(database, _config("postgres")) is False
+    assert not any(
+        "FROM khub_schema_migrations" in query
+        for query, _params in database.cursor_instance.executed
+    )
+
+
 def test_017_application_schema_checksum_is_frozen():
     assert signature_digest(expected_table_columns(include_operations=False)) == (
         APPLICATION_SCHEMA_CHECKSUM_WORKER
@@ -108,6 +123,34 @@ def test_017_application_adoption_allows_known_operation_tables(monkeypatch):
     monkeypatch.setattr(khub_migrate, "read_table_columns", lambda _connection: actual)
 
     khub_migrate._assert_worker_application_schema(object())
+
+
+def test_017_application_adoption_allows_current_model_extensions(monkeypatch):
+    actual = dict(APPLICATION_TABLE_COLUMNS_WORKER)
+    actual["user"] = (*actual["user"], "future_model_column")
+    actual["future_model_table"] = ("id",)
+
+    current = dict(expected_table_columns(include_operations=False))
+    current["user"] = (*current["user"], "future_model_column")
+    current["future_model_table"] = ("id",)
+    monkeypatch.setattr(khub_migrate, "expected_table_columns", lambda **_: current)
+    monkeypatch.setattr(khub_migrate, "read_table_columns", lambda _connection: actual)
+
+    khub_migrate._assert_worker_application_schema(object())
+
+
+def test_historical_supersession_check_does_not_mask_loader_errors(monkeypatch):
+    def fail_to_load(*_args, **_kwargs):
+        raise RuntimeError("migration loader unavailable")
+
+    monkeypatch.setattr(
+        _migration_utils.importlib.util,
+        "spec_from_file_location",
+        fail_to_load,
+    )
+
+    with pytest.raises(RuntimeError, match="loader unavailable"):
+        _migration_utils.should_skip_due_to_future_migrations(1, None, None)
 
 
 def test_017_is_a_sqlite_no_op(monkeypatch):

@@ -4,8 +4,9 @@
 This migration intentionally does not repair or reinterpret older application
 schemas. Databases already at the released ``main`` application schema reach it
 after no-op historical checks. Pre-main databases retain the historical
-001-016 compatibility path. Model-only tables absent from that numbered path
-are created immediately before the frozen migration-017 precondition check.
+001-016 compatibility path. The one known model-only table absent from that
+numbered path is bootstrapped explicitly immediately before the frozen
+migration-017 precondition check.
 """
 
 from __future__ import annotations
@@ -22,10 +23,11 @@ from khub_migrate import (  # noqa: E402
     _PeeweeConnectionAdapter,
     _verify_worker_schema,
     apply_worker_schema_migration,
+    bootstrap_worker_application_compatibility,
     worker_schema_migration_is_applied,
 )
 from kohakuhub.config import cfg  # noqa: E402
-from kohakuhub.db import db, init_db  # noqa: E402
+from kohakuhub.db import db  # noqa: E402
 
 
 MIGRATION_NUMBER = 17
@@ -55,22 +57,18 @@ def run() -> bool:
             print("Migration 017: Not applicable to SQLite")
             return True
         # Some application tables present on main were introduced through the
-        # normal model bootstrap rather than a numbered legacy migration. The
-        # 001-016 chain has now finished, so it is safe to create those missing
-        # tables before checking the frozen worker-schema boundary.
-        init_db()
-        if not check_migration_needed():
-            # The frozen application boundary is only a precondition for the
-            # first 017 install. Later numbered migrations may extend the
-            # application schema while this worker schema remains applied.
-            _verify_worker_schema(
-                _PeeweeConnectionAdapter(db), verify_application_schema=False
-            )
-            print("Migration 017: Already applied")
-            return True
-
-        print("Migration 017: Installing durable PostgreSQL worker schema...")
+        # normal model bootstrap rather than a numbered legacy migration. Keep
+        # the explicit compatibility bootstrap in the same PostgreSQL
+        # transaction as the frozen boundary check and worker DDL, so a
+        # rejected schema cannot leave behind partial application tables.
         with db.atomic():
+            bootstrap_worker_application_compatibility(_PeeweeConnectionAdapter(db))
+            if not check_migration_needed():
+                _verify_worker_schema(_PeeweeConnectionAdapter(db))
+                print("Migration 017: Already applied")
+                return True
+
+            print("Migration 017: Installing durable PostgreSQL worker schema...")
             apply_worker_schema_migration(_PeeweeConnectionAdapter(db))
         print("Migration 017: Completed")
         return True

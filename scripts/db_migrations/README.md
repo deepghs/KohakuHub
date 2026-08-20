@@ -100,8 +100,8 @@ def is_applied(db, cfg):
     has already applied their changes. Choose a unique signature column/table.
 
     Returns True if this migration is applied, False otherwise.
-    Errors should return False so an uncertain migration is retried and fails
-    visibly instead of silently skipping required work.
+    A known-absent signature may return False. Unexpected database or loader
+    errors must propagate so the migration cannot silently skip required work.
     """
     # Example: Check if a signature column/table exists
     return check_column_exists(db, cfg, "mytable", "mycolumn")
@@ -233,8 +233,8 @@ changes and must run when their own schema is missing.
 **Benefits:**
 - Keeps the only known historical supersession boundary explicit
 - Prevents an unrelated later migration from hiding a failed upgrade
-- Treats an uncertain signature as "not applied" so the current migration is
-  attempted and can fail visibly
+- Treats a known-absent signature as "not applied"; errors loading or
+  evaluating the supersession check abort the migration run
 
 **Each migration must implement:**
 ```python
@@ -242,7 +242,8 @@ def is_applied(db, cfg):
     """Check if THIS migration has been applied.
 
     Choose a unique signature (table or column) that this migration creates.
-    Errors should return False so the migration is attempted visibly.
+    Return False only for a known-absent signature. Propagate unexpected
+    database errors so the migration is attempted visibly and can fail.
     """
     return check_column_exists(db, cfg, "mytable", "my_signature_column")
 ```
@@ -280,7 +281,7 @@ cursor.execute("CREATE TABLE IF NOT EXISTS user (...)")
 - Failed migrations will prevent server startup
 - Only `001`-`007` may be superseded by a complete `008` signature
 - Use raw SQL queries instead of importing Peewee models
-- Errors in the historical supersession check are treated as "not applied"
+- Errors in the historical supersession check abort the migration run
 - Old migration scripts in `scripts/migrate_*.py` are kept for reference
 
 ## Utilities (`_migration_utils.py`)
