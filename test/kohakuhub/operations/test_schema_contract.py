@@ -30,7 +30,9 @@ RELEASED_V2_LEDGER_CHECKSUM = (
 
 
 class _CatalogConnection:
-    def __init__(self, *, bad_index: str | None = None, bad_constraint: str | None = None):
+    def __init__(
+        self, *, bad_index: str | None = None, bad_constraint: str | None = None
+    ):
         self.bad_index = bad_index
         self.bad_constraint = bad_constraint
 
@@ -42,18 +44,32 @@ class _CatalogConnection:
             ]
             if self.bad_index:
                 rows = [
-                    (name, "CREATE INDEX broken ON public.other (value)" if name == self.bad_index else definition, valid)
+                    (
+                        name,
+                        "CREATE INDEX broken ON public.other (value)"
+                        if name == self.bad_index
+                        else definition,
+                        valid,
+                    )
                     for name, definition, valid in rows
                 ]
             return _Rows(rows)
         if "FROM pg_constraint" in query:
             rows = [
                 (name, kind, True, definition)
-                for name, (kind, definition) in EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS.items()
+                for name, (
+                    kind,
+                    definition,
+                ) in EXPECTED_OPERATION_CONSTRAINT_DEFINITIONS.items()
             ]
             if self.bad_constraint:
                 rows = [
-                    (name, kind, True, "CHECK (false)" if name == self.bad_constraint else definition)
+                    (
+                        name,
+                        kind,
+                        True,
+                        "CHECK (false)" if name == self.bad_constraint else definition,
+                    )
                     for name, kind, valid, definition in rows
                 ]
             return _Rows(rows)
@@ -77,8 +93,18 @@ class _OperationUpgradeConnection:
 
     def execute(self, query, params=None):
         normalized = " ".join(query.split())
-        if "WHERE migration_name = 'khub-operation-kernel'" in normalized:
-            return _Row(self.ledger["khub-operation-kernel"])
+        if (
+            "migration_name = 'khub-operation-kernel'" in normalized
+            and "migration_name LIKE" in normalized
+        ):
+            return _Rows(
+                [
+                    (name, version, checksum)
+                    for name, (version, checksum) in self.ledger.items()
+                    if name == "khub-operation-kernel"
+                    or name.startswith("khub-operation-kernel-v")
+                ]
+            )
         if "WHERE migration_name = %s" in normalized:
             return _Row(self.ledger.get(params[0]))
         if "information_schema.tables" in normalized:
@@ -118,7 +144,9 @@ class _SchemaCursor:
 
 
 def test_v2_operation_signature_is_preserved_for_upgrade():
-    assert operation_table_columns_for_version(2) == HISTORICAL_OPERATION_TABLE_COLUMNS_V2
+    assert (
+        operation_table_columns_for_version(2) == HISTORICAL_OPERATION_TABLE_COLUMNS_V2
+    )
     assert operation_table_columns_for_version(2) != operation_table_columns()
     assert _historical_operation_schema_checksum(2) == RELEASED_V2_LEDGER_CHECKSUM
     assert _historical_operation_schema_checksum(2) != signature_digest(
@@ -142,8 +170,29 @@ def test_real_v2_ledger_is_upgraded_to_current_operation_schema():
     )
 
 
+def test_newer_versioned_operation_ledger_is_used_as_upgrade_baseline():
+    connection = _OperationUpgradeConnection()
+    connection.ledger["khub-operation-kernel"] = (
+        3,
+        "legacy checksum from an older release",
+    )
+    connection.ledger["khub-operation-kernel-v7"] = (
+        7,
+        signature_digest(operation_table_columns_for_version(7)),
+    )
+
+    _apply_operation_schema(connection)
+
+    assert connection.ledger[f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}"] == (
+        OPERATION_SCHEMA_VERSION,
+        _schema_checksum(),
+    )
+
+
 def test_v3_operation_signature_is_preserved_for_upgrade():
-    assert operation_table_columns_for_version(3) == HISTORICAL_OPERATION_TABLE_COLUMNS_V3
+    assert (
+        operation_table_columns_for_version(3) == HISTORICAL_OPERATION_TABLE_COLUMNS_V3
+    )
     assert operation_table_columns_for_version(3) != operation_table_columns()
     assert _historical_operation_schema_checksum(3) == signature_digest(
         HISTORICAL_OPERATION_TABLE_COLUMNS_V3
@@ -182,12 +231,25 @@ def test_procrastinate_schema_contract_rejects_missing_index():
                     for table, columns in {
                         "procrastinate_workers": {"id", "last_heartbeat"},
                         "procrastinate_jobs": {
-                            "id", "queue_name", "task_name", "priority", "lock",
-                            "queueing_lock", "args", "status", "scheduled_at",
-                            "attempts", "abort_requested", "worker_id",
+                            "id",
+                            "queue_name",
+                            "task_name",
+                            "priority",
+                            "lock",
+                            "queueing_lock",
+                            "args",
+                            "status",
+                            "scheduled_at",
+                            "attempts",
+                            "abort_requested",
+                            "worker_id",
                         },
                         "procrastinate_periodic_defers": {
-                            "id", "task_name", "defer_timestamp", "job_id", "periodic_id",
+                            "id",
+                            "task_name",
+                            "defer_timestamp",
+                            "job_id",
+                            "periodic_id",
                         },
                         "procrastinate_events": {"id", "job_id", "type", "at"},
                     }.items()

@@ -386,7 +386,7 @@ def generate_hub_api_service(config: dict) -> str:
       - KOHAKU_HUB_LFS_MULTIPART_CHUNK_SIZE_BYTES=50_000_000 # 50MB - size of each part (min 5MB except last)
       - KOHAKU_HUB_LFS_KEEP_VERSIONS=5
       - KOHAKU_HUB_LFS_AUTO_GC=true
-      - KOHAKU_HUB_AUTO_MIGRATE=false # Schema is applied by khub-migrate
+      - KOHAKU_HUB_AUTO_MIGRATE=false # Schema is applied by the one-shot migration service
       - KOHAKU_HUB_LOG_LEVEL=INFO
       - KOHAKU_HUB_LOG_FORMAT=terminal
       - KOHAKU_HUB_LOG_DIR=logs/
@@ -440,7 +440,7 @@ def _database_url(config: dict) -> str:
 
 
 def generate_khub_migrate_service(config: dict) -> str:
-    """Generate the one-shot schema owner used by API and worker."""
+    """Generate the one-shot service that runs the numbered migration chain."""
     depends_on = ""
     if config["postgres_builtin"]:
         depends_on = (
@@ -455,11 +455,13 @@ def generate_khub_migrate_service(config: dict) -> str:
     build: .
     container_name: khub-migrate
     restart: \"no\"
-    command: [\"python\", \"scripts/khub_migrate.py\"]
+    command: [\"python\", \"scripts/run_migrations.py\"]
 {depends_on}    environment:
       - KOHAKU_HUB_DB_BACKEND=postgres
       - KOHAKU_HUB_DATABASE_URL={_database_url(config)}
-      - KOHAKU_HUB_AUTO_MIGRATE=false
+      # khub-migrate is non-interactive and must confirm the historical 008
+      # upgrade when an older database is being brought to migration 017.
+      - KOHAKU_HUB_AUTO_MIGRATE=true
 {networks}"""
 
 

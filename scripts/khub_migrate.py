@@ -1,36 +1,34 @@
 #!/usr/bin/env python3
-"""Apply KHub and Procrastinate schema exactly once before service startup."""
+"""Durable-worker schema helpers owned by numbered migration 017."""
 
 from __future__ import annotations
 
 import hashlib
-import os
 import sys
 from pathlib import Path
+from typing import Any
 
-import psycopg
 from procrastinate.schema import SchemaManager
 
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
-# ``khub_migrate.py`` is also imported directly by migration tests.  Keep the
-# sibling legacy runner import valid in both invocation modes.
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from kohakuhub.config import cfg
-from kohakuhub.migrations.schema import (
-    expected_table_columns,
-    is_exact_current_schema,
+from kohakuhub.migrations.schema import (  # noqa: E402
     kernel_semantic_diff,
     operation_schema_object_diff,
     procrastinate_schema_diff,
+    read_table_columns,
+    schema_diff,
     signature_digest,
 )
-from kohakuhub.operations.sql import (
+from kohakuhub.operations.sql import (  # noqa: E402
     OPERATION_SCHEMA_SQL,
     OPERATION_SCHEMA_VERSION,
+    operation_table_columns,
     operation_table_columns_for_version,
 )
+
 
 LOCK_KEY = "kohakuhub.schema.lifecycle.v1"
 RELEASED_OPERATION_SCHEMA_CHECKSUMS = {
@@ -39,6 +37,195 @@ RELEASED_OPERATION_SCHEMA_CHECKSUMS = {
     # it from current Peewee models would break upgrades after model changes.
     2: "edc67a3141b85e4b5dfff264609764e236d192d7086ba2d9b0571b49c381d23e",
 }
+
+# Migration 017 has a fixed post-016 application-schema precondition. It must
+# not be recomputed from live Peewee models: model-only tables can be added by
+# the runner's final init_db() pass after this migration.
+APPLICATION_SCHEMA_CHECKSUM_WORKER = (
+    "4e38e499aec1d9ccf55323ab3e4fa9ed58d7cd183dbe07d4bd3d8d8b89e663f8"
+)
+APPLICATION_TABLE_COLUMNS_WORKER = {
+    "commit": (
+        "author_id",
+        "branch",
+        "commit_id",
+        "created_at",
+        "description",
+        "id",
+        "message",
+        "owner_id",
+        "repo_type",
+        "repository_id",
+        "username",
+    ),
+    "confirmationtoken": (
+        "action_data",
+        "action_type",
+        "created_at",
+        "expires_at",
+        "id",
+        "token",
+    ),
+    "dailyrepostats": (
+        "anonymous_downloads",
+        "authenticated_downloads",
+        "created_at",
+        "date",
+        "download_sessions",
+        "id",
+        "repository_id",
+        "total_files",
+    ),
+    "downloadsession": (
+        "file_count",
+        "first_download_at",
+        "first_file",
+        "id",
+        "last_download_at",
+        "repository_id",
+        "session_id",
+        "time_bucket",
+        "user_id",
+    ),
+    "emailverification": ("created_at", "expires_at", "id", "token", "user_id"),
+    "file": (
+        "created_at",
+        "id",
+        "is_deleted",
+        "lfs",
+        "owner_id",
+        "path_in_repo",
+        "repository_id",
+        "sha256",
+        "size",
+        "updated_at",
+    ),
+    "fallbacksource": (
+        "created_at",
+        "enabled",
+        "id",
+        "name",
+        "namespace",
+        "priority",
+        "source_type",
+        "token",
+        "updated_at",
+        "url",
+    ),
+    "invitation": (
+        "action",
+        "created_at",
+        "created_by_id",
+        "expires_at",
+        "id",
+        "max_usage",
+        "parameters",
+        "token",
+        "usage_count",
+        "used_at",
+        "used_by_id",
+    ),
+    "lfsobjecthistory": (
+        "commit_id",
+        "created_at",
+        "file_id",
+        "id",
+        "path_in_repo",
+        "repository_id",
+        "sha256",
+        "size",
+    ),
+    "repository": (
+        "created_at",
+        "downloads",
+        "full_id",
+        "id",
+        "lakefs_repo",
+        "lfs_keep_versions",
+        "lfs_suffix_rules",
+        "lfs_threshold_bytes",
+        "likes_count",
+        "name",
+        "namespace",
+        "owner_id",
+        "private",
+        "quota_bytes",
+        "repo_type",
+        "used_bytes",
+    ),
+    "repositorylike": ("created_at", "id", "repository_id", "user_id"),
+    "session": ("created_at", "expires_at", "id", "secret", "session_id", "user_id"),
+    "sshkey": (
+        "created_at",
+        "fingerprint",
+        "id",
+        "key_type",
+        "last_used",
+        "public_key",
+        "title",
+        "user_id",
+    ),
+    "stagingupload": (
+        "created_at",
+        "id",
+        "lfs",
+        "path_in_repo",
+        "repo_type",
+        "repository_id",
+        "revision",
+        "sha256",
+        "size",
+        "storage_key",
+        "upload_id",
+        "uploader_id",
+    ),
+    "token": ("created_at", "id", "last_used", "name", "token_hash", "user_id"),
+    "user": (
+        "avatar",
+        "avatar_updated_at",
+        "bio",
+        "created_at",
+        "description",
+        "email",
+        "email_verified",
+        "full_name",
+        "id",
+        "is_active",
+        "is_org",
+        "normalized_name",
+        "password_hash",
+        "private_quota_bytes",
+        "private_used_bytes",
+        "public_quota_bytes",
+        "public_used_bytes",
+        "social_media",
+        "username",
+        "website",
+    ),
+    "userexternaltoken": (
+        "created_at",
+        "encrypted_token",
+        "id",
+        "updated_at",
+        "url",
+        "user_id",
+    ),
+    "userorganization": ("created_at", "id", "organization_id", "role", "user_id"),
+}
+PROCRASTINATE_SCHEMA_CHECKSUM_WORKER = (
+    "c70ec4b400a60ad9592787653aae5ae77ae41bf801d56b5bd2712751a07f2009"
+)
+OPERATION_SCHEMA_VERSION_WORKER = 8
+OPERATION_SCHEMA_CHECKSUM_WORKER = (
+    "3143de9bba6022a7f4372a3be8cb2c8a7bd7c3e2ecb0a1b46ca046652118afd3"
+)
+
+KNOWN_OPERATION_TABLES_WORKER = frozenset(
+    table
+    for version in (2, 3, 6, 7, OPERATION_SCHEMA_VERSION_WORKER)
+    for table in operation_table_columns_for_version(version)
+)
+
 LEDGER_DDL = """
 CREATE TABLE IF NOT EXISTS khub_schema_migrations (
     migration_name TEXT PRIMARY KEY,
@@ -49,57 +236,69 @@ CREATE TABLE IF NOT EXISTS khub_schema_migrations (
 """
 
 
-def _database_url() -> str:
-    value = cfg.app.database_url
-    if cfg.app.db_backend != "postgres" or not value.startswith(
-        ("postgresql://", "postgres://")
-    ):
-        raise RuntimeError("khub-migrate requires KOHAKU_HUB_DB_BACKEND=postgres")
-    return value
+class _PeeweeConnectionAdapter:
+    """Expose the psycopg-like interface required by the schema helpers."""
 
+    def __init__(self, database: Any):
+        self.database = database
 
-def _has_application_tables(connection: psycopg.Connection) -> bool:
-    row = connection.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name NOT LIKE 'procrastinate_%'
-              AND table_name <> 'khub_schema_migrations'
-        )
-        """
-    ).fetchone()
-    return bool(row and row[0])
+    def execute(self, query: str, params: Any = None):
+        cursor = self.database.cursor()
+        if params is None:
+            cursor.execute(query)
+        else:
+            cursor.execute(query, params)
+        return cursor
 
-
-def _has_ledger(connection: psycopg.Connection) -> bool:
-    row = connection.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name = 'khub_schema_migrations'
-        )
-        """
-    ).fetchone()
-    return bool(row and row[0])
+    def cursor(self):
+        return self.database.cursor()
 
 
 def _schema_checksum() -> str:
-    # Keep this checksum scoped to the operation kernel.  Ordinary KHub model
-    # changes must not invalidate a worker migration that did not change.
-    from kohakuhub.operations.sql import operation_table_columns
-
     return signature_digest(operation_table_columns())
 
 
-def _legacy_schema_checksum() -> str:
-    return signature_digest(expected_table_columns(include_operations=False))
+def _procrastinate_schema_checksum() -> str:
+    return hashlib.sha256(SchemaManager.get_schema().encode("utf-8")).hexdigest()
 
 
-def _record(connection: psycopg.Connection, name: str, version: int, checksum: str) -> None:
+def _worker_application_schema_diff(connection: Any) -> dict[str, Any]:
+    # The application adoption record is scoped to the model-owned tables.
+    # Known durable-kernel tables may already exist when a pre-release worker
+    # schema is being recognized; their exact shape is checked separately by
+    # ``_apply_operation_schema`` and ``_verify_worker_schema``.
+    actual = {
+        table: columns
+        for table, columns in read_table_columns(connection).items()
+        if table not in KNOWN_OPERATION_TABLES_WORKER
+    }
+    return schema_diff(APPLICATION_TABLE_COLUMNS_WORKER, actual)
+
+
+def _assert_worker_application_schema(connection: Any) -> None:
+    diff = _worker_application_schema_diff(connection)
+    if any(diff.values()):
+        raise RuntimeError(
+            "migration 017 requires the application schema produced by main; "
+            f"diagnostic={diff}"
+        )
+
+
+def _assert_worker_runtime_inputs() -> None:
+    operation_checksum = _schema_checksum()
+    procrastinate_checksum = _procrastinate_schema_checksum()
+    if (
+        OPERATION_SCHEMA_VERSION != OPERATION_SCHEMA_VERSION_WORKER
+        or operation_checksum != OPERATION_SCHEMA_CHECKSUM_WORKER
+        or procrastinate_checksum != PROCRASTINATE_SCHEMA_CHECKSUM_WORKER
+    ):
+        raise RuntimeError(
+            "migration 017 is frozen to its released worker schema; add a new "
+            "numbered migration for the current Procrastinate or operation schema"
+        )
+
+
+def _record(connection: Any, name: str, version: int, checksum: str) -> None:
     connection.execute(
         """
         INSERT INTO khub_schema_migrations (migration_name, version, checksum)
@@ -122,7 +321,7 @@ def _record(connection: psycopg.Connection, name: str, version: int, checksum: s
 
 
 def _assert_recorded_checksum(
-    connection: psycopg.Connection,
+    connection: Any,
     name: str,
     expected_checksum: str,
 ) -> None:
@@ -153,8 +352,8 @@ def _historical_operation_schema_checksum(version: int) -> str:
         signature = operation_table_columns_for_version(version)
     except ValueError as exc:
         raise RuntimeError(
-            f"unsupported historical operation schema version {version}; "
-            "upgrade from a supported durable-kernel release or rebuild explicitly"
+            "unsupported historical operation schema version "
+            f"{version}; upgrade from a supported durable-kernel release"
         ) from exc
     released_checksum = RELEASED_OPERATION_SCHEMA_CHECKSUMS.get(version)
     if released_checksum is not None:
@@ -162,7 +361,7 @@ def _historical_operation_schema_checksum(version: int) -> str:
     return signature_digest(signature)
 
 
-def _apply_procrastinate_schema(connection: psycopg.Connection) -> None:
+def _apply_procrastinate_schema(connection: Any) -> None:
     expected_tables = {
         "procrastinate_events",
         "procrastinate_jobs",
@@ -202,35 +401,51 @@ def _apply_procrastinate_schema(connection: psycopg.Connection) -> None:
                 "partial or incompatible Procrastinate schema; refusing to guess DDL: "
                 f"diagnostic={catalog_diff}"
             )
-        checksum = hashlib.sha256(SchemaManager.get_schema().encode("utf-8")).hexdigest()
-        _assert_recorded_checksum(connection, "procrastinate-3.9.0", checksum)
-        _record(connection, "procrastinate-3.9.0", 1, checksum)
+        _assert_recorded_checksum(
+            connection,
+            "procrastinate-3.9.0",
+            PROCRASTINATE_SCHEMA_CHECKSUM_WORKER,
+        )
+        _record(
+            connection,
+            "procrastinate-3.9.0",
+            1,
+            PROCRASTINATE_SCHEMA_CHECKSUM_WORKER,
+        )
         return
+
     schema_sql = SchemaManager.get_schema()
     with connection.cursor() as cursor:
         cursor.execute(schema_sql)
-    checksum = hashlib.sha256(schema_sql.encode("utf-8")).hexdigest()
-    _record(connection, "procrastinate-3.9.0", 1, checksum)
+    _record(
+        connection,
+        "procrastinate-3.9.0",
+        1,
+        PROCRASTINATE_SCHEMA_CHECKSUM_WORKER,
+    )
 
 
-def _apply_operation_schema(connection: psycopg.Connection) -> None:
+def _apply_operation_schema(connection: Any) -> None:
     current_name = f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION}"
-    legacy = connection.execute(
-        """SELECT version, checksum
+    ledger_rows = connection.execute(
+        """SELECT migration_name, version, checksum
            FROM khub_schema_migrations
-           WHERE migration_name = 'khub-operation-kernel'"""
-    ).fetchone()
-    current = connection.execute(
-        """SELECT version, checksum
-           FROM khub_schema_migrations
-           WHERE migration_name = %s""",
-        (current_name,),
-    ).fetchone()
+           WHERE migration_name = 'khub-operation-kernel'
+              OR migration_name LIKE 'khub-operation-kernel-v%'"""
+    ).fetchall()
+    operation_records: list[tuple[str, int, str]] = []
+    for name, version, checksum in ledger_rows:
+        version = int(version)
+        if name.startswith("khub-operation-kernel-v"):
+            suffix = name.removeprefix("khub-operation-kernel-v")
+            if not suffix.isdigit() or int(suffix) != version:
+                raise RuntimeError(
+                    "operation schema ledger name/version mismatch: "
+                    f"name={name!r} version={version}"
+                )
+        operation_records.append((name, version, checksum))
+    recorded = max(operation_records, key=lambda item: item[1], default=None)
 
-    # Once any operation table exists, the table shape must be a known
-    # released shape before the migration SQL is allowed to run.  This keeps
-    # ``ADD COLUMN IF NOT EXISTS`` from turning an unknown partial schema into
-    # something that merely looks current after a failed deployment.
     table_rows = connection.execute(
         """SELECT table_name
            FROM information_schema.tables
@@ -249,13 +464,12 @@ def _apply_operation_schema(connection: psycopg.Connection) -> None:
         }
     }
     if operation_tables:
-        recorded = current or legacy
         if recorded is None:
             raise RuntimeError(
                 "operation tables exist without a known migration ledger record; "
                 "refusing to run operation DDL"
             )
-        expected = operation_table_columns_for_version(int(recorded[0]))
+        expected = operation_table_columns_for_version(recorded[1])
         expected_tables = set(expected)
         if operation_tables != expected_tables:
             raise RuntimeError(
@@ -284,12 +498,12 @@ def _apply_operation_schema(connection: psycopg.Connection) -> None:
                 "operation schema columns do not match recorded version; "
                 f"refusing DDL: {column_diff}"
             )
-    if legacy is not None:
-        expected_legacy = _historical_operation_schema_checksum(int(legacy[0]))
-        if legacy[1] != expected_legacy:
+    if recorded is not None:
+        expected_checksum = _historical_operation_schema_checksum(recorded[1])
+        if recorded[2] != expected_checksum:
             raise RuntimeError(
-                "historical operation schema checksum mismatch: "
-                f"recorded={legacy[1]} expected={expected_legacy}"
+                "operation schema checksum mismatch: "
+                f"recorded={recorded[2]} expected={expected_checksum}"
             )
     with connection.cursor() as cursor:
         cursor.execute(OPERATION_SCHEMA_SQL)
@@ -301,70 +515,88 @@ def _apply_operation_schema(connection: psycopg.Connection) -> None:
     )
 
 
+def _verify_worker_schema(
+    connection: Any, *, verify_application_schema: bool = True
+) -> None:
+    if verify_application_schema:
+        _assert_worker_application_schema(connection)
+    procrastinate_diff = procrastinate_schema_diff(connection)
+    if any(procrastinate_diff.values()):
+        raise RuntimeError(
+            f"Procrastinate schema mismatch after migration: {procrastinate_diff}"
+        )
+    object_diff = operation_schema_object_diff(connection)
+    if any(object_diff.values()):
+        raise RuntimeError(
+            f"operation schema object mismatch after migration: {object_diff}"
+        )
+    semantic_diff = kernel_semantic_diff(connection)
+    if any(semantic_diff.values()):
+        raise RuntimeError(
+            f"operation schema semantic mismatch after migration: {semantic_diff}"
+        )
+
+
+def _expected_worker_ledger_records() -> dict[str, tuple[int, str]]:
+    return {
+        "khub-current-adoption": (1, APPLICATION_SCHEMA_CHECKSUM_WORKER),
+        "procrastinate-3.9.0": (1, PROCRASTINATE_SCHEMA_CHECKSUM_WORKER),
+        (f"khub-operation-kernel-v{OPERATION_SCHEMA_VERSION_WORKER}"): (
+            OPERATION_SCHEMA_VERSION_WORKER,
+            OPERATION_SCHEMA_CHECKSUM_WORKER,
+        ),
+    }
+
+
+def worker_schema_migration_is_applied(connection: Any) -> bool:
+    """Return whether migration 017's immutable ledger records exist."""
+
+    expected = _expected_worker_ledger_records()
+    try:
+        rows = connection.execute(
+            """
+            SELECT migration_name, version, checksum
+            FROM khub_schema_migrations
+            WHERE migration_name = ANY(%s)
+            """,
+            (list(expected),),
+        ).fetchall()
+    except Exception:
+        return False
+    actual = {name: (int(version), checksum) for name, version, checksum in rows}
+    return actual == expected
+
+
+def apply_worker_schema_migration(connection: Any) -> None:
+    """Apply migration 017 using the caller-owned transaction."""
+
+    _assert_worker_runtime_inputs()
+    connection.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (LOCK_KEY,)
+    )
+    _assert_worker_application_schema(connection)
+    connection.execute(LEDGER_DDL)
+    _record(
+        connection,
+        "khub-current-adoption",
+        1,
+        APPLICATION_SCHEMA_CHECKSUM_WORKER,
+    )
+    _apply_procrastinate_schema(connection)
+    _apply_operation_schema(connection)
+    _verify_worker_schema(connection, verify_application_schema=False)
+
+
 def migrate() -> None:
-    url = _database_url()
-    with psycopg.connect(url) as connection:
-        connection.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", (LOCK_KEY,))
-        try:
-            ledger_exists = _has_ledger(connection)
-            has_tables = _has_application_tables(connection)
+    """Run the post-main numbered migration stream used by deployment Compose."""
 
-            if not ledger_exists and not has_tables:
-                from run_migrations import run_migrations
+    # This entry point is retained for CI and development callers.  Sending it
+    # through the runner keeps fresh bootstraps and main-to-worker upgrades on
+    # the identical 017+ migration path.
+    from run_migrations import run_migrations
 
-                if not run_migrations():
-                    raise RuntimeError("legacy KHub schema bootstrap failed")
-                connection.rollback()
-                has_tables = _has_application_tables(connection)
-
-            if not ledger_exists and has_tables:
-                exact, diff = is_exact_current_schema(
-                    connection, include_operations=False
-                )
-                if not exact:
-                    raise RuntimeError(
-                        "cannot adopt unknown or partial schema; "
-                        f"diagnostic={diff}"
-                    )
-
-            if not ledger_exists:
-                connection.execute(LEDGER_DDL)
-                _record(
-                    connection,
-                    "khub-current-adoption",
-                    1,
-                    _legacy_schema_checksum(),
-                )
-            else:
-                _assert_recorded_checksum(
-                    connection,
-                    "khub-current-adoption",
-                    _legacy_schema_checksum(),
-                )
-
-            _apply_procrastinate_schema(connection)
-            _apply_operation_schema(connection)
-            exact, diff = is_exact_current_schema(connection)
-            if not exact:
-                raise RuntimeError(f"schema mismatch after migration: {diff}")
-            object_diff = operation_schema_object_diff(connection)
-            if any(object_diff.values()):
-                raise RuntimeError(
-                    f"operation schema object mismatch after migration: {object_diff}"
-                )
-            semantic_diff = kernel_semantic_diff(connection)
-            if any(semantic_diff.values()):
-                raise RuntimeError(
-                    f"operation schema semantic mismatch after migration: {semantic_diff}"
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.execute(
-                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (LOCK_KEY,)
-            )
+    if not run_migrations():
+        raise RuntimeError("KohakuHub numbered migration chain failed")
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ services:
       ## ===== Database Configuration =====
       - KOHAKU_HUB_DB_BACKEND=postgres
       - KOHAKU_HUB_DATABASE_URL=postgresql://<user>:<password>@postgres:5432/kohakuhub
-      - KOHAKU_HUB_AUTO_MIGRATE=true # Auto-confirm database migrations (required for Docker)
+      - KOHAKU_HUB_AUTO_MIGRATE=false # Schema is applied by the one-shot migration service
 
       ## ===== S3 Storage Configuration =====
       - KOHAKU_HUB_S3_ENDPOINT=http://minio:9000
@@ -121,14 +121,17 @@ services:
     build: .
     container_name: khub-migrate
     restart: "no"
-    command: ["python", "scripts/khub_migrate.py"]
+    command: ["python", "scripts/run_migrations.py"]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       - KOHAKU_HUB_DB_BACKEND=postgres
       - KOHAKU_HUB_DATABASE_URL=postgresql://<user>:<password>@postgres:5432/kohakuhub
-      - KOHAKU_HUB_AUTO_MIGRATE=false
+      # khub-migrate is a non-interactive one-shot service. It must be able
+      # to cross the historical 008 confirmation boundary when upgrading an
+      # older database.
+      - KOHAKU_HUB_AUTO_MIGRATE=true
 
   khub-worker:
     build: .

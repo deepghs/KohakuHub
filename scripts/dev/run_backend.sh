@@ -69,15 +69,9 @@ if [[ -f "${LAKEFS_CREDENTIALS_FILE}" ]]; then
   set +a
 fi
 
-if [[ "${KOHAKU_HUB_DB_BACKEND:-sqlite}" == "postgres" ]]; then
-  # Production-shaped local development uses the same one-shot migrator as Compose.
-  # API startup remains verification-only after this point.
-  "${PYTHON_BIN}" "${ROOT_DIR}/scripts/khub_migrate.py"
-else
-  # Keep SQLite available for lightweight local development; it cannot host the
-  # durable worker and therefore intentionally uses the legacy fixture migrator.
-  "${PYTHON_BIN}" "${ROOT_DIR}/scripts/run_migrations.py"
-fi
+# Keep local development on the same numbered migration path as Compose.
+# Already-applied historical migrations perform signature checks only.
+"${PYTHON_BIN}" "${ROOT_DIR}/scripts/run_migrations.py"
 
 if [[ "${KOHAKU_HUB_DEV_AUTO_SEED:-true}" == "true" && "${SKIP_SEED}" != "true" ]]; then
   # Keep local demo data creation on the same bootstrap path as normal backend startup.

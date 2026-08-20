@@ -282,6 +282,8 @@ jobs:
           --health-retries 12
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -297,6 +299,15 @@ jobs:
         run: |
           python scripts/khub_migrate.py
           python scripts/verify_schema.py
+
+      - name: Run PostgreSQL migration history matrix
+        env:
+          KOHAKU_HUB_MIGRATION_HISTORY_DSN: ${{ env.KOHAKU_HUB_DATABASE_URL }}
+        run: |
+          pytest -q \
+            test/kohakuhub/test_migration_history_matrix.py \
+            test/kohakuhub/test_db_migration_compatibility.py \
+            test/kohakuhub/test_legacy_migration_edge_cases.py
 
       - name: Run PostgreSQL worker lifecycle tests
         run: |

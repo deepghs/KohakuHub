@@ -14,18 +14,21 @@ Usage:
     python scripts/run_migrations.py
 """
 
-import sys
-import os
-from pathlib import Path
 import importlib.util
+import sys
+from contextlib import contextmanager
+from pathlib import Path
 
 # Add src to path
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "src"))
 
 # Import after path setup
-from kohakuhub.db import db, init_db
-from kohakuhub.config import cfg
+from kohakuhub.db import db, init_db  # noqa: E402
+from kohakuhub.config import cfg  # noqa: E402
+
+
+MIGRATION_LOCK_KEY = "kohakuhub.schema.lifecycle.v1"
 
 
 def discover_migrations():
@@ -42,10 +45,14 @@ def discover_migrations():
     for file_path in migrations_dir.glob("*.py"):
         if file_path.name.startswith("_"):
             continue  # Skip __init__.py and private files
+        number, separator, _ = file_path.stem.partition("_")
+        if not separator or not number.isdecimal():
+            continue
         migrations.append((file_path.stem, file_path))
 
-    # Sort by name (which should be numerical like 001_, 002_, etc.)
-    migrations.sort(key=lambda x: x[0])
+    # Sort by the numeric prefix so both ``017_...`` and an unpadded future
+    # ``17_...`` remain in the same migration order.
+    migrations.sort(key=lambda x: (int(x[0].partition("_")[0]), x[0]))
     return migrations
 
 
@@ -76,33 +83,55 @@ def is_database_initialized():
         True if User table exists (database is initialized)
         False if User table doesn't exist (fresh database)
     """
-    try:
-        db.connect(reuse_if_open=True)
-        cursor = db.cursor()
+    db.connect(reuse_if_open=True)
+    cursor = db.cursor()
 
-        if cfg.app.db_backend == "postgres":
-            cursor.execute(
-                """
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_name='user'
-                """
-            )
-            return cursor.fetchone() is not None
-        else:
-            # SQLite
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='user'"
-            )
-            return cursor.fetchone() is not None
-    except Exception as e:
-        print(f"  [WARNING] Failed to check database state: {e}")
-        # If we can't check, assume uninitialized (safer to skip migrations)
-        return False
+    if cfg.app.db_backend == "postgres":
+        cursor.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = current_schema() AND table_name='user'
+            """
+        )
+        return cursor.fetchone() is not None
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user'")
+    return cursor.fetchone() is not None
+
+
+@contextmanager
+def migration_lock():
+    """Serialize the complete PostgreSQL migration lifecycle."""
+
+    if cfg.app.db_backend != "postgres":
+        yield
+        return
+
+    db.connect(reuse_if_open=True)
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+        (MIGRATION_LOCK_KEY,),
+    )
+    try:
+        yield
+    finally:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+            (MIGRATION_LOCK_KEY,),
+        )
 
 
 def run_migrations():
     """Run all pending migrations."""
+    with migration_lock():
+        return _run_migrations_locked()
+
+
+def _run_migrations_locked():
+    """Run the original numbered migration chain while holding its DB lock."""
     print("=" * 70)
     print("KohakuHub Database Migrations")
     print("=" * 70)
@@ -110,20 +139,16 @@ def run_migrations():
     print(f"Database URL: {cfg.app.database_url}")
     print()
 
-    # Check if database is completely uninitialized
+    # A fresh database still runs numbered migrations. This is required for
+    # PostgreSQL-only migrations such as 017, which init_db() cannot install.
     if not is_database_initialized():
         print("Database is uninitialized (User table doesn't exist)")
-        print("Skipping all migrations - will create fresh schema via init_db()")
+        print("Initializing the current schema before numbered migrations")
         print("\nInitializing database (creating all tables)...")
         init_db()
         print("✓ Database initialized with current schema\n")
-        print("=" * 70)
-        print("[OK] Fresh database initialized successfully!")
-        print("=" * 70)
-        return True
-
-    # Database is initialized, check for migrations
-    print("Database is initialized, checking for pending migrations...\n")
+    else:
+        print("Database is initialized, checking for pending migrations...\n")
 
     # Discover migrations
     migrations = discover_migrations()
@@ -145,25 +170,29 @@ def run_migrations():
         module = load_migration_module(name, path)
         if not module:
             all_success = False
-            continue
+            break
 
         # Check if module has run() function
         if not hasattr(module, "run"):
             print(f"  [ERROR] Migration {name} missing run() function")
             all_success = False
-            continue
+            break
 
         # Run migration
         try:
             success = module.run()
             if not success:
                 all_success = False
+                print(f"  [ERROR] Stopping after failed migration {name}")
+                break
         except Exception as e:
             print(f"  [ERROR] Migration {name} crashed: {e}")
             import traceback
 
             traceback.print_exc()
             all_success = False
+            print(f"  [ERROR] Stopping after crashed migration {name}")
+            break
 
         print()
 
