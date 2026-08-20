@@ -199,6 +199,36 @@ class OperationStore:
         row = await cursor.fetchone()
         return _operation(row) if row else None
 
+    async def get_lakefs_repository(
+        self,
+        connection: psycopg.AsyncConnection,
+        repository_id: int,
+    ) -> str | None:
+        """Return the LakeFS backing owned by one application repository.
+
+        ``lakefs_repo`` is persisted by migration 016.  The derivation
+        fallback keeps old rows readable while the migration runner is
+        completing its backfill; the caller still fails closed when no
+        repository row exists at all.
+        """
+
+        cursor = await connection.execute(
+            """SELECT lakefs_repo, repo_type, full_id
+               FROM repository
+               WHERE id = %s""",
+            (repository_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        if row[0]:
+            return str(row[0])
+        if not row[1] or not row[2]:
+            return None
+        from kohakuhub.utils.lakefs import lakefs_repo_name
+
+        return lakefs_repo_name(str(row[1]), str(row[2]))
+
     async def get_blocking_repository_intent(
         self,
         connection: psycopg.AsyncConnection,
@@ -648,6 +678,33 @@ class OperationStore:
                 (operation_id,),
             )
         return len(rows)
+
+    async def list_cancel_requested_deliveries(
+        self, connection: psycopg.AsyncConnection, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return active deliveries whose durable operation cancellation is pending."""
+
+        if limit < 1:
+            raise ValueError("cancellation retry limit must be positive")
+        cursor = await connection.execute(
+            """SELECT o.id, s.id, s.procrastinate_job_id
+               FROM khub_repository_operations o
+               JOIN khub_operation_steps s ON s.operation_id = o.id
+               WHERE o.state = 'cancel_requested'
+                 AND s.state IN ('pending', 'running')
+                 AND s.procrastinate_job_id IS NOT NULL
+               ORDER BY s.updated_at
+               LIMIT %s""",
+            (limit,),
+        )
+        return [
+            {
+                "operation_id": row[0],
+                "step_id": int(row[1]),
+                "job_id": int(row[2]),
+            }
+            for row in await cursor.fetchall()
+        ]
 
     async def mark_step_observing(
         self,

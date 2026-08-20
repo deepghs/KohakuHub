@@ -1,17 +1,15 @@
 SHELL := /bin/bash
 PYTHON ?= $(if $(wildcard ./venv/bin/python),./venv/bin/python,python)
 TEST_ROOT ?= test/kohakuhub
+MIGRATION_TEST_ROOT ?= test/migrations
 SOURCE_ROOT ?= src/kohakuhub
 RANGE_DIR ?=
 TEST_RANGE = $(if $(strip $(RANGE_DIR)),$(TEST_ROOT)/$(RANGE_DIR),$(TEST_ROOT))
-# Historical migration tests exercise scripts/ and real database upgrades;
-# they run in the dedicated migration-validation job, not the unit suite.
 MIGRATION_TEST_PATHS = \
-	$(TEST_ROOT)/test_db_migration_compatibility.py \
-	$(TEST_ROOT)/test_legacy_migration_edge_cases.py \
-	$(TEST_ROOT)/test_migration_history_matrix.py \
-	$(TEST_ROOT)/operations/test_schema_contract.py
-UNIT_TEST_IGNORE_ARGS = $(foreach test,$(MIGRATION_TEST_PATHS),--ignore=$(test))
+	$(MIGRATION_TEST_ROOT)/test_db_migration_compatibility.py \
+	$(MIGRATION_TEST_ROOT)/test_legacy_migration_edge_cases.py \
+	$(MIGRATION_TEST_ROOT)/test_migration_history_matrix.py \
+	$(MIGRATION_TEST_ROOT)/test_operation_schema_contract.py
 COV_RANGE = $(if $(strip $(RANGE_DIR)),$(SOURCE_ROOT)/$(RANGE_DIR),$(SOURCE_ROOT))
 COV_FAIL_UNDER ?= $(if $(strip $(RANGE_DIR)),0,80)
 COV_TYPES ?= xml term-missing
@@ -50,7 +48,7 @@ help:
 	@echo "  make test-migrations  Run historical migration and upgrade validation separately"
 	@echo "  make test-ui          Run the main UI Vitest suite with coverage"
 	@echo "  make test-ui-admin    Run the admin UI Vitest suite with coverage"
-	@echo "  make test             Run backend tests, then main UI tests, then admin UI tests"
+	@echo "  make test             Run backend, migration, and UI test suites"
 	@echo "  make status           Show local dev infra container status"
 	@echo "  make logs-postgres    Tail Postgres logs"
 	@echo "  make logs-minio       Tail MinIO logs"
@@ -133,7 +131,7 @@ test-backend:
 		echo "Missing coverage range: $(COV_RANGE)" >&2; \
 		exit 1; \
 	fi
-	$(PYTHON) -m pytest $(TEST_RANGE) $(UNIT_TEST_IGNORE_ARGS) $(PYTEST_ARGS)
+	$(PYTHON) -m pytest $(TEST_RANGE) $(PYTEST_ARGS)
 
 test-migrations:
 	$(PYTHON) -m pytest $(MIGRATION_TEST_PATHS) $(MIGRATION_PYTEST_ARGS)

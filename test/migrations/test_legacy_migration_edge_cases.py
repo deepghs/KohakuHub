@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
-from importlib.util import module_from_spec, spec_from_file_location
 
 import pytest
 
-from test.kohakuhub.support.migration_history_database import (
+from kohakuhub.utils.lakefs import lakefs_repo_name
+from scripts import legacy_application_compat, legacy_invitation_compat
+
+from test.migrations.support.migration_history_database import (
     ROOT_DIR,
     _initialize_archived_schema,
     _run_archived_migrations,
@@ -19,7 +21,7 @@ from test.kohakuhub.support.migration_history_database import (
     seed_database,
     snapshot_database,
 )
-from test.kohakuhub.support.migration_history_manifest import HISTORICAL_RELEASES
+from test.migrations.support.migration_history_manifest import HISTORICAL_RELEASES
 
 
 SQLITE_FOREIGN_KEY_CONTRACT = (
@@ -68,54 +70,15 @@ def _run_current_runner(database):
     )
 
 
-def _load_migration_008():
-    spec = spec_from_file_location(
-        "test_migration_008_repair",
-        ROOT_DIR / "scripts" / "db_migrations" / "008_foreignkey_refactoring.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_migration_012():
-    spec = spec_from_file_location(
-        "test_migration_012_rollback",
-        ROOT_DIR
-        / "scripts"
-        / "db_migrations"
-        / "012_invitation_created_by_nullable.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_migration_016():
-    spec = spec_from_file_location(
-        "test_migration_016_frozen_derivation",
-        ROOT_DIR / "scripts" / "db_migrations" / "016_repository_lakefs_repo.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_sqlite_008_uses_the_frozen_016_lakefs_derivation():
-    migration_008 = _load_migration_008()
-    migration_016 = _load_migration_016()
-
     for repo_type, repo_id in (
         ("model", "migration-owner/preserved-repository"),
         ("dataset", "name_with.special/chars"),
         ("space", "Mixed/Case"),
     ):
-        assert migration_008.frozen_lakefs_repo_name(repo_type, repo_id) == (
-            migration_016.frozen_lakefs_repo_name(repo_type, repo_id)
-        )
+        assert legacy_application_compat.frozen_lakefs_repo_name(
+            repo_type, repo_id
+        ) == lakefs_repo_name(repo_type, repo_id)
 
 
 def _sqlite_schema_snapshot(database):
@@ -158,7 +121,7 @@ def test_sqlite_012_rebuild_failure_rolls_back_and_can_be_retried(
     tmp_path, monkeypatch
 ):
     database = _historical_sqlite(tmp_path, "v011")
-    migration = _load_migration_012()
+    migration = legacy_invitation_compat
 
     class DatabaseAdapter:
         def __init__(self, connection):
@@ -166,6 +129,15 @@ def test_sqlite_012_rebuild_failure_rolls_back_and_can_be_retried(
 
         def cursor(self):
             return self.connection.cursor()
+
+        def connect(self, reuse_if_open=True):
+            return self.connection
+
+        def table_exists(self, table_name):
+            return self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone() is not None
 
         def commit(self):
             self.connection.commit()
@@ -183,15 +155,16 @@ def test_sqlite_012_rebuild_failure_rolls_back_and_can_be_retried(
         before_schema = _sqlite_schema_snapshot(database)
         adapter = DatabaseAdapter(connection)
         monkeypatch.setattr(migration, "db", adapter)
-        original_rebuild = migration._sqlite_invitation_rebuild
+        original_rebuild = migration._rebuild_sqlite_invitation
 
         def fail_after_rebuild(cursor):
             original_rebuild(cursor)
             raise RuntimeError("injected invitation rebuild failure")
 
-        monkeypatch.setattr(migration, "_sqlite_invitation_rebuild", fail_after_rebuild)
+        monkeypatch.setattr(migration, "_rebuild_sqlite_invitation", fail_after_rebuild)
+        monkeypatch.setattr(migration.cfg.app, "db_backend", "sqlite")
         with pytest.raises(RuntimeError, match="injected invitation rebuild failure"):
-            migration.migrate_sqlite()
+            migration.repair_legacy_invitation_schema()
 
         assert snapshot_database(database) == before_rows
         assert _sqlite_schema_snapshot(database) == before_schema

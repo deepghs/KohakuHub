@@ -375,6 +375,9 @@ class _FenceStore:
     async def get_blocking_repository_operation(self, *_args, **_kwargs):
         return None
 
+    async def get_lakefs_repository(self, *_args, **_kwargs):
+        return "repo"
+
 
 def _patch_fence_connection(monkeypatch, connection):
     class _AsyncConnectionFactory:
@@ -978,7 +981,7 @@ async def test_repository_ref_fence_restores_capability_when_body_raises(monkeyp
         async with service.repository_ref_fence(7, "main"):
             assert mutation_gateway.has_active_capability() is True
             capability = mutation_gateway.require_capability(
-                "commit", {"branch": "main"}
+                "commit", {"repository": "repo", "branch": "main"}
             )
             assert capability.ref == "branch:main"
             raise RuntimeError("body failure")
@@ -1001,7 +1004,9 @@ async def test_repository_cutover_fence_uses_repository_capability(monkeypatch):
     _patch_fence_connection(monkeypatch, connection)
 
     async with service.repository_ref_fence(7, "__repository__"):
-        capability = mutation_gateway.require_capability("delete_repository", {})
+        capability = mutation_gateway.require_capability(
+            "delete_repository", {"repository": "repo"}
+        )
         assert capability.scope == "cutover"
         assert capability.ref == "__repository__"
 
@@ -1024,7 +1029,10 @@ async def test_repository_name_fence_restores_name_capability_after_body(monkeyp
     _patch_fence_connection(monkeypatch, connection)
 
     async with service.repository_name_fence("owner/repository"):
-        capability = mutation_gateway.require_capability("create_repository", {})
+        mutation_gateway.bind_repository("repo")
+        capability = mutation_gateway.require_capability(
+            "create_repository", {"repository": "repo"}
+        )
         assert capability.scope == "repository_name"
         assert capability.ref == "__repository_name__"
 

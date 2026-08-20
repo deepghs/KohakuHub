@@ -8,7 +8,7 @@ from scripts.khub_migrate import (
     APPLICATION_TABLE_COLUMNS_WORKER,
     _expected_worker_ledger_records,
 )
-from test.kohakuhub.support.migration_history_database import (
+from test.migrations.support.migration_history_database import (
     CURRENT_RUNNER,
     IsolatedPostgresDatabase,
     MigrationHistoryError,
@@ -36,7 +36,7 @@ from test.kohakuhub.support.migration_history_database import (
     sqlite_foreign_key_violations,
     snapshot_database,
 )
-from test.kohakuhub.support.migration_history_manifest import (
+from test.migrations.support.migration_history_manifest import (
     HISTORICAL_RELEASES,
     MAIN_RELEASE,
     migration_history_releases,

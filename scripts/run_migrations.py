@@ -80,6 +80,26 @@ def load_migration_module(name, path):
         return None
 
 
+def _repair_immutable_legacy_boundaries(number: int) -> bool:
+    """Repair known pre-017 states without editing numbered migrations.
+
+    Releases before this checkout shipped 008 and 012 with backend-specific
+    defects. Their files are immutable historical inputs, so the current
+    runner takes over only when it reaches those boundaries and the released
+    schema is incomplete.
+    """
+
+    if number == 8:
+        from legacy_application_compat import repair_legacy_application_schema
+
+        return repair_legacy_application_schema()
+    if number == 12:
+        from legacy_invitation_compat import repair_legacy_invitation_schema
+
+        return repair_legacy_invitation_schema()
+    return True
+
+
 def is_database_initialized():
     """Check if database is initialized (has User table).
 
@@ -169,6 +189,21 @@ def _run_migrations_locked():
     all_success = True
     for name, path in migrations:
         print(f"Running {name}...")
+
+        number = int(name.partition("_")[0])
+        try:
+            if not _repair_immutable_legacy_boundaries(number):
+                all_success = False
+                print(f"  [ERROR] Stopping after compatibility repair for {name}")
+                break
+        except Exception as e:
+            print(f"  [ERROR] Compatibility repair for {name} crashed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            all_success = False
+            print(f"  [ERROR] Stopping before migration {name}")
+            break
 
         # Load migration module
         module = load_migration_module(name, path)

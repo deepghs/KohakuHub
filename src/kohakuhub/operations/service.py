@@ -17,11 +17,15 @@ from urllib.parse import parse_qsl, urlparse
 import psycopg
 
 from kohakuhub import lakefs_mutation_gateway as mutation_gateway
+from kohakuhub.logger import get_logger
 
 from .registry import DEFAULT_REGISTRY, OperationRegistry
 from .store import OperationStore
 from .finalizer import finalize_commit_domain
 from .types import CommitIntentRecord, OperationRecord
+
+
+logger = get_logger("OPERATIONS")
 
 
 class IdempotencyConflict(ValueError):
@@ -553,11 +557,19 @@ class OperationService:
                         )
                     if blocking is not None:
                         raise CommitInProgress(blocking)
+                    lakefs_repository = await self.store.get_lakefs_repository(
+                        connection, repository_id
+                    )
                     capability_token = mutation_gateway.activate_capability(
                         mutation_gateway.MutationCapability(
                             repository_id=int(repository_id),
                             ref="__repository__" if cutover else lock_ref,
                             scope="cutover" if cutover else "mutation",
+                            lakefs_repositories=(
+                                frozenset({lakefs_repository})
+                                if lakefs_repository
+                                else frozenset()
+                            ),
                         )
                     )
                     # Expose the checked-out connection to callers that need to
@@ -631,6 +643,7 @@ class OperationService:
                         repository_id=None,
                         ref="__repository_name__",
                         scope="repository_name",
+                        lakefs_repositories=frozenset(),
                     )
                 )
                 try:
@@ -1310,8 +1323,14 @@ class OperationService:
             if cancel_job is not None:
                 try:
                     await cancel_job(job_id, abort=True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # The durable state remains cancel_requested so the
+                    # reconciler can retry delivery cancellation.  Do not
+                    # hide the dependency failure from operators.
+                    logger.warning(
+                        "Failed to cancel Procrastinate job "
+                        f"{job_id} for operation {operation_id}: {exc}"
+                    )
         return operation
 
     async def mark_dispatch_started(

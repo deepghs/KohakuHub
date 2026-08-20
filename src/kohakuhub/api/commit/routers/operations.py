@@ -38,7 +38,10 @@ from kohakuhub.operations.service import (
 
 logger = get_logger("FILE")
 router = APIRouter()
-COMMIT_STAGE_CONCURRENCY = 8
+# LakeFS stages one object per request. Four concurrent uploads keep a large
+# commit below the combined LakeFS/MinIO and backend connection pressure while
+# leaving headroom for the branch HEAD/commit calls.
+COMMIT_STAGE_CONCURRENCY = 4
 _UNSET_FILE = object()
 
 

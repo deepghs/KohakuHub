@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from kohakuhub.utils.lakefs import get_lakefs_client
+from kohakuhub.logger import get_logger
 
 from .metrics import (
     OPERATION_BACKLOG,
@@ -34,6 +35,7 @@ NO_EFFECT_CURSOR = "__khub_observation_no_effect__"
 AMBIGUOUS_MARKER_CURSOR = "__khub_observation_ambiguous_marker__"
 OBSERVATION_CURSOR_PREFIX = "__khub_observation_cursor_v1__:"
 KNOWN_WORKER_QUEUES = ("control-v1", "sync-v1", "bulk-v1", "cleanup-v1")
+logger = get_logger("OPERATIONS_RECONCILE")
 
 
 async def _recover_stalled_deliveries(
@@ -66,6 +68,39 @@ async def _recover_stalled_deliveries(
             continue
         recovered.add(job_id)
     return recovered
+
+
+async def _retry_cancel_requested_deliveries(
+    pool: Any, app: Any, *, limit: int
+) -> int:
+    """Retry delivery cancellation until the durable operation reaches a terminal state."""
+
+    manager = getattr(app, "job_manager", None)
+    cancel_job = getattr(manager, "cancel_job_by_id_async", None)
+    if cancel_job is None:
+        return 0
+
+    store = OperationStore(pool)
+    list_deliveries = getattr(store, "list_cancel_requested_deliveries", None)
+    if list_deliveries is None:
+        # Keep lightweight embedding/test stores compatible with the optional
+        # reconciliation extension.
+        return 0
+    async with pool.connection() as connection:
+        deliveries = await list_deliveries(connection, limit=limit)
+
+    retried = 0
+    for delivery in deliveries:
+        try:
+            await cancel_job(delivery["job_id"], abort=True)
+        except Exception as exc:
+            logger.warning(
+                "Failed to retry cancellation for Procrastinate job "
+                f"{delivery['job_id']} (operation {delivery['operation_id']}): {exc}"
+            )
+            continue
+        retried += 1
+    return retried
 
 
 async def _observe_runtime_metrics(
@@ -614,6 +649,9 @@ async def reconcile_once(
             app,
             seconds_since_heartbeat=stalled_timeout_seconds,
             limit=limit,
+        )
+        repaired += await _retry_cancel_requested_deliveries(
+            pool, app, limit=limit
         )
         async with pool.connection() as connection:
             async with connection.transaction():

@@ -291,10 +291,11 @@ def _commit_dependencies(monkeypatch, client, repo):
 
 
 @pytest.fixture(autouse=True)
-def _reset_fakes(monkeypatch):
+def _reset_fakes():
     _FakeFileModel.reset()
     _FakeHistory.get_or_none_result = None
-    monkeypatch.setenv("KOHAKU_HUB_TEST_COMPATIBILITY", "true")
+    with commit_ops.mutation_gateway.test_compatibility():
+        yield
 
 
 @pytest.mark.asyncio

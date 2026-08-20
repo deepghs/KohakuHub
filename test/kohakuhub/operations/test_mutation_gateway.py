@@ -15,6 +15,9 @@ class _Client:
     async def commit(self, **kwargs):
         return kwargs
 
+    async def create_tag(self, **kwargs):
+        return kwargs
+
 
 async def _get_fence_limiter():
     limiter = _fence_connection_limiter("postgresql://test", 2)
@@ -71,7 +74,12 @@ async def test_gateway_rejects_mutation_without_a_fence(monkeypatch):
 async def test_gateway_validates_ref_against_active_capability(monkeypatch):
     monkeypatch.delenv("KOHAKU_HUB_TEST_COMPATIBILITY", raising=False)
     token = gateway.activate_capability(
-        gateway.MutationCapability(repository_id=7, ref="branch:main", scope="mutation")
+        gateway.MutationCapability(
+            repository_id=7,
+            ref="branch:main",
+            scope="mutation",
+            lakefs_repositories=frozenset({"repo"}),
+        )
     )
     try:
         with pytest.raises(gateway.MutationFenceRequired):
@@ -80,6 +88,28 @@ async def test_gateway_validates_ref_against_active_capability(monkeypatch):
             "repository": "repo",
             "branch": "main",
         }
+    finally:
+        gateway.reset_capability(token)
+
+
+@pytest.mark.asyncio
+async def test_gateway_validates_create_tag_name_as_the_locked_ref():
+    token = gateway.activate_capability(
+        gateway.MutationCapability(
+            repository_id=7,
+            ref="tag:v1",
+            scope="mutation",
+            lakefs_repositories=frozenset({"repo"}),
+        )
+    )
+    try:
+        assert await gateway.create_tag(
+            _Client(), repository="repo", id="v1", ref="source-commit"
+        ) == {"repository": "repo", "id": "v1", "ref": "source-commit"}
+        with pytest.raises(gateway.MutationFenceRequired):
+            await gateway.create_tag(
+                _Client(), repository="repo", id="v2", ref="source-commit"
+            )
     finally:
         gateway.reset_capability(token)
 
@@ -120,7 +150,10 @@ async def test_gateway_enforces_create_delete_scopes_and_allows_hard_reset():
 
     token = gateway.activate_capability(
         gateway.MutationCapability(
-            repository_id=7, ref="branch:main", scope="mutation"
+            repository_id=7,
+            ref="branch:main",
+            scope="mutation",
+            lakefs_repositories=frozenset({"repo"}),
         )
     )
     try:

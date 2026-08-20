@@ -545,6 +545,7 @@ async def _create_repo_unlocked(payload: CreateRepoPayload, user: User):
         return hf_server_error(f"LakeFS repository allocation failed: {str(e)}")
 
     storage_namespace = f"s3://{cfg.s3.bucket}/{lakefs_repo}"
+    mutation_gateway.bind_repository(lakefs_repo)
 
     try:
         await mutation_gateway.create_repository(
@@ -840,6 +841,7 @@ async def _migrate_lakefs_repository(
 
     client = get_lakefs_client()
     from_s3_prefix = f"{from_lakefs_repo}/"
+    mutation_gateway.bind_repository(to_lakefs_repo)
 
     try:
         # 1. Get list of all objects with metadata from old repo

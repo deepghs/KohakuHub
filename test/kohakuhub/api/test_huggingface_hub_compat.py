@@ -409,12 +409,21 @@ async def test_hf_api_likes_visibility_move_delete_and_list_liked_repos(
         is True
     )
 
-    await asyncio.to_thread(lambda: api.delete_repo("owner/hf-lifecycle-renamed"))
+    # Repository deletion remains deliberately fail-closed in PostgreSQL until
+    # its durable cleanup handler lands.  Keep the expected HF wire behavior
+    # explicit here instead of turning the disabled operation into a hidden
+    # compatibility regression.
+    from huggingface_hub.errors import HfHubHTTPError
+
+    with pytest.raises(HfHubHTTPError, match="503 Service Unavailable"):
+        await asyncio.to_thread(
+            lambda: api.delete_repo("owner/hf-lifecycle-renamed")
+        )
     assert (
         await asyncio.to_thread(
             lambda: api.repo_exists("owner/hf-lifecycle-renamed")
         )
-        is False
+        is True
     )
 
 
