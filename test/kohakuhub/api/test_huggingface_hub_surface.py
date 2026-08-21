@@ -181,12 +181,17 @@ async def test_list_repo_tree_supports_pagination_over_many_entries(
         )
         for i in range(60)
     ]
-    await _run(
-        api.create_commit,
-        repo_id=repo_id,
-        operations=additions,
-        commit_message="bulk seed 60 files",
-    )
+    # Keep setup commits below huggingface_hub's fixed 10-second read timeout
+    # under constrained CI resources. The assertion still observes one
+    # 60-entry tree, which is the pagination contract under test.
+    for offset in range(0, len(additions), 20):
+        batch = additions[offset : offset + 20]
+        await _run(
+            api.create_commit,
+            repo_id=repo_id,
+            operations=batch,
+            commit_message=f"bulk seed files {offset}-{offset + len(batch) - 1}",
+        )
 
     tree = await _run(
         lambda: list(
