@@ -42,6 +42,20 @@ router = APIRouter()
 # commit below the combined LakeFS/MinIO and backend connection pressure while
 # leaving headroom for the branch HEAD/commit calls.
 COMMIT_STAGE_CONCURRENCY = 4
+
+
+def _staging_paths_are_independent(paths: list[str | None]) -> bool:
+    """Return whether same-kind staging operations can safely overlap."""
+
+    normalized = sorted(
+        str(path).strip("/")
+        for path in paths
+        if path is not None and str(path).strip("/")
+    )
+    return all(
+        current != previous and not current.startswith(f"{previous}/")
+        for previous, current in zip(normalized, normalized[1:])
+    )
 _UNSET_FILE = object()
 
 
@@ -163,81 +177,147 @@ async def _estimate_commit_quota_delta(
     the LakeFS stat call supplies the missing size before any mutation.
     """
 
-    # Applying two mutations to the same path (or a file and one of its
-    # parent folders) against one pre-commit snapshot makes subtraction
-    # order-dependent and can under/over-count quota.  Reject the ambiguous
-    # request before staging; callers can retry with a canonical operation set.
-    seen_paths: set[str] = set()
-    normalized_paths: list[tuple[str, str]] = []
-    for operation in operations:
-        path = str(operation.get("value", {}).get("path", "")).strip("/")
+    # Reject duplicate paths and unsafe file/folder overlaps before building
+    # the projection.  Walk each path's component prefixes instead of
+    # comparing every pair, so a large commit stays linear in its path length.
+    path_operations: dict[str, tuple[str, int]] = {}
+    for operation_index, operation in enumerate(operations):
+        path = str(operation.get("value", {}).get("path") or "").strip("/")
         if not path:
             continue
-        key = operation.get("key", "")
-        normalized_paths.append((path, key))
-        if path in seen_paths:
+        if path in path_operations:
             raise ValueError("commit contains overlapping mutations")
-        seen_paths.add(path)
-    for path, _key in normalized_paths:
-        prefix = path + "/"
-        if any(other != path and (other.startswith(prefix) or path.startswith(other + "/")) for other, _ in normalized_paths):
-            raise ValueError("commit contains overlapping file and folder mutations")
+        path_operations[path] = (operation.get("key", ""), operation_index)
 
-    delta = 0
+    for path, (key, operation_index) in path_operations.items():
+        parts = path.split("/")
+        prefix = ""
+        for part in parts[:-1]:
+            prefix = f"{prefix}/{part}" if prefix else part
+            ancestor = path_operations.get(prefix)
+            if ancestor is None:
+                continue
+            ancestor_key, ancestor_index = ancestor
+            if not (
+                ancestor_key == "deletedFolder"
+                and ancestor_index < operation_index
+            ):
+                raise ValueError(
+                    "commit contains overlapping file and folder mutations"
+                )
+
+    # Apply mutations in request order against a small projected view. This
+    # matches the HF client contract for delete-folder followed by re-adding a
+    # child while avoiding the old all-pairs overlap scan (O(n^2)).
+    initial_regular: dict[str, int] = {}
+    projected_regular: dict[str, int] = {}
+    loaded_files: dict[str, File | None] = {}
+    loaded_folder_prefixes: list[str] = []
+    anonymous_folder_delta = 0
+    lfs_delta = 0
+    checked_lfs_oids: set[str] = set()
 
     def active_file(path: str) -> File | None:
+        path = str(path or "").strip("/")
+        if path in loaded_files:
+            return loaded_files[path]
         if existing_files is None:
-            return get_file(repo, path)
-        existing = existing_files.get(path)
-        return existing if existing is not None and not existing.is_deleted else None
+            existing = get_file(repo, path)
+        else:
+            existing = existing_files.get(path)
+        if existing is not None and existing.is_deleted:
+            existing = None
+        loaded_files[path] = existing
+        if existing is not None and not existing.lfs:
+            size = int(existing.size)
+            initial_regular[path] = size
+            projected_regular[path] = size
+        return existing
 
-    def subtract_current(path: str) -> None:
-        nonlocal delta
-        existing = active_file(path)
-        if existing and not existing.is_deleted and not existing.lfs:
-            delta -= int(existing.size)
+    def charge_lfs_object(oid: str, size: int) -> None:
+        nonlocal lfs_delta
+        if oid in checked_lfs_oids:
+            return
+        checked_lfs_oids.add(oid)
+        if not LFSObjectHistory.get_or_none(
+            (LFSObjectHistory.repository == repo)
+            & (LFSObjectHistory.sha256 == oid)
+        ):
+            lfs_delta += int(size)
+
+    def delete_projected_prefix(prefix: str) -> None:
+        for projected_path in tuple(projected_regular):
+            if projected_path.startswith(prefix):
+                projected_regular.pop(projected_path, None)
+
+    def load_and_delete_folder(folder_path: str) -> None:
+        nonlocal anonymous_folder_delta
+        folder_path = folder_path.strip("/")
+        prefix = f"{folder_path}/"
+        if any(prefix.startswith(loaded) for loaded in loaded_folder_prefixes):
+            delete_projected_prefix(prefix)
+            return
+        loaded_folder_prefixes.append(prefix)
+        rows = (
+            File.select(File.path_in_repo, File.size, File.lfs)
+            .where(
+                (File.repository == repo)
+                & (File.path_in_repo.startswith(prefix))
+                # Peewee builds SQL expressions from this comparison; a
+                # Python ``not`` would evaluate the field immediately.
+                & (File.is_deleted == False)  # noqa: E712
+            )
+            .tuples()
+        )
+        for row in rows:
+            # Keep compatibility with lightweight unit fakes that return only
+            # (size, lfs) for this query.
+            if len(row) == 3:
+                child_path, size, is_lfs = row
+                child_path = str(child_path).strip("/")
+                if child_path not in loaded_files:
+                    loaded_files[child_path] = None
+                    if not is_lfs:
+                        initial_regular[child_path] = int(size)
+                        projected_regular[child_path] = int(size)
+            else:
+                child_path = None
+                size, is_lfs = row
+            if not is_lfs:
+                if child_path is None:
+                    anonymous_folder_delta -= int(size)
+                else:
+                    projected_regular.pop(child_path, None)
+        delete_projected_prefix(prefix)
 
     for operation in operations:
         key = operation["key"]
         value = operation["value"]
-        path = value.get("path")
+        path = str(value.get("path") or "").strip("/")
         if key == "file":
             data = base64.b64decode(value.get("content", ""))
-            subtract_current(path)
-            delta += len(data)
+            active_file(path)
+            projected_regular[path] = len(data)
         elif key == "lfsFile":
-            oid = value.get("oid")
+            oid = str(value.get("oid") or "")
             size = int(value.get("size") or 0)
             existing = active_file(path)
             if existing and not existing.is_deleted and existing.lfs and existing.sha256 == oid:
+                projected_regular.pop(path, None)
                 continue
             lfs_key = f"lfs/{oid[:2]}/{oid[2:4]}/{oid}"
             actual_size = await get_object_metadata(cfg.s3.bucket, lfs_key)
             size = int(actual_size["size"])
-            if not LFSObjectHistory.get_or_none(
-                (LFSObjectHistory.repository == repo)
-                & (LFSObjectHistory.sha256 == oid)
-            ):
-                delta += size
+            projected_regular.pop(path, None)
+            charge_lfs_object(oid, size)
         elif key == "deletedFile":
-            subtract_current(path)
+            active_file(path)
+            projected_regular.pop(path, None)
         elif key == "deletedFolder":
-            folder_path = path if path.endswith("/") else f"{path}/"
-            for existing in (
-                File.select(File.size, File.lfs)
-                .where(
-                    (File.repository == repo)
-                    & (File.path_in_repo.startswith(folder_path))
-                    # Peewee builds SQL expressions from this comparison; a
-                    # Python ``not`` would evaluate the field immediately.
-                    & (File.is_deleted == False)  # noqa: E712
-                )
-                .tuples()
-            ):
-                if not existing[1]:
-                    delta -= int(existing[0])
+            load_and_delete_folder(path)
         elif key == "copyFile":
-            subtract_current(path)
+            active_file(path)
+            projected_regular.pop(path, None)
             source = active_file(value.get("srcPath"))
             if source is None:
                 source_object = await client.stat_object(
@@ -246,22 +326,22 @@ async def _estimate_commit_quota_delta(
                     path=value.get("srcPath"),
                 )
                 if should_use_lfs(repo, path, int(source_object["size_bytes"])):
-                    if not LFSObjectHistory.get_or_none(
-                        (LFSObjectHistory.repository == repo)
-                        & (LFSObjectHistory.sha256 == source_object["checksum"])
-                    ):
-                        delta += int(source_object["size_bytes"])
+                    charge_lfs_object(
+                        str(source_object["checksum"]),
+                        int(source_object["size_bytes"]),
+                    )
                 else:
-                    delta += int(source_object["size_bytes"])
+                    projected_regular[path] = int(source_object["size_bytes"])
             elif source.lfs:
-                if not LFSObjectHistory.get_or_none(
-                    (LFSObjectHistory.repository == repo)
-                    & (LFSObjectHistory.sha256 == source.sha256)
-                ):
-                    delta += int(source.size)
+                charge_lfs_object(str(source.sha256), int(source.size))
             else:
-                delta += int(source.size)
-    return delta
+                projected_regular[path] = int(source.size)
+    return (
+        sum(projected_regular.values())
+        - sum(initial_regular.values())
+        + anonymous_folder_delta
+        + lfs_delta
+    )
 
 
 async def process_regular_file(
@@ -1100,6 +1180,23 @@ async def _commit_unlocked(
     if header is None:
         raise HTTPException(400, detail={"error": "Missing commit header"})
 
+    # huggingface_hub sends parentCommit when the caller based its mutation on
+    # a known revision. Validate it before metadata reads, intent creation, or
+    # any LakeFS staging so a stale client cannot mutate a newer branch head.
+    requested_parent = header.get("parentCommit")
+    if requested_parent is not None:
+        if not isinstance(requested_parent, str) or not requested_parent.strip():
+            raise HTTPException(
+                400,
+                detail={"error": "Invalid parentCommit in commit header"},
+            )
+        requested_parent = requested_parent.strip()
+        if not base_head.startswith(requested_parent):
+            raise HTTPException(
+                409,
+                detail={"error": "Commit parent does not match repository head"},
+            )
+
     # Persist the request identity before touching LakeFS staging.  The body
     # hash is separate from the staged finalization payload because the latter
     # is only known after object metadata has been resolved.
@@ -1287,6 +1384,7 @@ async def _commit_unlocked(
     # route wrapper is held for this complete staging and commit sequence.
 
     index = 0
+    stage_semaphore = asyncio.Semaphore(COMMIT_STAGE_CONCURRENCY)
     while index < len(operations):
         op = operations[index]
         key = op["key"]
@@ -1335,8 +1433,14 @@ async def _commit_unlocked(
                     )
                 return changed, local_mutations
 
-            stage_semaphore = asyncio.Semaphore(COMMIT_STAGE_CONCURRENCY)
-            if len(group) > 1 and existing_files is not None:
+            can_stage_concurrently = _staging_paths_are_independent(
+                [group_op["value"].get("path") for group_op in group]
+            )
+            if (
+                len(group) > 1
+                and existing_files is not None
+                and can_stage_concurrently
+            ):
                 staged = await asyncio.gather(
                     *(stage_regular_file(group_op) for group_op in group),
                     return_exceptions=True,
@@ -1355,7 +1459,7 @@ async def _commit_unlocked(
             index = group_end
             continue
 
-        if intent is not None and path and not use_batch_staging:
+        if intent is not None and path and not use_batch_staging and key != "lfsFile":
             # Record the target before the first LakeFS staging mutation so a
             # stale prepared intent can reset the unchanged branch safely.
             await operation_service.record_prepared_staging_path(
@@ -1366,32 +1470,78 @@ async def _commit_unlocked(
 
         match key:
             case "lfsFile":
-                # LFS file already in S3
-                changed, lfs_info = await process_lfs_file(
-                    path=path,
-                    oid=value.get("oid"),
-                    size=value.get("size"),
-                    algo=value.get("algo", "sha256"),
-                    repo=repo_row,
-                    lakefs_repo=lakefs_repo,
-                    revision=revision,
-                    file_mutations=file_mutations,
-                    existing_file=(
-                        existing_files.get(path) if existing_files is not None else _UNSET_FILE
-                    ),
+                group_end = index + 1
+                while group_end < len(operations) and operations[group_end]["key"] == "lfsFile":
+                    group_end += 1
+                group = operations[index:group_end]
+                if not use_batch_staging and intent is not None:
+                    for group_op in group:
+                        group_path = group_op["value"].get("path")
+                        if group_path:
+                            await operation_service.record_prepared_staging_path(
+                                intent.id,
+                                path=str(group_path),
+                                recursive=False,
+                            )
+
+                async def stage_lfs_file(
+                    group_op: dict,
+                ) -> tuple[bool, dict | None, list[dict]]:
+                    local_mutations: list[dict] = []
+                    group_value = group_op["value"]
+                    group_path = group_value.get("path")
+                    async with stage_semaphore:
+                        changed, lfs_info = await process_lfs_file(
+                            path=group_path,
+                            oid=group_value.get("oid"),
+                            size=group_value.get("size"),
+                            algo=group_value.get("algo", "sha256"),
+                            repo=repo_row,
+                            lakefs_repo=lakefs_repo,
+                            revision=revision,
+                            file_mutations=local_mutations,
+                            existing_file=(
+                                existing_files.get(group_path)
+                                if existing_files is not None
+                                else _UNSET_FILE
+                            ),
+                        )
+                    return changed, lfs_info, local_mutations
+
+                can_stage_concurrently = _staging_paths_are_independent(
+                    [group_op["value"].get("path") for group_op in group]
                 )
-                files_changed = files_changed or changed
-                if lfs_info:
-                    logger.debug(
-                        f"[COMMIT_OP] Adding LFS file to tracking queue: {path} "
-                        f"(sha256={lfs_info['sha256'][:8]}, size={lfs_info['size']:,})"
+                if (
+                    len(group) > 1
+                    and existing_files is not None
+                    and can_stage_concurrently
+                ):
+                    staged = await asyncio.gather(
+                        *(stage_lfs_file(group_op) for group_op in group),
+                        return_exceptions=True,
                     )
-                    pending_lfs_tracking.append(lfs_info)
                 else:
-                    logger.warning(
-                        f"[COMMIT_OP] process_lfs_file returned NO tracking info for: {path} "
-                        f"(oid={value.get('oid', 'MISSING')[:8]})"
-                    )
+                    staged = [await stage_lfs_file(group_op) for group_op in group]
+
+                for result in staged:
+                    if isinstance(result, BaseException):
+                        raise result
+                    changed, lfs_info, mutations = result
+                    files_changed = files_changed or changed
+                    file_mutations.extend(mutations)
+                    if lfs_info:
+                        logger.debug(
+                            f"[COMMIT_OP] Adding LFS file to tracking queue: "
+                            f"{lfs_info['path']} (sha256={lfs_info['sha256'][:8]}, "
+                            f"size={lfs_info['size']:,})"
+                        )
+                        pending_lfs_tracking.append(lfs_info)
+                    else:
+                        logger.warning(
+                            "[COMMIT_OP] process_lfs_file returned NO tracking info"
+                        )
+                index = group_end
+                continue
 
             case "deletedFile":
                 # Delete single file

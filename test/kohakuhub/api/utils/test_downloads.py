@@ -201,17 +201,29 @@ async def test_track_download_async_creates_new_session_and_schedules_cleanup(mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("latest_stat", "expected_start_delta"),
+    ("latest_stat_offset", "expected_start_delta"),
     [
         (None, None),
-        (SimpleNamespace(date=datetime.now(timezone.utc).date() - timedelta(days=3)), 2),
-        (SimpleNamespace(date=datetime.now(timezone.utc).date() - timedelta(days=1)), "skip"),
+        (3, 2),
+        (1, "skip"),
     ],
 )
 async def test_ensure_stats_up_to_date_dispatches_aggregation_ranges(
-    monkeypatch, latest_stat, expected_start_delta
+    monkeypatch, latest_stat_offset, expected_start_delta
 ):
     seen = {}
+    frozen_now = datetime.now(timezone.utc)
+    today = frozen_now.date()
+    latest_stat = (
+        None
+        if latest_stat_offset is None
+        else SimpleNamespace(date=today - timedelta(days=latest_stat_offset))
+    )
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_now if tz is not None else frozen_now.replace(tzinfo=None)
 
     class FakeDailyRepoStats:
         repository = _Field("repository")
@@ -226,11 +238,11 @@ async def test_ensure_stats_up_to_date_dispatches_aggregation_ranges(
 
     monkeypatch.setattr(download_utils, "DailyRepoStats", FakeDailyRepoStats)
     monkeypatch.setattr(download_utils, "aggregate_sessions_to_daily", fake_aggregate)
+    monkeypatch.setattr(download_utils, "datetime", FrozenDateTime)
 
     repo = SimpleNamespace(full_id="owner/repo")
     await download_utils.ensure_stats_up_to_date(repo)
 
-    today = datetime.now(timezone.utc).date()
     yesterday = today - timedelta(days=1)
     if expected_start_delta == "skip":
         assert seen == {}

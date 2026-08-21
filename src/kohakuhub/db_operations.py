@@ -37,6 +37,12 @@ from kohakuhub.db import (
 from kohakuhub.utils.names import normalize_name
 
 
+# PostgreSQL accepts at most 65,535 bind parameters per statement. These
+# projections use one path parameter per row, so keep a generous margin for
+# future query changes and very large commits.
+FILE_PATH_QUERY_BATCH_SIZE = 1_000
+
+
 # ===== User operations =====
 
 
@@ -467,19 +473,33 @@ def get_repo_file_metadata_map(
     When ``paths`` is provided, only those paths are selected so a small
     preupload batch does not scan the whole repository.
     """
-    query = (File.repository == repo) & (File.is_deleted == False)
-    if paths is not None:
-        query &= File.path_in_repo.in_(list(paths))
+    base_query = (File.repository == repo) & (File.is_deleted == False)
+    if paths is None:
+        path_batches = [None]
+    else:
+        path_list = list(dict.fromkeys(str(path) for path in paths if path))
+        path_batches = [
+            path_list[offset : offset + FILE_PATH_QUERY_BATCH_SIZE]
+            for offset in range(0, len(path_list), FILE_PATH_QUERY_BATCH_SIZE)
+        ]
 
-    return {
-        path: (sha256 or "", size)
-        for path, sha256, size in File.select(
-            File.path_in_repo, File.sha256, File.size
+    result: dict[str, tuple[str, int]] = {}
+    for path_batch in path_batches:
+        query = base_query
+        if path_batch is not None:
+            query &= File.path_in_repo.in_(path_batch)
+        result.update(
+            {
+                path: (sha256 or "", size)
+                for path, sha256, size in File.select(
+                    File.path_in_repo, File.sha256, File.size
+                )
+                .where(query)
+                .tuples()
+                .iterator()
+            }
         )
-        .where(query)
-        .tuples()
-        .iterator()
-    }
+    return result
 
 
 def get_repo_file_map(
@@ -496,21 +516,27 @@ def get_repo_file_map(
     if not path_list:
         return {}
 
-    return {
-        row.path_in_repo: row
-        for row in File.select(
-            File.path_in_repo,
-            File.size,
-            File.sha256,
-            File.lfs,
-            File.is_deleted,
+    result: dict[str, File] = {}
+    for offset in range(0, len(path_list), FILE_PATH_QUERY_BATCH_SIZE):
+        path_batch = path_list[offset : offset + FILE_PATH_QUERY_BATCH_SIZE]
+        result.update(
+            {
+                row.path_in_repo: row
+                for row in File.select(
+                    File.path_in_repo,
+                    File.size,
+                    File.sha256,
+                    File.lfs,
+                    File.is_deleted,
+                )
+                .where(
+                    (File.repository == repo)
+                    & File.path_in_repo.in_(path_batch)
+                )
+                .iterator()
+            }
         )
-        .where(
-            (File.repository == repo)
-            & File.path_in_repo.in_(path_list)
-        )
-        .iterator()
-    }
+    return result
 
 
 def get_repo_file_sha256_map(repo: Repository) -> dict[str, str]:

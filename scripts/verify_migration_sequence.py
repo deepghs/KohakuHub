@@ -57,7 +57,7 @@ def declared_migration_number(path: Path) -> int | None:
             declared = ast.literal_eval(value)
         except (ValueError, TypeError):
             return None
-        return declared if isinstance(declared, int) else None
+        return declared if type(declared) is int else None
     return None
 
 

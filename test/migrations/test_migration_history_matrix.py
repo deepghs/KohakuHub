@@ -147,6 +147,81 @@ def test_postgres_017_rejects_extra_application_schema_and_rolls_back(tmp_path):
         assert after == before
 
 
+@pytest.mark.parametrize(
+    ("mutation", "diagnostic"),
+    (
+        ("type", "semantic_columns"),
+        ("nullable", "semantic_columns"),
+        ("index", "invalid_indexes"),
+        ("primary_key", "missing_constraints"),
+    ),
+)
+def test_postgres_017_rejects_application_semantic_drift(
+    tmp_path, mutation, diagnostic
+):
+    dsn = postgres_dsn()
+    if dsn is None:
+        pytest.skip(
+            "set KOHAKU_HUB_MIGRATION_HISTORY_DSN to enable PostgreSQL schema coverage"
+        )
+
+    import psycopg
+    from psycopg import sql
+
+    with IsolatedPostgresDatabase(dsn) as database:
+        archive_root = archive_release(MAIN_RELEASE, tmp_path / "main")
+        _initialize_archived_schema(archive_root, database)
+        seed_database(database)
+        _complete_main_016_backfill(database)
+
+        with psycopg.connect(database.url) as connection:
+            if mutation == "type":
+                connection.execute(
+                    'ALTER TABLE "user" ALTER COLUMN username TYPE TEXT'
+                )
+            elif mutation == "nullable":
+                connection.execute(
+                    'ALTER TABLE "user" ALTER COLUMN username DROP NOT NULL'
+                )
+            elif mutation == "index":
+                connection.execute('DROP INDEX "user_is_org"')
+                connection.execute(
+                    'CREATE INDEX "user_is_org" ON "user" ("is_org") '
+                    'WHERE "is_org" = TRUE'
+                )
+            else:
+                constraint_name = connection.execute(
+                    """
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = 'emailverification'::regclass
+                      AND contype = 'p'
+                    LIMIT 1
+                    """
+                ).fetchone()[0]
+                connection.execute(
+                    sql.SQL("ALTER TABLE emailverification DROP CONSTRAINT {}")
+                    .format(sql.Identifier(constraint_name))
+                )
+            # Release the DDL lock before the runner opens its own connection.
+            connection.commit()
+
+            if mutation == "primary_key":
+                from scripts.khub_migrate import _application_schema_semantic_diff
+
+                with psycopg.connect(database.url) as connection:
+                    semantic_diff = _application_schema_semantic_diff(connection)
+                assert semantic_diff["missing_constraints"]
+
+        before = (_postgres_schema_snapshot(database), ledger_rows(database))
+        result = _run_script(CURRENT_RUNNER, database, cwd=ROOT_DIR)
+        after = (_postgres_schema_snapshot(database), ledger_rows(database))
+
+        assert not result.succeeded, result.diagnostic()
+        assert diagnostic in result.stdout
+        assert after == before
+
+
 def _postgres_schema_snapshot(database):
     import psycopg
 

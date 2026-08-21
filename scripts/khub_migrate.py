@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from db_migrations._017_schema import (  # noqa: E402
     OPERATION_TABLE_COLUMNS_V6,
     OPERATION_TABLE_COLUMNS_V7,
     OPERATION_TABLE_COLUMNS_V8,
+    PRE_017_POSTGRES_APPLICATION_SCHEMA_SQL,
     PROCRASTINATE_SCHEMA_SQL_V390,
     PROCRASTINATE_REQUIRED_INDEXES_V390,
     PROCRASTINATE_TABLE_COLUMNS_V390,
@@ -238,6 +240,76 @@ KNOWN_OPERATION_TABLES_WORKER = frozenset(
     for table in signature
 )
 
+# The numbered 001-016 scripts were not schema-bootstrap scripts. Some of
+# them created a valid application table with a weaker default/nullability
+# contract, or omitted a non-essential index when the table already existed.
+# 017 must recognize those released databases without changing the historical
+# files. Keep the exceptions explicit so a genuinely new drift is still
+# rejected at the adoption boundary.
+HISTORICAL_APPLICATION_NULLABLE_COLUMNS = frozenset(
+    {
+        ("dailyrepostats", "anonymous_downloads"),
+        ("dailyrepostats", "authenticated_downloads"),
+        ("dailyrepostats", "download_sessions"),
+        ("dailyrepostats", "total_files"),
+        ("downloadsession", "file_count"),
+        ("invitation", "usage_count"),
+        ("repository", "downloads"),
+        ("repository", "likes_count"),
+        ("user", "is_org"),
+    }
+)
+HISTORICAL_APPLICATION_TYPES = {
+    ("user", "normalized_name"): frozenset({"text"}),
+}
+HISTORICAL_APPLICATION_DEFAULTS = {
+    ("confirmationtoken", "created_at"): frozenset({"current_timestamp"}),
+    ("dailyrepostats", "anonymous_downloads"): frozenset({"0"}),
+    ("dailyrepostats", "authenticated_downloads"): frozenset({"0"}),
+    ("dailyrepostats", "download_sessions"): frozenset({"0"}),
+    ("dailyrepostats", "total_files"): frozenset({"0"}),
+    ("downloadsession", "file_count"): frozenset({"1"}),
+    ("file", "is_deleted"): frozenset({"false"}),
+    ("invitation", "usage_count"): frozenset({"0"}),
+    ("repository", "downloads"): frozenset({"0"}),
+    ("repository", "likes_count"): frozenset({"0"}),
+    ("user", "is_org"): frozenset({"false"}),
+    ("userexternaltoken", "created_at"): frozenset({"current_timestamp"}),
+    ("userexternaltoken", "updated_at"): frozenset({"current_timestamp"}),
+}
+
+# These indexes were omitted by one or more released 001-016 paths when the
+# table already existed.  017 intentionally does not rewrite those historical
+# application tables; a later migration can add or tighten these indexes
+# without changing 017's immutable adoption contract.
+OPTIONAL_HISTORICAL_APPLICATION_INDEXES = frozenset(
+    {
+        "commit_author_id",
+        "commit_commit_id_repository_id",
+        "commit_owner_id",
+        "commit_repository_id",
+        "commit_repository_id_branch",
+        "dailyrepostats_repository_id_date",
+        "downloadsession_repository_id_session_id_time_bucket",
+        "emailverification_user_id",
+        "file_is_deleted",
+        "file_owner_id",
+        "file_repository_id",
+        "file_repository_id_path_in_repo",
+        "invitation_action_created_by_id",
+        "invitation_created_by_id",
+        "invitation_used_by_id",
+        "lfsobjecthistory_file_id",
+        "lfsobjecthistory_repository_id",
+        "lfsobjecthistory_repository_id_path_in_repo",
+        "repositorylike_repository_id_user_id",
+        "stagingupload_repository_id",
+        "stagingupload_uploader_id",
+        "user_is_org",
+        "userorganization_user_id_organization_id",
+    }
+)
+
 LEDGER_DDL = """
 CREATE TABLE IF NOT EXISTS khub_schema_migrations (
     migration_name TEXT PRIMARY KEY,
@@ -257,15 +329,15 @@ WORKER_APPLICATION_COMPATIBILITY_SQL = (
     """
     CREATE TABLE IF NOT EXISTS fallbacksource (
         id SERIAL PRIMARY KEY,
-        namespace VARCHAR(255) NOT NULL DEFAULT '',
+        namespace VARCHAR(255) NOT NULL,
         url VARCHAR(255) NOT NULL,
         token VARCHAR(255),
-        priority INTEGER NOT NULL DEFAULT 100,
+        priority INTEGER NOT NULL,
         name VARCHAR(255) NOT NULL,
         source_type VARCHAR(255) NOT NULL,
-        enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        enabled BOOLEAN NOT NULL,
+        created_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP NOT NULL
     )
     """,
     """
@@ -325,6 +397,302 @@ def bootstrap_worker_application_compatibility(connection: Any) -> None:
             cursor.execute(statement)
 
 
+def _normalize_application_catalog_sql(value: str | None, schema: str) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).lower().split()).replace('"', "")
+    for prefix in (f"{schema.lower()}.", "pg_temp.", "public."):
+        normalized = normalized.replace(prefix, "")
+    return normalized
+
+
+def _normalize_application_default(value: str | None, schema: str) -> str | None:
+    normalized = _normalize_application_catalog_sql(value, schema)
+    if normalized is not None and normalized.startswith("nextval("):
+        # SERIAL sequence names are implementation details of the historical
+        # database, not part of the application column contract.
+        return "__sequence__"
+    return normalized
+
+
+def _normalize_application_index_definition(value: str, schema: str) -> str:
+    normalized = _normalize_application_catalog_sql(value, schema) or ""
+    # PostgreSQL includes the physical index name in pg_indexes.indexdef.
+    # Compare the table, uniqueness, access method, keys, and predicate while
+    # deliberately ignoring that name.
+    return re.sub(
+        r"^create\s+(unique\s+)?index\s+[^ ]+\s+on\s+",
+        lambda match: f"create {match.group(1) or ''}index on ",
+        normalized,
+    )
+
+
+def _application_catalog_snapshot(connection: Any, schema: str) -> dict[str, Any]:
+    table_rows = connection.execute(
+        """
+        SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
+               a.attnotnull, pg_get_expr(d.adbin, d.adrelid)
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        JOIN pg_attribute AS a ON a.attrelid = c.oid
+                              AND a.attnum > 0
+                              AND NOT a.attisdropped
+        LEFT JOIN pg_attrdef AS d ON d.adrelid = c.oid AND d.adnum = a.attnum
+        WHERE n.nspname = %s
+          AND c.relkind = 'r'
+          AND c.relname NOT LIKE 'procrastinate_%%'
+          AND c.relname <> ALL(%s)
+        ORDER BY c.relname, a.attnum
+        """,
+        (schema, [*KNOWN_OPERATION_TABLES_WORKER, "khub_schema_migrations"]),
+    ).fetchall()
+    columns: dict[str, dict[str, tuple[str, bool, str | None]]] = {}
+    for table, column, type_name, not_null, default in table_rows:
+        columns.setdefault(table, {})[column] = (
+            type_name,
+            not not_null,
+            _normalize_application_default(default, schema),
+        )
+
+    table_names = sorted(columns)
+    index_rows = connection.execute(
+        """
+        SELECT indexes.tablename, indexes.indexname, indexes.indexdef,
+               index_info.indisvalid
+        FROM pg_indexes AS indexes
+        JOIN pg_class AS index_relation
+          ON index_relation.relname = indexes.indexname
+        JOIN pg_namespace AS index_namespace
+          ON index_namespace.oid = index_relation.relnamespace
+         AND index_namespace.nspname = indexes.schemaname
+        JOIN pg_index AS index_info
+          ON index_info.indexrelid = index_relation.oid
+        WHERE indexes.schemaname = %s
+          AND indexes.tablename = ANY(%s)
+        """,
+        (schema, table_names),
+    ).fetchall()
+    indexes = {
+        (table, name): (
+            _normalize_application_index_definition(definition, schema),
+            bool(valid),
+        )
+        for table, name, definition, valid in index_rows
+    }
+
+    constraint_rows = connection.execute(
+        """
+        SELECT relation.relname, constraint_info.conname,
+               constraint_info.contype, constraint_info.convalidated,
+               pg_get_constraintdef(constraint_info.oid, true)
+        FROM pg_constraint AS constraint_info
+        JOIN pg_class AS relation ON relation.oid = constraint_info.conrelid
+        JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = %s AND relation.relname = ANY(%s)
+        """,
+        (schema, table_names),
+    ).fetchall()
+    constraints = {
+        (table, name): (
+            kind,
+            bool(validated),
+            _normalize_application_catalog_sql(definition, schema),
+        )
+        for table, name, kind, validated, definition in constraint_rows
+    }
+    return {
+        "columns": columns,
+        "indexes": indexes,
+        "constraints": constraints,
+    }
+
+
+def _application_default_is_compatible(
+    table: str,
+    column: str,
+    expected: str | None,
+    actual: str | None,
+) -> bool:
+    if actual == expected:
+        return True
+    if expected == "__sequence__" and actual == "__sequence__":
+        return True
+    if expected is not None:
+        return False
+    if actual is None or actual.startswith("null::"):
+        return True
+    return actual in HISTORICAL_APPLICATION_DEFAULTS.get((table, column), ())
+
+
+def _application_nullability_is_compatible(
+    table: str,
+    column: str,
+    expected: bool,
+    actual: bool,
+) -> bool:
+    if actual == expected:
+        return True
+    return (
+        not expected
+        and actual
+        and (table, column) in HISTORICAL_APPLICATION_NULLABLE_COLUMNS
+    )
+
+
+def _application_schema_semantic_diff(connection: Any) -> dict[str, list[str]]:
+    """Compare public application objects with the frozen pre-017 DDL.
+
+    The expected catalog is built from migration-owned SQL in a temporary
+    schema. This keeps the adoption boundary independent of current Peewee
+    models while still checking details that a column-name diff cannot see.
+    """
+
+    if not hasattr(connection, "execute"):
+        # Lightweight unit fakes exercise the name-only boundary. Production
+        # migration connections always expose execute through the adapter.
+        return {}
+
+    connection.execute("SET LOCAL search_path TO pg_temp")
+    try:
+        for statement in PRE_017_POSTGRES_APPLICATION_SCHEMA_SQL:
+            connection.execute(statement)
+        temp_schema = connection.execute(
+            "SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()"
+        ).fetchone()[0]
+        connection.execute("SET LOCAL search_path TO public")
+        expected = _application_catalog_snapshot(connection, temp_schema)
+        actual = _application_catalog_snapshot(connection, "public")
+    except Exception:
+        # A failed statement aborts the caller-owned transaction; rollback
+        # removes the temporary objects, so cleanup would only mask the
+        # original diagnostic with an in-failed-transaction error.
+        raise
+    connection.execute("SET LOCAL search_path TO pg_temp")
+    for table in expected["columns"]:
+        connection.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')
+    connection.execute("SET LOCAL search_path TO public")
+
+    diff: dict[str, list[str]] = {
+        "semantic_columns": [],
+        "missing_indexes": [],
+        "extra_indexes": [],
+        "invalid_indexes": [],
+        "missing_constraints": [],
+        "extra_constraints": [],
+        "invalid_constraints": [],
+    }
+    expected_columns = expected["columns"]
+    actual_columns = actual["columns"]
+    for table in sorted(set(expected_columns) & set(actual_columns)):
+        for column in sorted(set(expected_columns[table]) & set(actual_columns[table])):
+            expected_value = expected_columns[table][column]
+            actual_value = actual_columns[table][column]
+            if (
+                actual_value[0] != expected_value[0]
+                and actual_value[0]
+                not in HISTORICAL_APPLICATION_TYPES.get((table, column), ())
+                or not _application_nullability_is_compatible(
+                    table, column, expected_value[1], actual_value[1]
+                )
+                or not _application_default_is_compatible(
+                    table, column, expected_value[2], actual_value[2]
+                )
+            ):
+                diff["semantic_columns"].append(
+                    f"{table}.{column} actual={actual_value!r} expected={expected_value!r}"
+                )
+
+    expected_indexes = expected["indexes"]
+    actual_indexes = actual["indexes"]
+    expected_by_definition: dict[str, list[tuple[str, str]]] = {}
+    actual_by_definition: dict[str, list[tuple[tuple[str, str], bool]]] = {}
+    for (table, name), (definition, _valid) in expected_indexes.items():
+        expected_by_definition.setdefault(definition, []).append((table, name))
+    for key, (definition, valid) in actual_indexes.items():
+        actual_by_definition.setdefault(definition, []).append((key, valid))
+
+    for definition, expected_keys in expected_by_definition.items():
+        actual_matches = actual_by_definition.get(definition, [])
+        if actual_matches:
+            if not any(valid for _key, valid in actual_matches):
+                table, name = expected_keys[0]
+                diff["invalid_indexes"].append(f"{table}.{name}")
+            continue
+        for table, name in expected_keys:
+            actual_with_same_name = actual_indexes.get((table, name))
+            if actual_with_same_name is not None:
+                diff["invalid_indexes"].append(f"{table}.{name}")
+            elif name not in OPTIONAL_HISTORICAL_APPLICATION_INDEXES:
+                diff["missing_indexes"].append(f"{table}.{name}")
+
+    expected_constraints = expected["constraints"]
+    actual_constraints = actual["constraints"]
+    expected_by_definition: dict[tuple[str, str, str | None], list[tuple[str, str]]] = {}
+    actual_by_definition: dict[
+        tuple[str, str, str | None], list[tuple[tuple[str, str], bool]]
+    ] = {}
+    for (table, name), (kind, _valid, definition) in expected_constraints.items():
+        expected_by_definition.setdefault((table, kind, definition), []).append(
+            (table, name)
+        )
+    for (table, name), (kind, valid, definition) in actual_constraints.items():
+        actual_by_definition.setdefault((table, kind, definition), []).append(
+            ((table, name), valid)
+        )
+
+    expected_referential_keys = {
+        (table, kind, definition)
+        for table, kind, definition in expected_by_definition
+        if kind in {"p", "f"}
+    }
+    actual_referential_keys = {
+        (table, kind, definition)
+        for table, kind, definition in actual_by_definition
+        if kind in {"p", "f"}
+    }
+    for definition_key in sorted(expected_referential_keys - actual_referential_keys):
+        diff["missing_constraints"].extend(
+            f"{constraint_table}.{constraint_name}"
+            for constraint_table, constraint_name in expected_by_definition[
+                definition_key
+            ]
+        )
+    for definition_key in sorted(expected_referential_keys & actual_referential_keys):
+        actual_matches = actual_by_definition[definition_key]
+        if not any(valid for _key, valid in actual_matches):
+            table, name = expected_by_definition[definition_key][0]
+            diff["invalid_constraints"].append(f"{table}.{name}")
+
+    for (table, name), (kind, valid, definition) in actual_constraints.items():
+        if kind not in {"p", "f"}:
+            continue
+        definition_key = (table, kind, definition)
+        if definition_key not in expected_referential_keys:
+            diff["extra_constraints"].append(f"{table}.{name}")
+        elif not valid:
+            diff["invalid_constraints"].append(f"{table}.{name}")
+    for (table, name), (kind, _valid, definition) in expected_constraints.items():
+        actual_with_same_name = actual_constraints.get((table, name))
+        if actual_with_same_name is not None:
+            actual_kind, actual_valid, actual_definition = actual_with_same_name
+            if (
+                actual_kind != kind
+                or actual_definition != definition
+                or not actual_valid
+            ):
+                diff["invalid_constraints"].append(f"{table}.{name}")
+
+    for table in expected_columns:
+        if table not in actual_columns:
+            diff["semantic_columns"].append(f"missing table {table}")
+    for table in actual_columns:
+        if table not in expected_columns:
+            diff["semantic_columns"].append(f"unexpected table {table}")
+    for key, values in diff.items():
+        diff[key] = sorted(set(values))
+    return diff
+
+
 def _worker_application_schema_diff(connection: Any) -> dict[str, Any]:
     # The application adoption record is scoped to the model-owned tables.
     # Known durable-kernel tables may already exist when a pre-release worker
@@ -347,6 +715,12 @@ def _assert_worker_application_schema(connection: Any) -> None:
         raise RuntimeError(
             "migration 017 requires the application schema produced by main; "
             f"diagnostic={diff}"
+        )
+    semantic_diff = _application_schema_semantic_diff(connection)
+    if any(semantic_diff.values()):
+        raise RuntimeError(
+            "migration 017 requires the application schema produced by main; "
+            f"semantic_diagnostic={semantic_diff}"
         )
 
 

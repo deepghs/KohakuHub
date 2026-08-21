@@ -916,6 +916,33 @@ async def test_record_prepared_staging_paths_rewrites_intent_once_for_a_batch():
 
 
 @pytest.mark.asyncio
+async def test_record_prepared_staging_paths_deduplicates_large_existing_payload_linearly():
+    existing = [
+        {"path": f"items/file-{index}.txt", "recursive": False}
+        for index in range(2000)
+    ]
+    intent = _intent(payload={"quota_delta": 0, "staging_paths": existing})
+    store = _IntentStore(intent=intent)
+    service = OperationService(_Pool(), _app())
+    service.store = store
+
+    await service.record_prepared_staging_paths(
+        intent.id,
+        paths=(
+            {"path": "items/file-1999.txt", "recursive": False},
+            {"path": "items/file-2000.txt", "recursive": False},
+            {"path": "items", "recursive": True},
+        ),
+    )
+
+    assert len(intent.payload_json["staging_paths"]) == 2002
+    assert intent.payload_json["staging_paths"][-2:] == [
+        {"path": "items/file-2000.txt", "recursive": False},
+        {"path": "items", "recursive": True},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_mark_commit_intent_uncertain_keeps_terminal_intent_unchanged():
     intent = _intent(state="finalized")
     store = _IntentStore(intent=intent)

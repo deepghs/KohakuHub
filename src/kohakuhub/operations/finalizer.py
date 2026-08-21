@@ -8,6 +8,12 @@ from typing import Any
 from psycopg import AsyncConnection
 
 
+# Six bind parameters are emitted for every file upsert. Keep each statement
+# comfortably below PostgreSQL's 65,535-parameter limit while retaining one
+# round trip for ordinary-sized commits.
+FILE_UPSERT_BATCH_SIZE = 1_000
+
+
 def _owner_id(payload: Mapping[str, Any]) -> int:
     value = payload.get("owner_id")
     if value is None:
@@ -133,38 +139,40 @@ async def finalize_commit_domain(
                         (repository_id, delete_paths),
                     )
             if upserts:
-                values_sql = ", ".join(
-                    "(%s, %s, %s, %s, %s, FALSE, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
-                    for _ in upserts
-                )
-                params = []
-                for mutation in upserts:
-                    params.extend(
-                        (
-                            repository_id,
-                            str(mutation["path"]),
-                            int(mutation["size"]),
-                            str(mutation["sha256"]),
-                            bool(mutation["lfs"]),
-                            owner_id,
-                        )
+                for offset in range(0, len(upserts), FILE_UPSERT_BATCH_SIZE):
+                    batch = upserts[offset : offset + FILE_UPSERT_BATCH_SIZE]
+                    values_sql = ", ".join(
+                        "(%s, %s, %s, %s, %s, FALSE, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                        for _ in batch
                     )
-                await connection.execute(
-                    f"""
-                    INSERT INTO file
-                        (repository_id, path_in_repo, size, sha256, lfs, is_deleted,
-                         owner_id, created_at, updated_at)
-                    VALUES {values_sql}
-                    ON CONFLICT (repository_id, path_in_repo) DO UPDATE SET
-                        size = EXCLUDED.size,
-                        sha256 = EXCLUDED.sha256,
-                        lfs = EXCLUDED.lfs,
-                        is_deleted = FALSE,
-                        owner_id = EXCLUDED.owner_id,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    tuple(params),
-                )
+                    params = []
+                    for mutation in batch:
+                        params.extend(
+                            (
+                                repository_id,
+                                str(mutation["path"]),
+                                int(mutation["size"]),
+                                str(mutation["sha256"]),
+                                bool(mutation["lfs"]),
+                                owner_id,
+                            )
+                        )
+                    await connection.execute(
+                        f"""
+                        INSERT INTO file
+                            (repository_id, path_in_repo, size, sha256, lfs, is_deleted,
+                             owner_id, created_at, updated_at)
+                        VALUES {values_sql}
+                        ON CONFLICT (repository_id, path_in_repo) DO UPDATE SET
+                            size = EXCLUDED.size,
+                            sha256 = EXCLUDED.sha256,
+                            lfs = EXCLUDED.lfs,
+                            is_deleted = FALSE,
+                            owner_id = EXCLUDED.owner_id,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        tuple(params),
+                    )
 
     # Keep the denormalized counters current at the same commit boundary as
     # the authoritative Commit/File rows. Replaying finalization is guarded by

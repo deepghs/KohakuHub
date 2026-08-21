@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
@@ -280,6 +281,30 @@ def _file_operation(path="README.md"):
     }
 
 
+def _lfs_operation(path="weights.bin", oid="a" * 64):
+    return {
+        "key": "lfsFile",
+        "value": {
+            "path": path,
+            "oid": oid,
+            "size": 12,
+            "algo": "sha256",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        (["a.txt", "b.txt"], True),
+        (["same.txt", "same.txt"], False),
+        (["folder", "folder/file.txt"], False),
+    ],
+)
+def test_staging_paths_only_parallelize_independent_targets(paths, expected):
+    assert commit_ops._staging_paths_are_independent(paths) is expected
+
+
 def _commit_dependencies(monkeypatch, client, repo):
     monkeypatch.setattr(commit_ops.Repository, "get_or_none", lambda *args: repo)
     monkeypatch.setattr(commit_ops, "check_repo_write_permission", lambda *args: None)
@@ -442,6 +467,34 @@ async def test_estimate_quota_delta_subtracts_only_live_non_lfs_folder_files(mon
 
     assert delta == -15
     assert _FakeFileModel.select_query.where_calls
+
+
+@pytest.mark.asyncio
+async def test_estimate_quota_delta_allows_delete_folder_then_add_child(monkeypatch):
+    repo = SimpleNamespace()
+    monkeypatch.setattr(commit_ops, "File", _FakeFileModel)
+    monkeypatch.setattr(commit_ops, "get_file", lambda *_args: None)
+    _FakeFileModel.select_query = _Query(
+        rows=[("folder/old.txt", 10, False)]
+    )
+
+    delta = await commit_ops._estimate_commit_quota_delta(
+        repo,
+        [
+            {"key": "deletedFolder", "value": {"path": "folder"}},
+            {
+                "key": "file",
+                "value": {
+                    "path": "folder/new.txt",
+                    "content": base64.b64encode(b"new").decode(),
+                },
+            },
+        ],
+        _FakeLakeFSClient(),
+        "lakefs-repo",
+    )
+
+    assert delta == -7
 
 
 @pytest.mark.asyncio
@@ -823,6 +876,139 @@ async def test_commit_unlocked_returns_503_when_base_head_cannot_be_resolved(mon
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail == {"error": "Unable to resolve commit base head"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent", ["stale-head", "base-head-extra"])
+async def test_commit_unlocked_rejects_stale_parent_before_lakefs_staging(
+    monkeypatch, parent
+):
+    repo = SimpleNamespace(id=1, owner=SimpleNamespace(username="owner"))
+    client = _FakeLakeFSClient()
+    _commit_dependencies(monkeypatch, client, repo)
+    monkeypatch.setattr(
+        commit_ops,
+        "process_regular_file",
+        lambda **_kwargs: pytest.fail("staging must not start for a stale parent"),
+    )
+
+    request = _FakeRequest(
+        _commit_body(_file_operation()),
+    )
+    request._body = request._body.replace(
+        b'"summary": "commit"',
+        f'"summary": "commit", "parentCommit": "{parent}"'.encode(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await commit_ops._commit_unlocked(
+            commit_ops.RepoType.model,
+            "owner",
+            "repo",
+            "main",
+            request,
+            SimpleNamespace(id=7, username="owner"),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "error": "Commit parent does not match repository head"
+    }
+    assert not [call for call in client.calls if call[0] in {"upload_object", "commit"}]
+
+
+@pytest.mark.asyncio
+async def test_commit_unlocked_accepts_short_matching_parent(monkeypatch):
+    repo = SimpleNamespace(id=1, owner=SimpleNamespace(username="owner"), private=False)
+    client = _FakeLakeFSClient()
+    _commit_dependencies(monkeypatch, client, repo)
+    monkeypatch.setattr(
+        commit_ops,
+        "process_regular_file",
+        lambda **kwargs: _async_true_and_record(kwargs["file_mutations"], "README.md"),
+    )
+    request = _FakeRequest(_commit_body(_file_operation()))
+    request._body = request._body.replace(
+        b'"summary": "commit"',
+        b'"summary": "commit", "parentCommit": "base-hea"',
+    )
+
+    result = await commit_ops._commit_unlocked(
+        commit_ops.RepoType.model,
+        "owner",
+        "repo",
+        "main",
+        request,
+        SimpleNamespace(id=7, username="owner"),
+    )
+
+    assert result["commitOid"] == "commit-created"
+
+
+@pytest.mark.asyncio
+async def test_commit_unlocked_stages_contiguous_lfs_files_with_bounded_concurrency(
+    monkeypatch,
+):
+    repo = SimpleNamespace(id=1, owner=SimpleNamespace(username="owner"), private=False)
+    client = _FakeLakeFSClient()
+    service = _BatchFakeOperationService()
+    _commit_dependencies(monkeypatch, client, repo)
+    monkeypatch.setattr(commit_ops.cfg.app, "db_backend", "postgres")
+    monkeypatch.setattr(commit_ops, "get_repo_file_map", lambda *_args: {})
+    monkeypatch.setattr(
+        commit_ops,
+        "_estimate_commit_quota_delta",
+        lambda *_args, **_kwargs: _async_return(0),
+    )
+
+    active = 0
+    maximum_active = 0
+
+    async def stage_lfs(**kwargs):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0)
+        kwargs["file_mutations"].append(
+            {
+                "action": "upsert",
+                "path": kwargs["path"],
+                "size": kwargs["size"],
+                "sha256": kwargs["oid"],
+                "lfs": True,
+            }
+        )
+        active -= 1
+        return True, {
+            "path": kwargs["path"],
+            "sha256": kwargs["oid"],
+            "size": kwargs["size"],
+        }
+
+    monkeypatch.setattr(commit_ops, "process_lfs_file", stage_lfs)
+    request = _FakeRequest(
+        _commit_body(
+            _lfs_operation("weights-0.bin", "0" * 64),
+            _lfs_operation("weights-1.bin", "1" * 64),
+        ),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                operation_runtime=SimpleNamespace(service=service),
+            )
+        ),
+    )
+
+    result = await commit_ops._commit_unlocked(
+        commit_ops.RepoType.model,
+        "owner",
+        "repo",
+        "main",
+        request,
+        SimpleNamespace(id=7, username="owner"),
+    )
+
+    assert result["commitOid"] == "commit-created"
+    assert maximum_active == 2
 
 
 @pytest.mark.asyncio

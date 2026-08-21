@@ -803,9 +803,17 @@ class OperationService:
                     )
                 payload = dict(intent.payload_json)
                 paths = list(payload.get("staging_paths", []))
+                existing_keys = {
+                    (str(entry.get("path", "")), bool(entry.get("recursive", False)))
+                    for entry in paths
+                    if isinstance(entry, Mapping)
+                }
                 for entry in entries:
-                    if entry not in paths:
-                        paths.append(entry)
+                    key = (entry["path"], entry["recursive"])
+                    if key in existing_keys:
+                        continue
+                    paths.append(entry)
+                    existing_keys.add(key)
                 payload["staging_paths"] = paths
                 canonical, payload_hash = _canonical_payload(payload)
                 updated = await self.store.update_prepared_commit_payload(

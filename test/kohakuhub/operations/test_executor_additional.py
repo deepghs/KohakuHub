@@ -711,6 +711,35 @@ async def test_finalize_commit_domain_batches_distinct_main_file_upserts():
 
 
 @pytest.mark.asyncio
+async def test_finalize_commit_domain_chunks_large_file_upsert_batches():
+    connection = _Connection()
+    mutations = [
+        {
+            "path": f"items/file-{index}.txt",
+            "size": index + 1,
+            "sha256": f"sha-{index}",
+            "lfs": False,
+            "action": "upsert",
+        }
+        for index in range(1001)
+    ]
+
+    await finalize_commit_domain(
+        connection,
+        payload=_finalizer_payload(file_mutations=mutations),
+    )
+
+    file_inserts = [
+        entry
+        for entry in connection.queries
+        if entry[0].lower().startswith("insert into file")
+    ]
+    assert len(file_inserts) == 2
+    assert len(file_inserts[0][1]) == 1000 * 6
+    assert len(file_inserts[1][1]) == 1 * 6
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("is_private", "expected_namespace_params"),
     (

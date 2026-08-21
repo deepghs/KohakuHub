@@ -265,6 +265,8 @@ def test_procrastinate_schema_contract_rejects_missing_index():
                 return _Rows([])
             if "FROM pg_type" in query:
                 return _Rows([])
+            if "FROM pg_constraint" in query:
+                return _Rows([])
             raise AssertionError(query)
 
     result = procrastinate_schema_diff(ProcrastinateCatalog())

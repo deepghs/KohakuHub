@@ -49,7 +49,7 @@ async def test_feature_commit_does_not_mutate_main_file_projection_or_quota():
 
 
 @pytest.mark.asyncio
-async def test_quota_estimate_rejects_duplicate_or_overlapping_paths():
+async def test_quota_estimate_rejects_duplicate_or_unsafe_overlapping_paths():
     with pytest.raises(ValueError, match="overlapping"):
         await _estimate_commit_quota_delta(
             None,

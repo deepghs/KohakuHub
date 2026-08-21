@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -224,6 +225,103 @@ PROCRASTINATE_TYPES = {
             ("args", "jsonb"),
             ("scheduled_at", "timestamp with time zone"),
         ),
+    ),
+}
+
+# Frozen PostgreSQL catalog semantics for Procrastinate 3.9.0.  The table and
+# object-name sets above are useful for a fast existence check, but an object
+# with the right name can still have the wrong type, predicate, or constraint.
+PROCRASTINATE_COLUMN_CONTRACT = {
+    "procrastinate_workers": {
+        "id": ("bigint", False, "__identity__"),
+        "last_heartbeat": ("timestamp with time zone", False, "now()"),
+    },
+    "procrastinate_jobs": {
+        "id": ("bigint", False, "__sequence__"),
+        "queue_name": ("character varying(128)", False, None),
+        "task_name": ("character varying(128)", False, None),
+        "priority": ("integer", False, "0"),
+        "lock": ("text", True, None),
+        "queueing_lock": ("text", True, None),
+        "args": ("jsonb", False, "'{}'::jsonb"),
+        "status": ("procrastinate_job_status", False, "'todo'::procrastinate_job_status"),
+        "scheduled_at": ("timestamp with time zone", True, None),
+        "attempts": ("integer", False, "0"),
+        "abort_requested": ("boolean", False, "false"),
+        "worker_id": ("bigint", True, None),
+    },
+    "procrastinate_periodic_defers": {
+        "id": ("bigint", False, "__sequence__"),
+        "task_name": ("character varying(128)", False, None),
+        "defer_timestamp": ("bigint", True, None),
+        "job_id": ("bigint", True, None),
+        "periodic_id": ("character varying(128)", False, "''::character varying"),
+    },
+    "procrastinate_events": {
+        "id": ("bigint", False, "__sequence__"),
+        "job_id": ("bigint", False, None),
+        "type": ("procrastinate_job_event_type", True, None),
+        "at": ("timestamp with time zone", True, "now()"),
+    },
+}
+
+PROCRASTINATE_INDEX_DEFINITIONS = {
+    "procrastinate_jobs_queueing_lock_idx_v1": "CREATE UNIQUE INDEX procrastinate_jobs_queueing_lock_idx_v1 ON public.procrastinate_jobs USING btree (queueing_lock) WHERE (status = 'todo'::procrastinate_job_status)",
+    "procrastinate_jobs_lock_idx_v1": "CREATE UNIQUE INDEX procrastinate_jobs_lock_idx_v1 ON public.procrastinate_jobs USING btree (lock) WHERE (status = 'doing'::procrastinate_job_status)",
+    "idx_procrastinate_jobs_worker_not_null": "CREATE INDEX idx_procrastinate_jobs_worker_not_null ON public.procrastinate_jobs USING btree (worker_id) WHERE ((worker_id IS NOT NULL) AND (status = 'doing'::procrastinate_job_status))",
+    "procrastinate_jobs_queue_name_idx_v1": "CREATE INDEX procrastinate_jobs_queue_name_idx_v1 ON public.procrastinate_jobs USING btree (queue_name)",
+    "procrastinate_jobs_id_lock_idx_v1": "CREATE INDEX procrastinate_jobs_id_lock_idx_v1 ON public.procrastinate_jobs USING btree (id, lock) WHERE (status = ANY (ARRAY['todo'::procrastinate_job_status, 'doing'::procrastinate_job_status]))",
+    "procrastinate_jobs_priority_idx_v1": "CREATE INDEX procrastinate_jobs_priority_idx_v1 ON public.procrastinate_jobs USING btree (priority DESC, id) WHERE (status = 'todo'::procrastinate_job_status)",
+    "procrastinate_events_job_id_fkey_v1": "CREATE INDEX procrastinate_events_job_id_fkey_v1 ON public.procrastinate_events USING btree (job_id)",
+    "procrastinate_periodic_defers_job_id_fkey_v1": "CREATE INDEX procrastinate_periodic_defers_job_id_fkey_v1 ON public.procrastinate_periodic_defers USING btree (job_id)",
+    "idx_procrastinate_workers_last_heartbeat": "CREATE INDEX idx_procrastinate_workers_last_heartbeat ON public.procrastinate_workers USING btree (last_heartbeat)",
+}
+
+PROCRASTINATE_CONSTRAINT_DEFINITIONS = {
+    "procrastinate_events_job_id_fkey": (
+        "procrastinate_events",
+        "f",
+        "FOREIGN KEY (job_id) REFERENCES procrastinate_jobs(id) ON DELETE CASCADE",
+    ),
+    "procrastinate_events_pkey": (
+        "procrastinate_events",
+        "p",
+        "PRIMARY KEY (id)",
+    ),
+    "check_not_todo_abort_requested": (
+        "procrastinate_jobs",
+        "c",
+        "CHECK (NOT (status = 'todo'::procrastinate_job_status AND abort_requested = true))",
+    ),
+    "procrastinate_jobs_pkey": (
+        "procrastinate_jobs",
+        "p",
+        "PRIMARY KEY (id)",
+    ),
+    "procrastinate_jobs_worker_id_fkey": (
+        "procrastinate_jobs",
+        "f",
+        "FOREIGN KEY (worker_id) REFERENCES procrastinate_workers(id) ON DELETE SET NULL",
+    ),
+    "procrastinate_periodic_defers_job_id_fkey": (
+        "procrastinate_periodic_defers",
+        "f",
+        "FOREIGN KEY (job_id) REFERENCES procrastinate_jobs(id)",
+    ),
+    "procrastinate_periodic_defers_pkey": (
+        "procrastinate_periodic_defers",
+        "p",
+        "PRIMARY KEY (id)",
+    ),
+    "procrastinate_periodic_defers_unique": (
+        "procrastinate_periodic_defers",
+        "u",
+        "UNIQUE (task_name, periodic_id, defer_timestamp)",
+    ),
+    "procrastinate_workers_pkey": (
+        "procrastinate_workers",
+        "p",
+        "PRIMARY KEY (id)",
     ),
 }
 
@@ -542,12 +640,36 @@ def operation_schema_object_diff(
     }
 
 
+def _normalize_procrastinate_index_definition(value: str) -> str:
+    normalized = _normalize_catalog_sql(value).replace('"', "")
+    normalized = normalized.replace("public.", "")
+    return re.sub(
+        r"^create\s+(unique\s+)?index\s+[^ ]+\s+on\s+",
+        lambda match: f"create {match.group(1) or ''}index on ",
+        normalized,
+    )
+
+
+def _normalize_procrastinate_default(
+    value: str | None, identity: str | None = None
+) -> str | None:
+    if identity:
+        return "__identity__"
+    normalized = None if value is None else _normalize_catalog_sql(value)
+    if normalized is not None and normalized.startswith("nextval("):
+        return "__sequence__"
+    return normalized
+
+
 def procrastinate_schema_diff(
     connection: Any,
     *,
     table_columns: dict[str, set[str]] | None = None,
     required_indexes: set[str] | None = None,
     types: dict[str, tuple[str, tuple]] | None = None,
+    column_contract: dict[str, dict[str, tuple[str, bool, str | None]]] | None = None,
+    index_definitions: dict[str, str] | None = None,
+    constraint_definitions: dict[str, tuple[str, str, str]] | None = None,
 ) -> dict[str, list[str]]:
     """Check the durable Procrastinate catalog beyond object names."""
 
@@ -560,28 +682,117 @@ def procrastinate_schema_diff(
         else required_indexes
     )
     types = PROCRASTINATE_TYPES if types is None else types
+    column_contract = (
+        PROCRASTINATE_COLUMN_CONTRACT if column_contract is None else column_contract
+    )
+    index_definitions = (
+        PROCRASTINATE_INDEX_DEFINITIONS
+        if index_definitions is None
+        else index_definitions
+    )
+    constraint_definitions = (
+        PROCRASTINATE_CONSTRAINT_DEFINITIONS
+        if constraint_definitions is None
+        else constraint_definitions
+    )
 
     table_rows = connection.execute(
-        """SELECT table_name, column_name
-           FROM information_schema.columns
-           WHERE table_schema = 'public' AND table_name = ANY(%s)""",
+        """SELECT columns.table_name, columns.column_name,
+                  format_type(attribute.atttypid, attribute.atttypmod),
+                  attribute.attidentity, NOT attribute.attnotnull,
+                  pg_get_expr(default_value.adbin, default_value.adrelid)
+           FROM information_schema.columns AS columns
+           JOIN pg_class AS relation
+             ON relation.relname = columns.table_name
+           JOIN pg_namespace AS namespace
+             ON namespace.oid = relation.relnamespace
+            AND namespace.nspname = columns.table_schema
+           JOIN pg_attribute AS attribute
+             ON attribute.attrelid = relation.oid
+            AND attribute.attname = columns.column_name
+           LEFT JOIN pg_attrdef AS default_value
+             ON default_value.adrelid = attribute.attrelid
+            AND default_value.adnum = attribute.attnum
+           WHERE columns.table_schema = 'public'
+             AND columns.table_name = ANY(%s)
+           ORDER BY columns.table_name, columns.ordinal_position""",
         (sorted(table_columns),),
     ).fetchall()
     actual_columns: dict[str, set[str]] = {}
-    for table, column in table_rows:
+    actual_column_contract: dict[tuple[str, str], tuple[str, bool, str | None]] = {}
+    for row in table_rows:
+        table, column = row[:2]
         actual_columns.setdefault(table, set()).add(column)
+        if len(row) < 6:
+            continue
+        _table, _column, type_name, identity, nullable, default = row
+        actual_column_contract[(table, column)] = (
+            type_name,
+            bool(nullable),
+            _normalize_procrastinate_default(default, identity),
+        )
     missing_columns = [
         f"{table}.{column}"
         for table, columns in table_columns.items()
         for column in sorted(columns - actual_columns.get(table, set()))
     ]
+    invalid_columns = [
+        f"{table}.{column}"
+        for table, columns in column_contract.items()
+        for column, expected in columns.items()
+        if (table, column) in actual_column_contract
+        and actual_column_contract[(table, column)] != expected
+    ]
 
     index_rows = connection.execute(
-        """SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"""
+        """SELECT indexes.tablename, indexes.indexname, indexes.indexdef,
+                  index_info.indisvalid
+           FROM pg_indexes AS indexes
+           JOIN pg_class AS index_relation
+             ON index_relation.relname = indexes.indexname
+           JOIN pg_namespace AS index_namespace
+             ON index_namespace.oid = index_relation.relnamespace
+            AND index_namespace.nspname = indexes.schemaname
+           JOIN pg_index AS index_info
+             ON index_info.indexrelid = index_relation.oid
+           WHERE indexes.schemaname = 'public'"""
     ).fetchall()
-    missing_indexes = sorted(
-        required_indexes - {row[0] for row in index_rows}
-    )
+    actual_index_names: set[str] = set()
+    actual_index_definitions: dict[str, tuple[str, bool]] = {}
+    for row in index_rows:
+        if len(row) == 1:
+            actual_index_names.add(row[0])
+            continue
+        _table, name, definition, valid = row
+        actual_index_names.add(name)
+        actual_index_definitions[name] = (
+            _normalize_procrastinate_index_definition(definition),
+            bool(valid),
+        )
+    expected_index_definitions = {
+        name: _normalize_procrastinate_index_definition(definition)
+        for name, definition in index_definitions.items()
+    }
+    actual_index_by_definition = {
+        definition: valid
+        for definition, valid in actual_index_definitions.values()
+    }
+    missing_indexes = []
+    invalid_indexes = []
+    for name in sorted(required_indexes):
+        expected_definition = expected_index_definitions.get(name)
+        actual = actual_index_definitions.get(name)
+        if actual is None:
+            if expected_definition and expected_definition in actual_index_by_definition:
+                continue
+            if name not in actual_index_names:
+                missing_indexes.append(name)
+            continue
+        actual_definition, valid = actual
+        if not valid or (
+            expected_definition is not None and actual_definition != expected_definition
+        ):
+            invalid_indexes.append(name)
 
     type_rows = connection.execute(
         """SELECT t.typname, t.typtype, e.enumlabel
@@ -594,26 +805,102 @@ def procrastinate_schema_diff(
     ).fetchall()
     actual_types: dict[str, tuple[str, list[str]]] = {}
     for name, type_code, enum_label in type_rows:
-        type_name = "enum" if type_code == "e" else "composite" if type_code == "c" else type_code
+        type_name = (
+            "enum" if type_code == "e" else "composite" if type_code == "c" else type_code
+        )
         entry = actual_types.setdefault(name, (type_name, []))
         if enum_label is not None:
             entry[1].append(enum_label)
     missing_types = sorted(set(types) - set(actual_types))
-    invalid_types = sorted(
-        name
-        for name, (expected_kind, expected_values) in types.items()
-        if name in actual_types
-        and (
-            actual_types[name][0] != expected_kind
-            or expected_kind == "enum"
-            and tuple(actual_types[name][1]) != tuple(expected_values)
-        )
-    )
+    composite_names = [
+        name for name, (kind, _values) in types.items() if kind == "composite"
+    ]
+    composite_rows = connection.execute(
+        """SELECT type_info.typname, attribute.attname,
+                  format_type(attribute.atttypid, attribute.atttypmod)
+           FROM pg_type AS type_info
+           JOIN pg_namespace AS namespace
+             ON namespace.oid = type_info.typnamespace
+           JOIN pg_class AS relation
+             ON relation.oid = type_info.typrelid
+           JOIN pg_attribute AS attribute
+             ON attribute.attrelid = relation.oid
+            AND attribute.attnum > 0
+            AND NOT attribute.attisdropped
+           WHERE namespace.nspname = 'public'
+             AND type_info.typname = ANY(%s)
+           ORDER BY type_info.typname, attribute.attnum""",
+        (composite_names,),
+    ).fetchall()
+    actual_composites: dict[str, list[tuple[str, str]]] = {}
+    for name, field, type_name in composite_rows:
+        actual_composites.setdefault(name, []).append((field, type_name))
+    invalid_types = []
+    for name, (expected_kind, expected_values) in types.items():
+        if name not in actual_types:
+            continue
+        actual_kind, actual_values = actual_types[name]
+        invalid = actual_kind != expected_kind
+        if expected_kind == "enum":
+            invalid = invalid or tuple(actual_values) != tuple(expected_values)
+        elif expected_kind == "composite":
+            invalid = invalid or tuple(actual_composites.get(name, ())) != tuple(
+                expected_values
+            )
+        if invalid:
+            invalid_types.append(name)
+
+    constraint_rows = connection.execute(
+        """SELECT relation.relname, constraint_info.conname,
+                  constraint_info.contype, constraint_info.convalidated,
+                  pg_get_constraintdef(constraint_info.oid, true)
+           FROM pg_constraint AS constraint_info
+           JOIN pg_class AS relation
+             ON relation.oid = constraint_info.conrelid
+           JOIN pg_namespace AS namespace
+             ON namespace.oid = relation.relnamespace
+           WHERE namespace.nspname = 'public'
+             AND relation.relname = ANY(%s)""",
+        (sorted(table_columns),),
+    ).fetchall()
+    actual_constraints: dict[str, tuple[str, str, bool, str]] = {}
+    actual_constraints_by_definition: dict[tuple[str, str, str], bool] = {}
+    for row in constraint_rows:
+        if len(row) < 5:
+            continue
+        table, name, kind, valid, definition = row
+        normalized = _normalize_catalog_sql(definition).replace('"', "")
+        actual_constraints[name] = (table, kind, bool(valid), normalized)
+        actual_constraints_by_definition[(table, kind, normalized)] = bool(valid)
+    missing_constraints = []
+    invalid_constraints = []
+    for name, (table, kind, definition) in constraint_definitions.items():
+        expected_definition = _normalize_catalog_sql(definition).replace('"', "")
+        actual = actual_constraints.get(name)
+        semantic_key = (table, kind, expected_definition)
+        if actual is None:
+            if semantic_key not in actual_constraints_by_definition:
+                missing_constraints.append(name)
+            elif not actual_constraints_by_definition[semantic_key]:
+                invalid_constraints.append(name)
+            continue
+        actual_table, actual_kind, valid, actual_definition = actual
+        if (
+            actual_table != table
+            or actual_kind != kind
+            or not valid
+            or actual_definition != expected_definition
+        ):
+            invalid_constraints.append(name)
     return {
-        "missing_columns": missing_columns,
-        "missing_indexes": missing_indexes,
+        "missing_columns": sorted(missing_columns),
+        "invalid_columns": sorted(invalid_columns),
+        "missing_indexes": sorted(missing_indexes),
+        "invalid_indexes": sorted(invalid_indexes),
         "missing_types": missing_types,
-        "invalid_types": invalid_types,
+        "invalid_types": sorted(invalid_types),
+        "missing_constraints": sorted(missing_constraints),
+        "invalid_constraints": sorted(invalid_constraints),
     }
 
 

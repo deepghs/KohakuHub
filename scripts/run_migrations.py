@@ -30,6 +30,7 @@ from kohakuhub.config import cfg  # noqa: E402
 from db_migrations._017_schema import (  # noqa: E402
     bootstrap_pre_017_application_schema,
 )
+from verify_migration_sequence import validation_errors  # noqa: E402
 
 
 MIGRATION_LOCK_KEY = "kohakuhub.schema.lifecycle.v1"
@@ -150,6 +151,12 @@ def migration_lock():
 
 def run_migrations():
     """Run all pending migrations."""
+    stream_errors = validation_errors(SCRIPT_DIR / "db_migrations")
+    if stream_errors:
+        print("Migration sequence validation failed:")
+        for error in stream_errors:
+            print(f"- {error}")
+        return False
     with migration_lock():
         return _run_migrations_locked()
 
