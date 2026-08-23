@@ -39,12 +39,11 @@ from kohakuhub.operations.service import (
 
 logger = get_logger("FILE")
 router = APIRouter()
-# LakeFS stages one object per request. Eight concurrent uploads keep a large
-# commit within the Hugging Face client's short request budget while leaving
-# most of the per-process LakeFS HTTP pool for control calls. The shared
-# semaphore keeps this budget global to the event loop, so concurrent
+# LakeFS stages one object per request. Four concurrent uploads leave enough
+# room in the per-process LakeFS HTTP pool for control calls and other requests.
+# The shared semaphore keeps this budget global to the event loop, so concurrent
 # repositories cannot multiply it per request.
-COMMIT_STAGE_CONCURRENCY = 8
+COMMIT_STAGE_CONCURRENCY = 4
 _STAGE_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 

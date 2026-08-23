@@ -116,6 +116,25 @@ async def test_gateway_validates_ref_against_active_capability(monkeypatch):
         gateway.reset_capability(token)
 
 
+def test_gateway_rejects_an_operation_without_a_fence_specification():
+    token = gateway.activate_capability(
+        gateway.MutationCapability(
+            repository_id=7,
+            ref="branch:main",
+            scope="mutation",
+            lakefs_repositories=frozenset({"repo"}),
+        )
+    )
+    try:
+        with pytest.raises(gateway.MutationFenceRequired, match="no fence specification"):
+            gateway.require_capability(
+                "future_mutation",
+                {"repository": "repo", "branch": "main"},
+            )
+    finally:
+        gateway.reset_capability(token)
+
+
 @pytest.mark.asyncio
 async def test_gateway_validates_create_tag_name_as_the_locked_ref():
     token = gateway.activate_capability(

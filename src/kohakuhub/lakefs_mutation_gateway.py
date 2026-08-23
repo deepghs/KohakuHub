@@ -30,6 +30,28 @@ _TEST_COMPATIBILITY: ContextVar[bool] = ContextVar(
 )
 
 
+# Keep the authorization surface explicit.  A gateway caller that is added
+# without a fence specification must fail closed instead of accidentally
+# inheriting repository-only authorization.
+_REPOSITORY_OPERATIONS = frozenset({"create_repository", "delete_repository"})
+_REF_SPECS = {
+    "create_branch": ("name", "branch"),
+    "delete_branch": ("branch", "branch"),
+    # The branch router fences the tag namespace by its new name.  The
+    # LakeFS ``ref`` is the immutable source commit and is not the locked
+    # mutation target.
+    "create_tag": ("id", "tag"),
+    "delete_tag": ("tag", "tag"),
+    "commit": ("branch", "branch"),
+    "upload_object": ("branch", "branch"),
+    "link_physical_address": ("branch", "branch"),
+    "delete_object": ("branch", "branch"),
+    "revert_branch": ("branch", "branch"),
+    "merge_into_branch": ("destination_branch", "branch"),
+    "hard_reset_branch": ("branch", "branch"),
+}
+
+
 @contextmanager
 def test_compatibility():
     """Allow direct route tests to exercise legacy calls without a fence.
@@ -129,6 +151,11 @@ def require_capability(operation: str, kwargs: dict[str, Any]) -> MutationCapabi
     if capability.scope == "test_compatibility":
         return capability
 
+    if operation not in _REPOSITORY_OPERATIONS and operation not in _REF_SPECS:
+        raise MutationFenceRequired(
+            f"LakeFS mutation {operation} has no fence specification"
+        )
+
     if capability.scope == "repository_name":
         if operation != "create_repository":
             raise MutationFenceRequired(
@@ -164,23 +191,10 @@ def require_capability(operation: str, kwargs: dict[str, Any]) -> MutationCapabi
             f"LakeFS mutation {operation} targets an unapproved repository"
         )
 
-    ref_specs = {
-        "create_branch": ("name", "branch"),
-        "delete_branch": ("branch", "branch"),
-        # The branch router fences the tag namespace by its new name.  The
-        # LakeFS ``ref`` is the immutable source commit and is not the locked
-        # mutation target.
-        "create_tag": ("id", "tag"),
-        "delete_tag": ("tag", "tag"),
-        "commit": ("branch", "branch"),
-        "upload_object": ("branch", "branch"),
-        "link_physical_address": ("branch", "branch"),
-        "delete_object": ("branch", "branch"),
-        "revert_branch": ("branch", "branch"),
-        "merge_into_branch": ("destination_branch", "branch"),
-        "hard_reset_branch": ("branch", "branch"),
-    }
-    ref_key, ref_kind = ref_specs.get(operation, ("", "branch"))
+    if operation in _REPOSITORY_OPERATIONS:
+        return capability
+
+    ref_key, ref_kind = _REF_SPECS[operation]
     requested_ref = kwargs.get(ref_key)
     if requested_ref is not None and capability.ref != "__repository__":
         if _canonical_ref(requested_ref, ref_kind) != capability.ref:
