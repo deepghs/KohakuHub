@@ -181,7 +181,12 @@ export const repoAPI = {
    * @returns {Promise} - Repository metadata
    */
   getInfo: (type, namespace, name) =>
-    api.get(`/api/${type}s/${namespace}/${name}`),
+    api.get(`/api/${type}s/${namespace}/${name}`, {
+      // The repo viewer obtains its bounded file listing separately. Asking
+      // repo-info for siblings would enumerate every object before the page
+      // can render, which is unbounded for large HF-compatible repositories.
+      params: { include_siblings: false },
+    }),
 
   /**
    * List repositories

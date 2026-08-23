@@ -69,6 +69,8 @@ if [[ -f "${LAKEFS_CREDENTIALS_FILE}" ]]; then
   set +a
 fi
 
+# Keep local development on the same numbered migration path as Compose.
+# Already-applied historical migrations perform signature checks only.
 "${PYTHON_BIN}" "${ROOT_DIR}/scripts/run_migrations.py"
 
 if [[ "${KOHAKU_HUB_DEV_AUTO_SEED:-true}" == "true" && "${SKIP_SEED}" != "true" ]]; then

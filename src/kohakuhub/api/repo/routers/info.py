@@ -173,6 +173,7 @@ async def get_repo_info(
     request: Request,
     fallback: bool = True,
     blobs: bool = True,
+    include_siblings: bool = True,
     user: User | None = Depends(get_optional_user),
 ):
     """Get repository information (without revision).
@@ -257,9 +258,10 @@ async def get_repo_info(
             # ``params["blobs"] = True``). Defaulting to True keeps existing
             # responses unchanged; opting out skips the per-file metadata that
             # dominates the cost on large repos.
-            siblings = await collect_hf_siblings(
-                repo_row, repo_type, repo_id, "main", with_metadata=blobs
-            )
+            if include_siblings:
+                siblings = await collect_hf_siblings(
+                    repo_row, repo_type, repo_id, "main", with_metadata=blobs
+                )
         except Exception as ex:
             logger.exception(
                 f"Could not fetch siblings for {lakefs_repo}: {str(ex)}", ex

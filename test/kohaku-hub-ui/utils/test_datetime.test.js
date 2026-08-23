@@ -53,6 +53,9 @@ describe("datetime utilities", () => {
       expect(formatRelativeTime({ value: "invalid" }, "never")).toBe("never");
       expect(formatRelativeTime(null, "never")).toBe("never");
       expect(formatUnixRelativeTime(0, "Unknown")).toBe("Unknown");
+      expect(formatUnixRelativeTime({ value: "invalid" }, "Unknown")).toBe(
+        "Unknown",
+      );
       expect(
         formatUnixRelativeTime(Math.floor(Date.now() / 1000) - 120),
       ).toContain("ago");
@@ -73,6 +76,12 @@ describe("datetime utilities", () => {
       expect(formatRelativeTime("2026-01-01 17:30:00", "never")).toContain(
         "ago",
       );
+      expect(
+        formatRelativeTime(
+          { valueOf: () => Date.parse("2026-01-01T09:55:00Z") },
+          "never",
+        ),
+      ).toContain("ago");
       expect(formatRelativeTime("2026-01-01T00:30:00Z", "never")).toContain(
         "ago",
       );

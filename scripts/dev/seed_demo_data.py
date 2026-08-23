@@ -36,6 +36,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from kohakuhub.config import cfg
+from kohakuhub import lakefs_mutation_gateway
 from kohakuhub.main import app
 from kohakuhub.utils.s3 import init_storage
 
@@ -51,6 +52,9 @@ INTERNAL_BASE_URL = (
 
 class SeedError(RuntimeError):
     """Raised when demo data creation fails."""
+
+
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -5175,7 +5179,7 @@ def print_summary(seed_applied: bool) -> None:
     print(f"Admin UI token: {cfg.admin.secret_token}")
 
 
-async def seed_demo_data() -> None:
+async def _seed_demo_data_unfenced() -> None:
     init_storage()
     transport = httpx.ASGITransport(app=app)
     accounts_by_name = account_index()
@@ -5277,6 +5281,29 @@ async def seed_demo_data() -> None:
 
     write_manifest()
     print_summary(seed_applied=True)
+
+
+async def seed_demo_data() -> None:
+    """Run the single-process local bootstrap with an explicit compatibility scope.
+
+    ``httpx.ASGITransport`` does not drive FastAPI's lifespan, and this script
+    is intentionally run before the long-lived API/worker processes start.
+    The seed therefore uses the legacy synchronous post-processing path while
+    this function is active.  The scope is local to this coroutine and is
+    restored before returning; deployed API requests never use it.
+    """
+
+    state = app.state
+    previous = state._state.get("_khub_test_compatibility", _MISSING)
+    state._khub_test_compatibility = True
+    try:
+        with lakefs_mutation_gateway.test_compatibility():
+            await _seed_demo_data_unfenced()
+    finally:
+        if previous is _MISSING:
+            state._state.pop("_khub_test_compatibility", None)
+        else:
+            state._khub_test_compatibility = previous
 
 
 def main() -> int:

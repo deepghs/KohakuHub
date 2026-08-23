@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -595,9 +596,11 @@ async def test_pooled_httpx_client_uses_keepalive_limits(monkeypatch):
     assert limits.max_connections == 64
     assert limits.max_keepalive_connections == 32
     assert limits.keepalive_expiry == 30.0
-    # ``timeout=None`` matches the previous unpooled per-call default —
-    # we don't want to silently introduce a tighter budget at this layer.
-    assert kw["timeout"] is None
+    timeout = kw["timeout"]
+    assert timeout.connect == 5.0
+    assert timeout.read == 30.0
+    assert timeout.write == 120.0
+    assert timeout.pool == 5.0
 
 
 @pytest.mark.asyncio
@@ -685,9 +688,8 @@ async def test_lifespan_shutdown_closes_pooled_client(monkeypatch):
     monkeypatch.setattr(main_mod, "init_storage", lambda: None)
 
     class _StubApp:
-        # The lifespan only consumes ``app`` as its parameter; nothing
-        # else on the app is touched.
-        ...
+        # Match the small part of FastAPI's app contract used by lifespan.
+        state = SimpleNamespace()
 
     async with main_mod.lifespan(_StubApp()):
         # Inside the lifespan, the singleton is still alive.

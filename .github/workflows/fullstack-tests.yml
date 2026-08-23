@@ -28,6 +28,7 @@ jobs:
           - "1.6.0"
           - "latest"
     env:
+      KOHAKU_HUB_DB_BACKEND: postgres
       KOHAKU_HUB_DATABASE_URL: postgresql://hub_test:hub_test_password@127.0.0.1:25432/kohakuhub_test
       KOHAKU_HUB_S3_ENDPOINT: http://127.0.0.1:29001
       KOHAKU_HUB_S3_PUBLIC_ENDPOINT: http://127.0.0.1:29001
@@ -77,7 +78,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       lakefs:
-        image: treeverse/lakefs:latest
+        image: treeverse/lakefs:1.86.0
         env:
           LAKEFS_DATABASE_TYPE: local
           LAKEFS_DATABASE_LOCAL_PATH: /tmp/lakefs/metadata.db
@@ -113,6 +114,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -128,6 +131,22 @@ jobs:
           else
             python -m pip install --upgrade "huggingface_hub==${HUGGINGFACE_HUB_VERSION}"
           fi
+
+      - name: Defer PostgreSQL checkpoints during the test suite
+        run: |
+          python - <<'PY'
+          import psycopg2
+
+          connection = psycopg2.connect(
+              "postgresql://hub_test:hub_test_password@127.0.0.1:25432/postgres"
+          )
+          connection.autocommit = True
+          with connection.cursor() as cursor:
+              cursor.execute("ALTER SYSTEM SET checkpoint_timeout = '30min'")
+              cursor.execute("ALTER SYSTEM SET max_wal_size = '4GB'")
+              cursor.execute("SELECT pg_reload_conf()")
+          connection.close()
+          PY
 
       - name: Run backend tests with coverage
         run: |
@@ -161,6 +180,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
+      KOHAKU_HUB_DB_BACKEND: postgres
       KOHAKU_HUB_DATABASE_URL: postgresql://hub_test:hub_test_password@127.0.0.1:25432/kohakuhub_test
       KOHAKU_HUB_S3_ENDPOINT: http://127.0.0.1:29001
       KOHAKU_HUB_S3_PUBLIC_ENDPOINT: http://127.0.0.1:29001
@@ -205,7 +225,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       lakefs:
-        image: treeverse/lakefs:latest
+        image: treeverse/lakefs:1.86.0
         env:
           LAKEFS_DATABASE_TYPE: local
           LAKEFS_DATABASE_LOCAL_PATH: /tmp/lakefs/metadata.db
@@ -241,6 +261,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -253,9 +275,81 @@ jobs:
           python -m pip install -e ".[dev]"
           python -m pip install --upgrade huggingface_hub
 
+      - name: Defer PostgreSQL checkpoints during the test suite
+        run: |
+          python - <<'PY'
+          import psycopg2
+
+          connection = psycopg2.connect(
+              "postgresql://hub_test:hub_test_password@127.0.0.1:25432/postgres"
+          )
+          connection.autocommit = True
+          with connection.cursor() as cursor:
+              cursor.execute("ALTER SYSTEM SET checkpoint_timeout = '30min'")
+              cursor.execute("ALTER SYSTEM SET max_wal_size = '4GB'")
+              cursor.execute("SELECT pg_reload_conf()")
+          connection.close()
+          PY
+
       - name: Run backend tests with cache disabled
         run: |
           make test-backend
+
+  worker-runtime:
+    name: worker runtime and schema lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      KOHAKU_HUB_DB_BACKEND: postgres
+      KOHAKU_HUB_DATABASE_URL: postgresql://hub_test:hub_test_password@127.0.0.1:25432/kohakuhub_test
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: hub_test
+          POSTGRES_PASSWORD: hub_test_password
+          POSTGRES_DB: kohakuhub_test
+        ports:
+          - 25432:5432
+        options: >-
+          --health-cmd "pg_isready -U hub_test -d kohakuhub_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Apply and verify durable schema
+        run: |
+          python scripts/khub_migrate.py
+          python scripts/verify_schema.py
+
+      - name: Verify migration sequence
+        run: python scripts/verify_migration_sequence.py
+
+      - name: Run PostgreSQL migration history matrix
+        env:
+          KOHAKU_HUB_MIGRATION_HISTORY_DSN: ${{ env.KOHAKU_HUB_DATABASE_URL }}
+        run: make test-migrations MIGRATION_PYTEST_ARGS=-q
+
+      - name: Run PostgreSQL worker lifecycle tests
+        run: |
+          pytest -q test/kohakuhub/operations/test_lifecycle_postgres.py test/kohakuhub/worker
+
+      - name: Build worker image
+        run: docker build --tag kohakuhub-worker-ci .
 
   ui-tests:
     name: frontend unit tests

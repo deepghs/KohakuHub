@@ -176,7 +176,9 @@ describe("frontend API client", () => {
     expect(deleteSpy).toHaveBeenCalledWith("/api/repos/delete", {
       data: { type: "model", name: "demo", organization: "acme" },
     });
-    expect(getSpy).toHaveBeenCalledWith("/api/models/alice/demo");
+    expect(getSpy).toHaveBeenCalledWith("/api/models/alice/demo", {
+      params: { include_siblings: false },
+    });
     expect(getSpy).toHaveBeenCalledWith("/api/datasets", {
       params: { limit: 5, sort: "likes" },
     });

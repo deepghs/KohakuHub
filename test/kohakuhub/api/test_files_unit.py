@@ -156,7 +156,67 @@ async def test_process_preupload_file_uses_batch_metadata_without_file_queries(
 
 
 @pytest.mark.asyncio
-async def test_preupload_batch_load_is_limited_to_sha256_paths(monkeypatch):
+async def test_process_preupload_file_uses_precomputed_sample_match(monkeypatch):
+    repo = SimpleNamespace()
+
+    monkeypatch.setattr(files_api, "should_use_lfs", lambda *_args: False)
+    monkeypatch.setattr(
+        files_api,
+        "check_file_by_sample",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("preupload should use the batch sample result")
+        ),
+    )
+
+    result = await files_api.process_preupload_file(
+        {"path": "same.txt", "size": 5, "sample": "aGVsbG8="},
+        repo,
+        "owner/demo",
+        "lakefs-repo",
+        "main",
+        1024,
+        sample_matches={"same.txt": True},
+    )
+
+    assert result == {
+        "path": "same.txt",
+        "uploadMode": "regular",
+        "shouldIgnore": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sample_batch_only_reads_known_same_size_files(monkeypatch):
+    repo = SimpleNamespace()
+    calls = []
+
+    class _SampleClient:
+        async def get_object(self, **kwargs):
+            calls.append(kwargs)
+            return b"hello"
+
+    monkeypatch.setattr(files_api, "should_use_lfs", lambda *_args: False)
+    monkeypatch.setattr(files_api, "get_lakefs_client", lambda: _SampleClient())
+
+    matches = await files_api._build_sample_match_map(
+        [
+            {"path": "existing.txt", "size": 5, "sample": "aGVsbG8="},
+            {"path": "new.txt", "size": 5, "sample": "bmV3"},
+        ],
+        repo=repo,
+        existing_files={"existing.txt": ("stored-sha", 5)},
+        lakefs_repo="lakefs-repo",
+        revision="main",
+    )
+
+    assert matches == {"existing.txt": True, "new.txt": False}
+    assert calls == [
+        {"repository": "lakefs-repo", "ref": "main", "path": "existing.txt"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_preupload_batch_load_covers_sha256_and_sample_paths(monkeypatch):
     repo = SimpleNamespace(
         private=True,
         created_at=None,
@@ -172,6 +232,7 @@ async def test_preupload_batch_load_is_limited_to_sha256_paths(monkeypatch):
     monkeypatch.setattr(files_api, "check_quota", lambda *_args: (True, None))
     monkeypatch.setattr(files_api, "resolve_lakefs_repo", lambda _repo: "lakefs-repo")
     monkeypatch.setattr(files_api, "get_effective_lfs_threshold", lambda _repo: 1024)
+    monkeypatch.setattr(files_api, "should_use_lfs", lambda *_args: False)
 
     def _batch_map(_repo, paths):
         captured.append(set(paths))
@@ -200,7 +261,7 @@ async def test_preupload_batch_load_is_limited_to_sha256_paths(monkeypatch):
         user=SimpleNamespace(username="alice"),
     )
 
-    assert captured == [{"same.bin"}]
+    assert captured == [{"same.bin", "sample.txt"}]
     assert len(response["files"]) == 2
 
 

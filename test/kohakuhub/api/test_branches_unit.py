@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import kohakuhub.api.branches as branches_api
 
@@ -281,6 +282,7 @@ async def test_reference_helpers_and_list_repo_refs_cover_pagination_and_fallbac
 
 @pytest.mark.asyncio
 async def test_revert_branch_covers_not_found_conflict_success_and_tracking_failure(monkeypatch):
+    monkeypatch.setattr(branches_api.cfg.app, "enable_revert_operations", True)
     repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
@@ -371,6 +373,58 @@ async def test_revert_branch_covers_not_found_conflict_success_and_tracking_fail
     assert result["success"] is True
 
 
+@pytest.mark.asyncio
+async def test_revert_production_postgres_path_fails_closed_until_issue_99_gate(
+    monkeypatch,
+):
+    repo = SimpleNamespace(id=7, repo_type="model", full_id="owner/repo")
+    user = SimpleNamespace(id=11, username="owner")
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                operation_runtime=SimpleNamespace(
+                    service=SimpleNamespace(
+                        accept=lambda **_kwargs: pytest.fail(
+                            "revert was accepted before Issue #99 gate"
+                        )
+                    )
+                )
+            )
+        ),
+        headers={"x-khub-idempotency-key": "revert-1"},
+    )
+
+    monkeypatch.setattr(branches_api.cfg.app, "db_backend", "postgres")
+    monkeypatch.setattr(branches_api.cfg.app, "enable_revert_operations", True)
+    monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
+    monkeypatch.setattr(branches_api, "check_repo_write_permission", lambda *_args: None)
+
+    with pytest.raises(HTTPException) as error:
+        await branches_api.revert_branch(
+            "model",
+            "owner",
+            "repo",
+            "main",
+            branches_api.RevertPayload(ref="commit-1"),
+            user=user,
+            request=request,
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.detail == {
+        "error": "durable_operation_not_available",
+        "operation": "revert",
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata", [{}, {"safe-looking": "value"}, {"authorization": "secret"}]
+)
+def test_revert_payload_rejects_all_user_metadata(metadata):
+    with pytest.raises(ValidationError):
+        branches_api.RevertPayload(ref="commit-1", metadata=metadata)
+
+
 def _async_return(value):
     async def _inner(*args, **kwargs):
         return value
@@ -440,6 +494,7 @@ async def test_merge_branches_covers_not_found_conflict_success_and_tracking_pat
 
 @pytest.mark.asyncio
 async def test_reset_branch_covers_guardrails_recoverability_success_and_failures(monkeypatch):
+    monkeypatch.setattr(branches_api.cfg.app, "enable_reset_operations", True)
     repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
@@ -527,3 +582,35 @@ async def test_reset_branch_covers_guardrails_recoverability_success_and_failure
             "model", "owner", "repo", "feature", branches_api.ResetPayload(ref="abc", force=True), user=user
         )
     assert generic_error.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_reset_production_path_fails_closed_even_when_flag_is_enabled(monkeypatch):
+    monkeypatch.setattr(branches_api.cfg.app, "db_backend", "postgres")
+    monkeypatch.setattr(branches_api.cfg.app, "enable_reset_operations", True)
+    repo = SimpleNamespace(id=1, repo_type="model", full_id="owner/repo")
+    user = SimpleNamespace(username="owner")
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(operation_runtime=object()))
+    )
+    monkeypatch.setattr(branches_api, "get_repository", lambda *_args: repo)
+    monkeypatch.setattr(
+        branches_api, "check_repo_write_permission", lambda *_args: None
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await branches_api.reset_branch(
+            "model",
+            "owner",
+            "repo",
+            "feature",
+            branches_api.ResetPayload(ref="abc", force=True),
+            user=user,
+            request=request,
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.detail == {
+        "error": "durable_operation_not_available",
+        "operation": "reset",
+    }

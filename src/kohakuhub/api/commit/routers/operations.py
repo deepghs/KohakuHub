@@ -6,32 +6,143 @@ import asyncio
 import base64
 import hashlib
 import json
+import weakref
+from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from kohakuhub.config import cfg
-from kohakuhub.db import File, Repository, User
+from kohakuhub.db import File, LFSObjectHistory, Repository, User
 from kohakuhub.db_operations import (
     create_commit,
-    create_file,
-    delete_file,
     get_effective_lfs_threshold,
     get_file,
+    get_repo_file_map,
     get_organization,
     should_use_lfs,
-    update_file,
 )
 from kohakuhub.logger import get_logger
 from kohakuhub.auth.dependencies import get_current_user
 from kohakuhub.auth.permissions import check_repo_write_permission
 from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 from kohakuhub.utils.s3 import get_object_metadata, object_exists
-from kohakuhub.api.quota.util import update_namespace_storage, update_repository_storage
-from kohakuhub.api.repo.utils.gc import run_gc_for_file, track_lfs_object
 from kohakuhub.api.repo.utils.hf import HFErrorCode
+from kohakuhub.operations.handlers import perform_commit_postprocess
+from kohakuhub import lakefs_mutation_gateway as mutation_gateway
+from kohakuhub.operations.service import (
+    CommitInProgress,
+    IdempotencyConflict,
+    QuotaExceeded,
+)
 
 logger = get_logger("FILE")
 router = APIRouter()
+# LakeFS stages one object per request. Four concurrent uploads leave enough
+# room in the per-process LakeFS HTTP pool for control calls and other requests.
+# The shared semaphore keeps this budget global to the event loop, so concurrent
+# repositories cannot multiply it per request.
+COMMIT_STAGE_CONCURRENCY = 4
+_STAGE_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _commit_stage_semaphore() -> asyncio.Semaphore:
+    """Return the staging budget shared by commits on this event loop."""
+
+    loop = asyncio.get_running_loop()
+    semaphore = _STAGE_SEMAPHORES.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(COMMIT_STAGE_CONCURRENCY)
+        _STAGE_SEMAPHORES[loop] = semaphore
+    return semaphore
+
+
+def _staging_paths_are_independent(paths: list[str | None]) -> bool:
+    """Return whether same-kind staging operations can safely overlap."""
+
+    normalized = sorted(
+        str(path).strip("/")
+        for path in paths
+        if path is not None and str(path).strip("/")
+    )
+    return all(
+        current != previous and not current.startswith(f"{previous}/")
+        for previous, current in zip(normalized, normalized[1:])
+    )
+_UNSET_FILE = object()
+
+
+def _log_commit_payload_debug(lines: list[str], raw: bytes) -> None:
+    """Log commit diagnostics without emitting private NDJSON content."""
+
+    if cfg.app.debug_log_payloads:
+        logger.debug(
+            "Commit payload received: {} lines, {} bytes",
+            len(lines),
+            len(raw),
+        )
+
+
+def _lakefs_status_code(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def _record_file_upsert(
+    file_mutations: list[dict] | None,
+    *,
+    repo: Repository,
+    path: str,
+    size: int,
+    sha256: str,
+    lfs: bool,
+) -> None:
+    """Record a finalization delta or preserve the legacy helper behavior."""
+
+    if file_mutations is not None:
+        file_mutations.append(
+            {
+                "action": "upsert",
+                "path": path,
+                "size": int(size),
+                "sha256": sha256,
+                "lfs": bool(lfs),
+            }
+        )
+        return
+    File.insert(
+        repository=repo,
+        path_in_repo=path,
+        size=size,
+        sha256=sha256,
+        lfs=lfs,
+        is_deleted=False,
+        owner=repo.owner,
+    ).on_conflict(
+        conflict_target=(File.repository, File.path_in_repo),
+        update={
+            File.sha256: sha256,
+            File.size: size,
+            File.lfs: lfs,
+            File.is_deleted: False,
+            File.updated_at: datetime.now(timezone.utc),
+        },
+    ).execute()
+
+
+def _record_file_delete(
+    file_mutations: list[dict] | None,
+    *,
+    repo: Repository,
+    path: str,
+) -> None:
+    if file_mutations is not None:
+        file_mutations.append({"action": "delete", "path": path})
+        return
+    File.update(is_deleted=True, updated_at=datetime.now(timezone.utc)).where(
+        (File.repository == repo) & (File.path_in_repo == path)
+    ).execute()
 
 
 class RepoType(str, Enum):
@@ -65,6 +176,188 @@ def calculate_git_blob_sha1(content: bytes) -> str:
     return sha.hexdigest()
 
 
+async def _estimate_commit_quota_delta(
+    repo: Repository,
+    operations: list[dict],
+    client,
+    lakefs_repo: str,
+    existing_files: dict[str, File] | None = None,
+) -> int:
+    """Estimate the positive net storage delta before LakeFS staging.
+
+    Non-LFS usage follows current-HEAD files. LFS usage follows unique history
+    objects and is never released by a delete. The estimate is intentionally
+    conservative for a copy whose source is absent from the metadata mirror;
+    the LakeFS stat call supplies the missing size before any mutation.
+    """
+
+    # Reject duplicate paths and unsafe file/folder overlaps before building
+    # the projection.  Walk each path's component prefixes instead of
+    # comparing every pair, so a large commit stays linear in its path length.
+    path_operations: dict[str, tuple[str, int]] = {}
+    for operation_index, operation in enumerate(operations):
+        path = str(operation.get("value", {}).get("path") or "").strip("/")
+        if not path:
+            continue
+        if path in path_operations:
+            raise ValueError("commit contains overlapping mutations")
+        path_operations[path] = (operation.get("key", ""), operation_index)
+
+    for path, (key, operation_index) in path_operations.items():
+        parts = path.split("/")
+        prefix = ""
+        for part in parts[:-1]:
+            prefix = f"{prefix}/{part}" if prefix else part
+            ancestor = path_operations.get(prefix)
+            if ancestor is None:
+                continue
+            ancestor_key, ancestor_index = ancestor
+            if not (
+                ancestor_key == "deletedFolder"
+                and ancestor_index < operation_index
+            ):
+                raise ValueError(
+                    "commit contains overlapping file and folder mutations"
+                )
+
+    # Apply mutations in request order against a small projected view. This
+    # matches the HF client contract for delete-folder followed by re-adding a
+    # child while avoiding the old all-pairs overlap scan (O(n^2)).
+    initial_regular: dict[str, int] = {}
+    projected_regular: dict[str, int] = {}
+    loaded_files: dict[str, File | None] = {}
+    loaded_folder_prefixes: list[str] = []
+    anonymous_folder_delta = 0
+    lfs_delta = 0
+    checked_lfs_oids: set[str] = set()
+
+    def active_file(path: str) -> File | None:
+        path = str(path or "").strip("/")
+        if path in loaded_files:
+            return loaded_files[path]
+        if existing_files is None:
+            existing = get_file(repo, path)
+        else:
+            existing = existing_files.get(path)
+        if existing is not None and existing.is_deleted:
+            existing = None
+        loaded_files[path] = existing
+        if existing is not None and not existing.lfs:
+            size = int(existing.size)
+            initial_regular[path] = size
+            projected_regular[path] = size
+        return existing
+
+    def charge_lfs_object(oid: str, size: int) -> None:
+        nonlocal lfs_delta
+        if oid in checked_lfs_oids:
+            return
+        checked_lfs_oids.add(oid)
+        if not LFSObjectHistory.get_or_none(
+            (LFSObjectHistory.repository == repo)
+            & (LFSObjectHistory.sha256 == oid)
+        ):
+            lfs_delta += int(size)
+
+    def delete_projected_prefix(prefix: str) -> None:
+        for projected_path in tuple(projected_regular):
+            if projected_path.startswith(prefix):
+                projected_regular.pop(projected_path, None)
+
+    def load_and_delete_folder(folder_path: str) -> None:
+        nonlocal anonymous_folder_delta
+        folder_path = folder_path.strip("/")
+        prefix = f"{folder_path}/"
+        if any(prefix.startswith(loaded) for loaded in loaded_folder_prefixes):
+            delete_projected_prefix(prefix)
+            return
+        loaded_folder_prefixes.append(prefix)
+        rows = (
+            File.select(File.path_in_repo, File.size, File.lfs)
+            .where(
+                (File.repository == repo)
+                & (File.path_in_repo.startswith(prefix))
+                # Peewee builds SQL expressions from this comparison; a
+                # Python ``not`` would evaluate the field immediately.
+                & (File.is_deleted == False)  # noqa: E712
+            )
+            .tuples()
+        )
+        for row in rows:
+            # Keep compatibility with lightweight unit fakes that return only
+            # (size, lfs) for this query.
+            if len(row) == 3:
+                child_path, size, is_lfs = row
+                child_path = str(child_path).strip("/")
+                if child_path not in loaded_files:
+                    loaded_files[child_path] = None
+                    if not is_lfs:
+                        initial_regular[child_path] = int(size)
+                        projected_regular[child_path] = int(size)
+            else:
+                child_path = None
+                size, is_lfs = row
+            if not is_lfs:
+                if child_path is None:
+                    anonymous_folder_delta -= int(size)
+                else:
+                    projected_regular.pop(child_path, None)
+        delete_projected_prefix(prefix)
+
+    for operation in operations:
+        key = operation["key"]
+        value = operation["value"]
+        path = str(value.get("path") or "").strip("/")
+        if key == "file":
+            data = base64.b64decode(value.get("content", ""))
+            active_file(path)
+            projected_regular[path] = len(data)
+        elif key == "lfsFile":
+            oid = str(value.get("oid") or "")
+            size = int(value.get("size") or 0)
+            existing = active_file(path)
+            if existing and not existing.is_deleted and existing.lfs and existing.sha256 == oid:
+                projected_regular.pop(path, None)
+                continue
+            lfs_key = f"lfs/{oid[:2]}/{oid[2:4]}/{oid}"
+            actual_size = await get_object_metadata(cfg.s3.bucket, lfs_key)
+            size = int(actual_size["size"])
+            projected_regular.pop(path, None)
+            charge_lfs_object(oid, size)
+        elif key == "deletedFile":
+            active_file(path)
+            projected_regular.pop(path, None)
+        elif key == "deletedFolder":
+            load_and_delete_folder(path)
+        elif key == "copyFile":
+            active_file(path)
+            projected_regular.pop(path, None)
+            source = active_file(value.get("srcPath"))
+            if source is None:
+                source_object = await client.stat_object(
+                    repository=lakefs_repo,
+                    ref=value.get("srcRevision", "main"),
+                    path=value.get("srcPath"),
+                )
+                if should_use_lfs(repo, path, int(source_object["size_bytes"])):
+                    charge_lfs_object(
+                        str(source_object["checksum"]),
+                        int(source_object["size_bytes"]),
+                    )
+                else:
+                    projected_regular[path] = int(source_object["size_bytes"])
+            elif source.lfs:
+                charge_lfs_object(str(source.sha256), int(source.size))
+            else:
+                projected_regular[path] = int(source.size)
+    return (
+        sum(projected_regular.values())
+        - sum(initial_regular.values())
+        + anonymous_folder_delta
+        + lfs_delta
+    )
+
+
 async def process_regular_file(
     path: str,
     content_b64: str,
@@ -72,6 +365,8 @@ async def process_regular_file(
     repo: Repository,
     lakefs_repo: str,
     revision: str,
+    file_mutations: list[dict] | None = None,
+    existing_file: File | None | object = _UNSET_FILE,
 ) -> bool:
     """Process regular file with inline base64 content.
 
@@ -124,7 +419,7 @@ async def process_regular_file(
     git_blob_sha1 = calculate_git_blob_sha1(data)
 
     # Check if file unchanged (deduplication)
-    existing = get_file(repo, path)
+    existing = get_file(repo, path) if existing_file is _UNSET_FILE else existing_file
     if existing and existing.sha256 == git_blob_sha1 and existing.size == len(data):
         if existing.is_deleted:
             # File was deleted, now being restored - need to re-upload to LakeFS
@@ -145,7 +440,8 @@ async def process_regular_file(
     # Upload to LakeFS
     try:
         client = get_lakefs_client()
-        await client.upload_object(
+        await mutation_gateway.upload_object(
+            client,
             repository=lakefs_repo,
             branch=revision,
             path=path,
@@ -154,25 +450,16 @@ async def process_regular_file(
     except Exception as e:
         raise HTTPException(500, detail={"error": f"Failed to upload {path}: {e}"})
 
-    # Update database - store git blob SHA1 in sha256 column for non-LFS files
-    File.insert(
-        repository=repo,
-        path_in_repo=path,
+    # Apply this only after LakeFS commit in production.  Direct helper calls
+    # retain the legacy write path for compatibility with isolated tests/tools.
+    _record_file_upsert(
+        file_mutations,
+        repo=repo,
+        path=path,
         size=len(data),
         sha256=git_blob_sha1,
         lfs=False,
-        is_deleted=False,
-        owner=repo.owner,
-    ).on_conflict(
-        conflict_target=(File.repository, File.path_in_repo),
-        update={
-            File.sha256: git_blob_sha1,
-            File.size: len(data),
-            File.lfs: False,  # Explicitly set to False
-            File.is_deleted: False,  # File is active (un-delete if previously deleted)
-            File.updated_at: datetime.now(timezone.utc),
-        },
-    ).execute()
+    )
 
     return True
 
@@ -185,6 +472,8 @@ async def process_lfs_file(
     repo: Repository,
     lakefs_repo: str,
     revision: str,
+    file_mutations: list[dict] | None = None,
+    existing_file: File | None | object = _UNSET_FILE,
 ) -> tuple[bool, dict | None]:
     """Process LFS file that was uploaded to S3.
 
@@ -207,7 +496,11 @@ async def process_lfs_file(
         raise HTTPException(400, detail={"error": f"Missing OID for LFS file {path}"})
 
     # Check for existing file (including deleted files to detect re-upload)
-    existing = File.get_or_none((File.repository == repo) & (File.path_in_repo == path))
+    existing = (
+        File.get_or_none((File.repository == repo) & (File.path_in_repo == path))
+        if existing_file is _UNSET_FILE
+        else existing_file
+    )
 
     # Track old LFS object for potential deletion
     old_lfs_oid = None
@@ -244,7 +537,8 @@ async def process_lfs_file(
                 }
 
                 client = get_lakefs_client()
-                await client.link_physical_address(
+                await mutation_gateway.link_physical_address(
+                    client,
                     repository=lakefs_repo,
                     branch=revision,
                     path=path,
@@ -269,11 +563,20 @@ async def process_lfs_file(
                     },
                 )
 
-            # Update database to mark as not deleted
-            File.update(is_deleted=False, updated_at=datetime.now(timezone.utc)).where(
-                File.id == existing.id
-            ).execute()
-            logger.success(f"Restored deleted file in DB: {path} (unmarked is_deleted)")
+            if file_mutations is None:
+                File.update(
+                    is_deleted=False, updated_at=datetime.now(timezone.utc)
+                ).where(File.id == existing.id).execute()
+            else:
+                _record_file_upsert(
+                    file_mutations,
+                    repo=repo,
+                    path=path,
+                    size=size,
+                    sha256=oid,
+                    lfs=True,
+                )
+            logger.success(f"Restored deleted file metadata: {path}")
 
             # Return tracking info for new commit (reusing existing LFS object)
             return True, {
@@ -347,9 +650,7 @@ async def process_lfs_file(
             f"(path: {path}, bucket: {cfg.s3.bucket}, key: {lfs_key})",
             e,
         )
-        logger.warning(
-            f"Could not verify S3 object metadata, continuing without size check"
-        )
+        logger.warning("Could not verify S3 object metadata, continuing without size check")
 
     # Link the physical S3 object to LakeFS
     try:
@@ -362,7 +663,8 @@ async def process_lfs_file(
         }
 
         client = get_lakefs_client()
-        await client.link_physical_address(
+        await mutation_gateway.link_physical_address(
+            client,
             repository=lakefs_repo,
             branch=revision,
             path=path,
@@ -386,25 +688,14 @@ async def process_lfs_file(
             detail={"error": f"Failed to link LFS file {path} in LakeFS: {str(e)}"},
         )
 
-    # Update database
-    File.insert(
-        repository=repo,
-        path_in_repo=path,
+    _record_file_upsert(
+        file_mutations,
+        repo=repo,
+        path=path,
         size=size,
         sha256=oid,
         lfs=True,
-        is_deleted=False,
-        owner=repo.owner,
-    ).on_conflict(
-        conflict_target=(File.repository, File.path_in_repo),
-        update={
-            File.sha256: oid,
-            File.size: size,
-            File.lfs: True,
-            File.is_deleted: False,  # File is active (un-delete if previously deleted)
-            File.updated_at: datetime.now(timezone.utc),
-        },
-    ).execute()
+    )
 
     logger.success(f"Updated database record for LFS file: {path}")
 
@@ -425,7 +716,11 @@ async def process_lfs_file(
 
 
 async def process_deleted_file(
-    path: str, repo: Repository, lakefs_repo: str, revision: str
+    path: str,
+    repo: Repository,
+    lakefs_repo: str,
+    revision: str,
+    file_mutations: list[dict] | None = None,
 ) -> bool:
     """Process file deletion.
 
@@ -445,29 +740,38 @@ async def process_deleted_file(
 
     try:
         client = get_lakefs_client()
-        await client.delete_object(repository=lakefs_repo, branch=revision, path=path)
+        await mutation_gateway.delete_object(
+            client, repository=lakefs_repo, branch=revision, path=path
+        )
         logger.success(f"Successfully deleted file from LakeFS: {path}")
+    except httpx.HTTPStatusError as e:
+        if _lakefs_status_code(e) != 404:
+            raise HTTPException(
+                502,
+                detail={"error": f"LakeFS failed to delete {path}"},
+            ) from e
+        logger.info(f"LakeFS reported {path} already absent; treating delete as no-op")
     except Exception as e:
-        # File might not exist, log warning but continue
-        logger.warning(f"Failed to delete {path} from LakeFS: {e}")
+        raise HTTPException(
+            502,
+            detail={"error": f"LakeFS failed to delete {path}"},
+        ) from e
 
-    # Mark as deleted in database (soft delete)
-    updated_count = (
-        File.update(is_deleted=True, updated_at=datetime.now(timezone.utc))
-        .where((File.repository == repo) & (File.path_in_repo == path))
-        .execute()
-    )
-
-    if updated_count > 0:
-        logger.success(f"Marked {path} as deleted in database (soft delete)")
+    _record_file_delete(file_mutations, repo=repo, path=path)
+    if file_mutations is not None:
+        logger.info(f"Recorded {path} for post-commit soft delete")
     else:
-        logger.info(f"File {path} was not in database")
+        logger.success(f"Marked {path} as deleted in database (soft delete)")
 
     return True
 
 
 async def process_deleted_folder(
-    path: str, repo: Repository, lakefs_repo: str, revision: str
+    path: str,
+    repo: Repository,
+    lakefs_repo: str,
+    revision: str,
+    file_mutations: list[dict] | None = None,
 ) -> bool:
     """Process folder deletion.
 
@@ -505,7 +809,13 @@ async def process_deleted_folder(
             all_folder_objects.extend(objects["results"])
 
             if objects.get("pagination") and objects["pagination"].get("has_more"):
-                after = objects["pagination"]["next_offset"]
+                next_offset = objects["pagination"].get("next_offset")
+                if not next_offset or str(next_offset) == str(after):
+                    raise HTTPException(
+                        502,
+                        detail={"error": "LakeFS returned a non-advancing folder cursor"},
+                    )
+                after = next_offset
                 has_more = True
             else:
                 has_more = False
@@ -515,38 +825,66 @@ async def process_deleted_folder(
             obj for obj in all_folder_objects if obj["path_type"] == "object"
         ]
 
+        semaphore = asyncio.Semaphore(32)
+
         async def delete_file_obj(obj):
             try:
-                await client.delete_object(
-                    repository=lakefs_repo, branch=revision, path=obj["path"]
-                )
+                async with semaphore:
+                    await mutation_gateway.delete_object(
+                        client,
+                        repository=lakefs_repo, branch=revision, path=obj["path"]
+                    )
                 logger.info(f"  Deleted: {obj['path']}")
                 return obj["path"]
+            except httpx.HTTPStatusError as e:
+                if _lakefs_status_code(e) == 404:
+                    return obj["path"]
+                return e
             except Exception as e:
-                logger.warning(f"  Failed to delete {obj['path']}: {e}")
-                return None
+                return e
 
         results = await asyncio.gather(*[delete_file_obj(obj) for obj in file_objects])
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise HTTPException(
+                502,
+                detail={
+                    "error": f"LakeFS failed to delete {len(failures)} folder object(s)"
+                },
+            ) from failures[0]
         deleted_files = [path for path in results if path is not None]
 
         logger.success(f"Deleted {len(deleted_files)} files from folder {folder_path}")
 
-        # Mark as deleted in database (soft delete)
         if deleted_files:
-            updated_count = (
-                File.update(is_deleted=True, updated_at=datetime.now(timezone.utc))
-                .where(
-                    (File.repository == repo)
-                    & (File.path_in_repo.startswith(folder_path))
+            if file_mutations is not None:
+                file_mutations.extend(
+                    {"action": "delete", "path": deleted_path}
+                    for deleted_path in deleted_files
                 )
-                .execute()
-            )
-            logger.success(
-                f"Marked {updated_count} file(s) as deleted in database (soft delete)"
-            )
+                logger.info(
+                    f"Recorded {len(deleted_files)} file(s) for post-commit soft delete"
+                )
+            else:
+                updated_count = (
+                    File.update(is_deleted=True, updated_at=datetime.now(timezone.utc))
+                    .where(
+                        (File.repository == repo)
+                        & (File.path_in_repo.startswith(folder_path))
+                    )
+                    .execute()
+                )
+                logger.success(
+                    f"Marked {updated_count} file(s) as deleted in database (soft delete)"
+                )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"Error deleting folder {folder_path}: {e}")
+        raise HTTPException(
+            502,
+            detail={"error": f"LakeFS failed to delete folder {folder_path}"},
+        ) from e
 
     return True
 
@@ -558,6 +896,8 @@ async def process_copy_file(
     repo: Repository,
     lakefs_repo: str,
     revision: str,
+    file_mutations: list[dict] | None = None,
+    source_file: File | None | object = _UNSET_FILE,
 ) -> bool:
     """Process file copy operation.
 
@@ -577,7 +917,7 @@ async def process_copy_file(
     """
     if not src_path:
         raise HTTPException(
-            400, detail={"error": f"Missing srcPath for copyFile operation"}
+            400, detail={"error": "Missing srcPath for copyFile operation"}
         )
 
     logger.info(
@@ -600,7 +940,8 @@ async def process_copy_file(
             "size_bytes": src_obj["size_bytes"],
         }
 
-        await client.link_physical_address(
+        await mutation_gateway.link_physical_address(
+            client,
             repository=lakefs_repo,
             branch=revision,
             path=dest_path,
@@ -611,50 +952,31 @@ async def process_copy_file(
             f"Successfully linked {dest_path} to same physical address as {src_path}"
         )
 
-        # Update database - copy file metadata
-        src_file = get_file(repo, src_path)
+        # Capture metadata for post-commit finalization.  Direct helper calls
+        # still use the old Peewee path for compatibility.
+        src_file = get_file(repo, src_path) if source_file is _UNSET_FILE else source_file
 
         if src_file:
-            File.insert(
-                repository=repo,
-                path_in_repo=dest_path,
+            _record_file_upsert(
+                file_mutations,
+                repo=repo,
+                path=dest_path,
                 size=src_file.size,
                 sha256=src_file.sha256,
                 lfs=src_file.lfs,
-                is_deleted=False,
-                owner=repo.owner,
-            ).on_conflict(
-                conflict_target=(File.repository, File.path_in_repo),
-                update={
-                    File.sha256: src_file.sha256,
-                    File.size: src_file.size,
-                    File.lfs: src_file.lfs,
-                    File.is_deleted: False,  # File is active
-                    File.updated_at: datetime.now(timezone.utc),
-                },
-            ).execute()
+            )
         else:
             # If not in database, create entry based on LakeFS info
             # Use repo-specific LFS settings
             is_lfs = should_use_lfs(repo, dest_path, src_obj["size_bytes"])
-            File.insert(
-                repository=repo,
-                path_in_repo=dest_path,
+            _record_file_upsert(
+                file_mutations,
+                repo=repo,
+                path=dest_path,
                 size=src_obj["size_bytes"],
                 sha256=src_obj["checksum"],
                 lfs=is_lfs,
-                is_deleted=False,
-                owner=repo.owner,
-            ).on_conflict(
-                conflict_target=(File.repository, File.path_in_repo),
-                update={
-                    File.sha256: src_obj["checksum"],
-                    File.size: src_obj["size_bytes"],
-                    File.lfs: is_lfs,
-                    File.is_deleted: False,  # File is active
-                    File.updated_at: datetime.now(timezone.utc),
-                },
-            ).execute()
+            )
 
         logger.success(f"Successfully copied {src_path} to {dest_path}")
 
@@ -677,6 +999,97 @@ async def commit(
     revision: str,
     request: Request,
     user: User = Depends(get_current_user),
+):
+    """Acquire the shared PostgreSQL ref fence around the full mutation."""
+
+    # The implementation below retains the existing HF-compatible parsing
+    # and response path.  The wrapper is intentionally thin so every LakeFS
+    # staging call, including the final commit, shares one cross-process gate.
+    if request.query_params.get("create_pr") not in ("1", "true", "True"):
+        repo_row = Repository.get_or_none(
+            (Repository.full_id == f"{namespace}/{name}")
+            & (Repository.repo_type == repo_type.value)
+        )
+        if repo_row is not None:
+            check_repo_write_permission(repo_row, user)
+            request_app = getattr(request, "app", None)
+            request_state = getattr(request_app, "state", None)
+            runtime_present = request_state is not None and hasattr(
+                request_state, "operation_runtime"
+            )
+            runtime = getattr(request_state, "operation_runtime", None)
+            operation_service = getattr(runtime, "service", None)
+            compatibility_mode = bool(
+                getattr(request_state, "_khub_test_compatibility", False)
+            ) and mutation_gateway.test_compatibility_enabled()
+            if (
+                isinstance(request, Request)
+                and not compatibility_mode
+            ):
+                if not runtime_present or operation_service is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"error": "mutation_fence_unavailable"},
+                    )
+            repository_ref_fence = getattr(
+                operation_service, "repository_ref_fence", None
+            )
+            if (
+                isinstance(request, Request)
+                and not compatibility_mode
+            ):
+                if not callable(repository_ref_fence):
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"error": "mutation_fence_unavailable"},
+                    )
+                try:
+                    async with repository_ref_fence(repo_row.id, revision):
+                        return await _commit_unlocked(
+                            repo_type, namespace, name, revision, request, user
+                        )
+                except CommitInProgress as exc:
+                    await _raise_commit_observing(
+                        operation_service,
+                        exc.intent,
+                        message="Another commit for this ref is still being observed",
+                    )
+    return await _commit_unlocked(repo_type, namespace, name, revision, request, user)
+
+
+async def _raise_commit_observing(
+    operation_service: Any,
+    intent: Any,
+    *,
+    message: str = "Commit result is being observed",
+) -> None:
+    """Expose a durable status handle without allowing a redispatch."""
+
+    operation_id = None
+    try:
+        operation = await operation_service.ensure_commit_observation_operation(
+            intent.id
+        )
+        operation_id = getattr(operation, "id", None)
+    except Exception:
+        logger.exception("Failed to create commit observation operation")
+
+    detail: dict[str, Any] = {"error": message}
+    headers = {"Retry-After": "30"}
+    if operation_id is not None:
+        operation_id = str(operation_id)
+        detail["operation_id"] = operation_id
+        headers["Location"] = f"{cfg.app.api_base}/operations/{operation_id}"
+    raise HTTPException(503, detail=detail, headers=headers)
+
+
+async def _commit_unlocked(
+    repo_type: RepoType,
+    namespace: str,
+    name: str,
+    revision: str,
+    request: Request,
+    user: User,
 ):
     """Create atomic commit with multiple file operations.
 
@@ -736,15 +1149,26 @@ async def commit(
 
     lakefs_repo = resolve_lakefs_repo(repo_row)
     client = get_lakefs_client()
+    request_app = getattr(request, "app", None)
+    runtime = getattr(getattr(request_app, "state", None), "operation_runtime", None)
+    operation_service = getattr(runtime, "service", None)
+
+    try:
+        base_branch = await client.get_branch(
+            repository=lakefs_repo, branch=revision
+        )
+        base_head = str(base_branch["commit_id"])
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            detail={"error": "Unable to resolve commit base head"},
+        ) from exc
 
     # Parse NDJSON payload
     raw = await request.body()
     lines = raw.decode("utf-8").splitlines()
 
-    if cfg.app.debug_log_payloads:
-        logger.debug("==== Commit Payload ====")
-        for line in lines:
-            logger.debug(line)
+    _log_commit_payload_debug(lines, raw)
 
     # Parse header and operations
     header = None
@@ -770,52 +1194,368 @@ async def commit(
     if header is None:
         raise HTTPException(400, detail={"error": "Missing commit header"})
 
-    # Process operations using match-case
+    # huggingface_hub sends parentCommit when the caller based its mutation on
+    # a known revision. Validate it before metadata reads, intent creation, or
+    # any LakeFS staging so a stale client cannot mutate a newer branch head.
+    requested_parent = header.get("parentCommit")
+    if requested_parent is not None:
+        if not isinstance(requested_parent, str) or not requested_parent.strip():
+            raise HTTPException(
+                400,
+                detail={"error": "Invalid parentCommit in commit header"},
+            )
+        requested_parent = requested_parent.strip()
+        if not base_head.startswith(requested_parent):
+            raise HTTPException(
+                409,
+                detail={"error": "Commit parent does not match repository head"},
+            )
+
+    # Persist the request identity before touching LakeFS staging.  The body
+    # hash is separate from the staged finalization payload because the latter
+    # is only known after object metadata has been resolved.
     files_changed = False
     pending_lfs_tracking = []
+    file_mutations: list[dict] = []
+    existing_files: dict[str, File] | None = None
+    request_headers = getattr(request, "headers", {})
+    idempotency_key = request_headers.get("x-khub-idempotency-key") or request_headers.get(
+        "idempotency-key"
+    )
+    request_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "repo_type": repo_type.value,
+                "repository_id": repo_row.id,
+                "ref": revision,
+                "header": header,
+                "operations": operations,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    intent = None
+    batch_staging_supported = callable(
+        getattr(operation_service, "record_prepared_staging_paths", None)
+    )
+    if cfg.app.db_backend == "postgres" and batch_staging_supported:
+        lookup_paths = {
+            str(candidate).strip("/")
+            for operation in operations
+            for candidate in (
+                operation.get("value", {}).get("path"),
+                operation.get("value", {}).get("srcPath")
+                if operation.get("key") == "copyFile"
+                else None,
+            )
+            if candidate
+        }
+        try:
+            existing_files = get_repo_file_map(repo_row, lookup_paths)
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                detail={"error": "Unable to load commit file metadata"},
+                headers={"Retry-After": "30"},
+            ) from exc
+    if (
+        callable(getattr(operation_service, "prepare_commit_intent", None))
+        and cfg.app.db_backend == "postgres"
+    ):
+        try:
+            if existing_files is None:
+                # Keep the lightweight route/test doubles on the original
+                # call shape; production PostgreSQL runtimes use the shared
+                # batch map above.
+                quota_delta = await _estimate_commit_quota_delta(
+                    repo_row, operations, client, lakefs_repo
+                )
+            else:
+                quota_delta = await _estimate_commit_quota_delta(
+                    repo_row,
+                    operations,
+                    client,
+                    lakefs_repo,
+                    existing_files=existing_files,
+                )
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                detail={"error": "invalid_commit_operations", "detail": str(exc)},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                detail={"error": "Unable to calculate commit quota delta"},
+                headers={"Retry-After": "30"},
+            ) from exc
+        deterministic_intent_id = (
+            uuid5(
+                NAMESPACE_URL,
+                f"khub-commit:{user.id}:{repo_row.id}:{revision}:{idempotency_key}",
+            )
+            if idempotency_key
+            else None
+        )
+        existing_intent = (
+            await operation_service.get_commit_intent(deterministic_intent_id)
+            if deterministic_intent_id is not None
+            else None
+        )
+        if existing_intent is not None:
+            if existing_intent.request_hash != request_hash:
+                raise HTTPException(
+                    409,
+                    detail={"error": "Idempotency key is bound to another commit request"},
+                )
+            if existing_intent.state == "finalized" and existing_intent.result_json:
+                return existing_intent.result_json
+            if existing_intent.state in {"committed", "reconciliation_required"}:
+                if existing_intent.payload_json.get("file_mutations") is not None:
+                    existing_result = dict(existing_intent.result_json or {})
+                    existing_result.setdefault(
+                        "commitOid", existing_intent.lakefs_commit_id
+                    )
+                    existing_result.setdefault("commitUrl", "")
+                    await operation_service.finalize_commit_intent(
+                        existing_intent.id,
+                        payload=existing_intent.payload_json,
+                        result_json=existing_result,
+                        requested_by_user_id=user.id,
+                        idempotency_key=idempotency_key or str(existing_intent.id),
+                    )
+                    return existing_result
+            await _raise_commit_observing(
+                operation_service,
+                existing_intent,
+                message="Commit request is still being observed",
+            )
 
-    for op in operations:
+        initial_intent_payload = {
+            "repository_id": repo_row.id,
+            "repo_type": repo_type.value,
+            "namespace": namespace,
+            "name": name,
+            "lakefs_repo": lakefs_repo,
+            "branch": revision,
+            "base_head": base_head,
+            "is_org": get_organization(namespace) is not None,
+            "file_mutations": [],
+            "lfs_tracking": [],
+            "author_id": getattr(user, "id", None),
+            "owner_id": getattr(repo_row, "owner_id", None)
+            or getattr(getattr(repo_row, "owner", None), "id", None),
+            "username": user.username,
+            "message": header.get("summary", "Commit via API"),
+            "description": header.get("description", ""),
+            "is_private": bool(repo_row.private),
+            "quota_delta": quota_delta,
+            "staging_paths": [],
+        }
+        try:
+            intent = await operation_service.prepare_commit_intent(
+                repository_id=repo_row.id,
+                ref=revision,
+                base_head=base_head,
+                payload=initial_intent_payload,
+                intent_id=deterministic_intent_id,
+                requested_by_user_id=getattr(user, "id", None),
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                quota_delta=quota_delta,
+            )
+        except CommitInProgress as exc:
+            await _raise_commit_observing(
+                operation_service,
+                exc.intent,
+                message="Another commit for this ref is still being observed",
+            )
+        except QuotaExceeded as exc:
+            raise HTTPException(
+                413,
+                detail={"error": "Storage quota exceeded"},
+            ) from exc
+
+    # Record every target before the first LakeFS staging mutation.  The batch
+    # write is important for large HF commits: recovery needs the full target
+    # set, but it should not turn one request into one JSONB rewrite per file.
+    use_batch_staging = intent is not None and batch_staging_supported
+    if use_batch_staging:
+        intent = await operation_service.record_prepared_staging_paths(
+            intent.id,
+            paths=[
+                {
+                    "path": str(operation["value"].get("path")),
+                    "recursive": operation["key"] == "deletedFolder",
+                }
+                for operation in operations
+                if operation["value"].get("path")
+            ],
+        )
+
+    # Process operations using match-case.  The ref fence acquired by the
+    # route wrapper is held for this complete staging and commit sequence.
+
+    index = 0
+    stage_semaphore = _commit_stage_semaphore()
+    while index < len(operations):
+        op = operations[index]
         key = op["key"]
         value = op["value"]
         path = value.get("path")
         logger.info(f"Processing {key}: {path}")
 
-        match key:
-            case "file":
-                # Regular file with inline content
-                changed = await process_regular_file(
-                    path=path,
-                    content_b64=value.get("content"),
-                    encoding=(value.get("encoding") or "").lower(),
-                    repo=repo_row,
-                    lakefs_repo=lakefs_repo,
-                    revision=revision,
-                )
-                files_changed = files_changed or changed
+        # Independent regular-file uploads commute because overlapping paths
+        # were rejected by the quota preflight.  Keep a small cap so a large
+        # HF commit uses the pooled LakeFS client without overwhelming it.
+        if key == "file":
+            group_end = index + 1
+            while group_end < len(operations) and operations[group_end]["key"] == "file":
+                group_end += 1
+            group = operations[index:group_end]
+            if not use_batch_staging and intent is not None:
+                for group_op in group:
+                    group_path = group_op["value"].get("path")
+                    if group_path:
+                        await operation_service.record_prepared_staging_path(
+                            intent.id,
+                            path=str(group_path),
+                            recursive=False,
+                        )
 
-            case "lfsFile":
-                # LFS file already in S3
-                changed, lfs_info = await process_lfs_file(
-                    path=path,
-                    oid=value.get("oid"),
-                    size=value.get("size"),
-                    algo=value.get("algo", "sha256"),
-                    repo=repo_row,
-                    lakefs_repo=lakefs_repo,
-                    revision=revision,
+            async def stage_regular_file(group_op: dict) -> tuple[bool, list[dict]]:
+                local_mutations: list[dict] = []
+                group_value = group_op["value"]
+                existing = (
+                    existing_files.get(group_value.get("path"))
+                    if existing_files is not None
+                    else _UNSET_FILE
                 )
-                files_changed = files_changed or changed
-                if lfs_info:
-                    logger.debug(
-                        f"[COMMIT_OP] Adding LFS file to tracking queue: {path} "
-                        f"(sha256={lfs_info['sha256'][:8]}, size={lfs_info['size']:,})"
+                if existing is not _UNSET_FILE and existing is not None and existing.is_deleted:
+                    existing = None
+                async with stage_semaphore:
+                    changed = await process_regular_file(
+                        path=group_value.get("path"),
+                        content_b64=group_value.get("content"),
+                        encoding=(group_value.get("encoding") or "").lower(),
+                        repo=repo_row,
+                        lakefs_repo=lakefs_repo,
+                        revision=revision,
+                        file_mutations=local_mutations,
+                        existing_file=existing,
                     )
-                    pending_lfs_tracking.append(lfs_info)
+                return changed, local_mutations
+
+            can_stage_concurrently = _staging_paths_are_independent(
+                [group_op["value"].get("path") for group_op in group]
+            )
+            if (
+                len(group) > 1
+                and existing_files is not None
+                and can_stage_concurrently
+            ):
+                staged = await asyncio.gather(
+                    *(stage_regular_file(group_op) for group_op in group),
+                    return_exceptions=True,
+                )
+                for result in staged:
+                    if isinstance(result, BaseException):
+                        raise result
+                    changed, mutations = result
+                    files_changed = files_changed or changed
+                    file_mutations.extend(mutations)
+            else:
+                for group_op in group:
+                    changed, mutations = await stage_regular_file(group_op)
+                    files_changed = files_changed or changed
+                    file_mutations.extend(mutations)
+            index = group_end
+            continue
+
+        if intent is not None and path and not use_batch_staging and key != "lfsFile":
+            # Record the target before the first LakeFS staging mutation so a
+            # stale prepared intent can reset the unchanged branch safely.
+            await operation_service.record_prepared_staging_path(
+                intent.id,
+                path=str(path),
+                recursive=key == "deletedFolder",
+            )
+
+        match key:
+            case "lfsFile":
+                group_end = index + 1
+                while group_end < len(operations) and operations[group_end]["key"] == "lfsFile":
+                    group_end += 1
+                group = operations[index:group_end]
+                if not use_batch_staging and intent is not None:
+                    for group_op in group:
+                        group_path = group_op["value"].get("path")
+                        if group_path:
+                            await operation_service.record_prepared_staging_path(
+                                intent.id,
+                                path=str(group_path),
+                                recursive=False,
+                            )
+
+                async def stage_lfs_file(
+                    group_op: dict,
+                ) -> tuple[bool, dict | None, list[dict]]:
+                    local_mutations: list[dict] = []
+                    group_value = group_op["value"]
+                    group_path = group_value.get("path")
+                    async with stage_semaphore:
+                        changed, lfs_info = await process_lfs_file(
+                            path=group_path,
+                            oid=group_value.get("oid"),
+                            size=group_value.get("size"),
+                            algo=group_value.get("algo", "sha256"),
+                            repo=repo_row,
+                            lakefs_repo=lakefs_repo,
+                            revision=revision,
+                            file_mutations=local_mutations,
+                            existing_file=(
+                                existing_files.get(group_path)
+                                if existing_files is not None
+                                else _UNSET_FILE
+                            ),
+                        )
+                    return changed, lfs_info, local_mutations
+
+                can_stage_concurrently = _staging_paths_are_independent(
+                    [group_op["value"].get("path") for group_op in group]
+                )
+                if (
+                    len(group) > 1
+                    and existing_files is not None
+                    and can_stage_concurrently
+                ):
+                    staged = await asyncio.gather(
+                        *(stage_lfs_file(group_op) for group_op in group),
+                        return_exceptions=True,
+                    )
                 else:
-                    logger.warning(
-                        f"[COMMIT_OP] process_lfs_file returned NO tracking info for: {path} "
-                        f"(oid={value.get('oid', 'MISSING')[:8]})"
-                    )
+                    staged = [await stage_lfs_file(group_op) for group_op in group]
+
+                for result in staged:
+                    if isinstance(result, BaseException):
+                        raise result
+                    changed, lfs_info, mutations = result
+                    files_changed = files_changed or changed
+                    file_mutations.extend(mutations)
+                    if lfs_info:
+                        logger.debug(
+                            f"[COMMIT_OP] Adding LFS file to tracking queue: "
+                            f"{lfs_info['path']} (sha256={lfs_info['sha256'][:8]}, "
+                            f"size={lfs_info['size']:,})"
+                        )
+                        pending_lfs_tracking.append(lfs_info)
+                    else:
+                        logger.warning(
+                            "[COMMIT_OP] process_lfs_file returned NO tracking info"
+                        )
+                index = group_end
+                continue
 
             case "deletedFile":
                 # Delete single file
@@ -824,6 +1564,7 @@ async def commit(
                     repo=repo_row,
                     lakefs_repo=lakefs_repo,
                     revision=revision,
+                    file_mutations=file_mutations,
                 )
                 files_changed = files_changed or changed
 
@@ -834,11 +1575,21 @@ async def commit(
                     repo=repo_row,
                     lakefs_repo=lakefs_repo,
                     revision=revision,
+                    file_mutations=file_mutations,
                 )
                 files_changed = files_changed or changed
 
             case "copyFile":
                 # Copy file
+                source_file = (
+                    existing_files.get(value.get("srcPath"))
+                    if existing_files is not None
+                    else _UNSET_FILE
+                )
+                if source_file is not _UNSET_FILE and (
+                    source_file is None or source_file.is_deleted
+                ):
+                    source_file = None
                 changed = await process_copy_file(
                     dest_path=path,
                     src_path=value.get("srcPath"),
@@ -846,16 +1597,28 @@ async def commit(
                     repo=repo_row,
                     lakefs_repo=lakefs_repo,
                     revision=revision,
+                    file_mutations=file_mutations,
+                    source_file=source_file,
                 )
                 files_changed = files_changed or changed
 
+        index += 1
+
     # If no files changed, return early
     if not files_changed:
+        if intent is not None:
+            await operation_service.abandon_commit_intent(
+                intent.id, error_code="no_changes"
+            )
         try:
             branch = await client.get_branch(repository=lakefs_repo, branch=revision)
             commit_id = branch["commit_id"]
-        except Exception:
-            commit_id = "no-changes"
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                detail={"error": "commit_head_unavailable"},
+                headers={"Retry-After": "30"},
+            ) from exc
 
         commit_url = f"{build_public_repo_path(repo_type, repo_id)}/commit/{commit_id}"
 
@@ -865,60 +1628,112 @@ async def commit(
             "pullRequestUrl": None,
         }
 
+    # Do not publish a stale staging branch.  LakeFS currently does not expose
+    # an expected-head argument on this client, so this check is the local
+    # fail-closed CAS boundary used until a server-side conditional update is
+    # available.
+    try:
+        current_branch = await client.get_branch(
+            repository=lakefs_repo, branch=revision
+        )
+        if str(current_branch["commit_id"]) != base_head:
+            raise HTTPException(
+                409,
+                detail={"error": "Repository head changed during commit preparation"},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            detail={"error": "Unable to validate commit base head"},
+        ) from exc
+
+    postprocess_payload = {
+        "repository_id": repo_row.id,
+        "repo_type": repo_type.value,
+        "namespace": namespace,
+        "name": name,
+        "branch": revision,
+        "base_head": base_head,
+        "is_org": get_organization(namespace) is not None,
+        "lfs_tracking": pending_lfs_tracking,
+        "file_mutations": file_mutations,
+        "author_id": getattr(user, "id", None),
+        "owner_id": getattr(repo_row, "owner_id", None)
+        or getattr(getattr(repo_row, "owner", None), "id", None),
+        "username": user.username,
+        "message": header.get("summary", "Commit via API"),
+        "description": header.get("description", ""),
+        "lakefs_repo": lakefs_repo,
+        "is_private": bool(getattr(repo_row, "private", False)),
+        "quota_delta": int((intent.payload_json if intent else {}).get("quota_delta", 0)),
+        # Destructive legacy GC is explicitly unavailable to the PostgreSQL
+        # durable worker.  Only the SQLite compatibility path may opt in.
+        "allow_destructive_gc": cfg.app.db_backend != "postgres",
+    }
+    if intent is not None:
+        intent = await operation_service.update_prepared_commit_payload(
+            intent.id, payload=postprocess_payload
+        )
+
     # Create commit in LakeFS
     commit_msg = header.get("summary", "Commit via API")
     commit_desc = header.get("description", "")
     logger.info(f"Commit message: {commit_msg}")
 
+    if intent is not None:
+        await operation_service.mark_commit_intent_dispatch_started(intent.id)
+
     try:
-        commit_result = await client.commit(
+        commit_metadata = {
+            "description": commit_desc,
+        } if commit_desc else {}
+        if intent is not None:
+            commit_metadata.update(
+                {
+                    "khub_operation_id": str(intent.id),
+                    "khub_marker": intent.marker,
+                    "khub_payload_hash": intent.payload_hash,
+                }
+            )
+        commit_result = await mutation_gateway.commit(
+            client,
             repository=lakefs_repo,
             branch=revision,
             message=commit_msg,
-            metadata={"description": commit_desc} if commit_desc else None,
+            metadata=commit_metadata or None,
         )
     except Exception as e:
+        if intent is not None:
+            # A transport error after dispatch is ambiguous.  Preserve the
+            # intent and force callers through observation instead of a second
+            # LakeFS commit.
+            from httpx import HTTPStatusError
+
+            if isinstance(e, HTTPStatusError) and e.response.status_code in {
+                400,
+                404,
+                422,
+            }:
+                await operation_service.abandon_commit_intent(
+                    intent.id,
+                    error_code=f"lakefs_http_{e.response.status_code}",
+                    confirmed_no_effect=True,
+                )
+                raise HTTPException(
+                    e.response.status_code,
+                    detail={"error": "LakeFS rejected the commit"},
+                ) from e
+            raise HTTPException(
+                503,
+                detail={"error": "Commit result is being observed"},
+                headers={"Retry-After": "30"},
+            ) from e
         raise HTTPException(500, detail={"error": f"Commit failed: {str(e)}"})
 
-    # Poll to verify commit is accessible (LakeFS needs time to process large commits)
     commit_id = commit_result["id"]
-    logger.info(f"Verifying commit {commit_id[:8]} is accessible...")
-    max_attempts = 120
-    for attempt in range(max_attempts):
-        try:
-            await client.get_commit(repository=lakefs_repo, commit_id=commit_id)
-            logger.debug(
-                f"Commit {commit_id[:8]} verified after {attempt + 1} attempts"
-            )
-            break
-        except Exception as e:
-            if attempt < max_attempts - 1:
-                logger.debug(
-                    f"Commit not ready yet (attempt {attempt + 1}/{max_attempts}), waiting..."
-                )
-                await asyncio.sleep(0.5)  # Wait 500ms before retry
-            else:
-                logger.warning(
-                    f"Commit {commit_id[:8]} not accessible after {max_attempts} attempts, but continuing..."
-                )
-                break
-
-    # Record commit in our database (track the actual user)
-    try:
-        create_commit(
-            commit_id=commit_result["id"],
-            repository=repo_row,
-            repo_type=repo_type.value,
-            branch=revision,
-            author=user,
-            username=user.username,
-            message=commit_msg,
-            description=commit_desc,
-        )
-        logger.info(f"Recorded commit {commit_result['id'][:8]} by {user.username}")
-    except Exception as e:
-        logger.warning(f"Failed to record commit in database: {e}")
-        # Don't fail the commit if DB recording fails
+    logger.info(f"LakeFS accepted commit {commit_id[:8]}; visibility is reconciled asynchronously")
 
     # Generate commit URL
     commit_url = (
@@ -926,64 +1741,91 @@ async def commit(
     )
     logger.success(f"Commit URL: {commit_url}")
 
-    # Track LFS objects and run GC
-    if pending_lfs_tracking:
-        logger.info(
-            f"[COMMIT_LFS_TRACKING] Processing {len(pending_lfs_tracking)} LFS file(s) "
-            f"for commit {commit_result['id'][:8]}"
-        )
-        for lfs_info in pending_lfs_tracking:
-            logger.debug(
-                f"  - {lfs_info['path']}: sha256={lfs_info['sha256'][:8]}, size={lfs_info['size']:,}"
+    finalization_payload = dict(postprocess_payload)
+    finalization_payload["commit_id"] = commit_result["id"]
+    # A confirmed LakeFS commit is never converted into an HTTP failure if
+    # PostgreSQL finalization is temporarily unavailable.  The committed
+    # intent/marker is the recovery source and a later reaper must finalize it
+    # without dispatching LakeFS again.
+    if operation_service is not None and intent is not None:
+        try:
+            await operation_service.mark_commit_intent_committed(
+                intent.id,
+                lakefs_commit_id=commit_result["id"],
+                result_json={
+                    "commitUrl": commit_url,
+                    "commitOid": commit_result["id"],
+                    "pullRequestUrl": None,
+                },
             )
-
-            track_lfs_object(
-                repo_type=repo_type.value,
-                namespace=namespace,
-                name=name,
-                path_in_repo=lfs_info["path"],
-                sha256=lfs_info["sha256"],
-                size=lfs_info["size"],
-                commit_id=commit_result["id"],
+            await operation_service.finalize_commit_intent(
+                intent.id,
+                payload=finalization_payload,
+                result_json={
+                    "commitUrl": commit_url,
+                    "commitOid": commit_result["id"],
+                    "pullRequestUrl": None,
+                },
+                requested_by_user_id=getattr(user, "id", None),
+                idempotency_key=f"commit-postprocess:{commit_result['id']}",
             )
-
-            if cfg.app.lfs_auto_gc and lfs_info.get("old_sha256"):
-                deleted_count = run_gc_for_file(
-                    repo_type=repo_type.value,
-                    namespace=namespace,
-                    name=name,
-                    path_in_repo=lfs_info["path"],
-                    current_commit_id=commit_result["id"],
-                )
-                if deleted_count > 0:
-                    logger.info(
-                        f"GC: Cleaned up {deleted_count} old version(s) of {lfs_info['path']}"
-                    )
+        except IdempotencyConflict:
+            logger.error(
+                f"Commit post-process idempotency conflict for {commit_result['id'][:8]}"
+            )
+        except Exception as e:
+            logger.exception(
+                f"Commit finalization deferred for {commit_result['id'][:8]}: {e}"
+            )
+    elif operation_service is not None:
+        # Compatibility path for lightweight runtime test doubles.  Real
+        # PostgreSQL runtimes always expose commit intent methods.
+        try:
+            await operation_service.accept(
+                kind="commit.postprocess.v1",
+                resource_key=f"commit-postprocess:{repo_row.id}:{commit_result['id']}",
+                payload=finalization_payload,
+                requested_by_user_id=getattr(user, "id", None),
+                idempotency_key=f"commit-postprocess:{commit_result['id']}",
+                repository_id=repo_row.id,
+                expected_head=commit_result["id"],
+            )
+        except Exception as e:
+            logger.exception(
+                f"Failed to enqueue commit post-process for {commit_result['id'][:8]}: {e}"
+            )
     else:
-        logger.warning(
-            f"[COMMIT_LFS_TRACKING] No LFS files to track for commit {commit_result['id'][:8]}"
-        )
-
-    # Update storage usage for namespace and repository after successful commit
-    try:
-        # Recalculate repository storage (keeps repo.used_bytes accurate)
-        await update_repository_storage(repo_row)
-        logger.debug(
-            f"Updated repository storage for {repo_id}: {repo_row.used_bytes:,} bytes"
-        )
-
-        # Check if namespace is organization (User with is_org=True)
-        org = get_organization(namespace)
-        is_org = org is not None
-
-        # Recalculate namespace storage usage
-        await update_namespace_storage(namespace, is_org)
-        logger.debug(
-            f"Updated storage usage for {'org' if is_org else 'user'} {namespace}"
-        )
-    except Exception as e:
-        # Log error but don't fail the commit
-        logger.warning(f"Failed to update storage usage for {namespace}: {e}")
+        # ASGI unit tests and lightweight SQLite development do not enter the
+        # production lifespan. Keep that explicit path functional; production
+        # PostgreSQL requests always use the durable operation runtime.
+        try:
+            # Legacy SQLite/unit-test path: apply the same finalization after
+            # LakeFS success, preserving the old helper contract.
+            for mutation in file_mutations:
+                if mutation["action"] == "delete":
+                    _record_file_delete(None, repo=repo_row, path=mutation["path"])
+                else:
+                    _record_file_upsert(
+                        None,
+                        repo=repo_row,
+                        path=mutation["path"],
+                        size=mutation["size"],
+                        sha256=mutation["sha256"],
+                        lfs=mutation["lfs"],
+                    )
+            create_commit(
+                commit_id=commit_result["id"],
+                repository=repo_row,
+                repo_type=repo_type.value,
+                branch=revision,
+                author=user,
+                username=user.username,
+                message=commit_msg,
+                description=commit_desc,
+            )
+            await perform_commit_postprocess(finalization_payload)
+        except Exception as e:
+            logger.warning(f"Commit post-process fallback failed: {e}")
 
     return {
         "commitUrl": commit_url,

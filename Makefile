@@ -1,9 +1,15 @@
 SHELL := /bin/bash
 PYTHON ?= $(if $(wildcard ./venv/bin/python),./venv/bin/python,python)
 TEST_ROOT ?= test/kohakuhub
+MIGRATION_TEST_ROOT ?= test/migrations
 SOURCE_ROOT ?= src/kohakuhub
 RANGE_DIR ?=
 TEST_RANGE = $(if $(strip $(RANGE_DIR)),$(TEST_ROOT)/$(RANGE_DIR),$(TEST_ROOT))
+MIGRATION_TEST_PATHS = \
+	$(MIGRATION_TEST_ROOT)/test_db_migration_compatibility.py \
+	$(MIGRATION_TEST_ROOT)/test_legacy_migration_edge_cases.py \
+	$(MIGRATION_TEST_ROOT)/test_migration_history_matrix.py \
+	$(MIGRATION_TEST_ROOT)/test_operation_schema_contract.py
 COV_RANGE = $(if $(strip $(RANGE_DIR)),$(SOURCE_ROOT)/$(RANGE_DIR),$(SOURCE_ROOT))
 COV_FAIL_UNDER ?= $(if $(strip $(RANGE_DIR)),0,80)
 COV_TYPES ?= xml term-missing
@@ -15,8 +21,8 @@ UI_ADMIN_TEST_ROOT ?= test/kohaku-hub-admin
 
 .PHONY: help init-env install-backend install-frontend install infra-up infra-down \
 	backend seed-demo reset-local-data reset-and-seed ui ui-only admin status \
-	logs-postgres logs-minio logs-lakefs test test-backend test-ui test-ui-admin \
-	verify-seed-demo
+	logs-postgres logs-minio logs-lakefs test test-backend test-migrations test-ui test-ui-admin \
+	verify-seed-demo verify-migration-sequence
 
 help:
 	@echo "Local development targets:"
@@ -28,6 +34,7 @@ help:
 	@echo "  make infra-down       Stop local infra containers but keep persisted data"
 	@echo "  make seed-demo        Run migrations + first-run demo seed without starting uvicorn"
 	@echo "  make verify-seed-demo Verify the local demo seed fixtures without starting uvicorn"
+	@echo "  make verify-migration-sequence Check the numbered migration stream"
 	@echo "  make reset-local-data Dangerously clear local KohakuHub dev data through the local reset helper"
 	@echo "  make reset-and-seed   Reset persisted local data, then bootstrap fresh demo data"
 	@echo "  make backend          Run FastAPI backend in reload mode"
@@ -38,9 +45,10 @@ help:
 	@echo "                        Example: make test-backend RANGE_DIR=api"
 	@echo "                        Example: make test-backend RANGE_DIR=api/repo/routers"
 	@echo "                        Options: COV_TYPES='xml term-missing'"
+	@echo "  make test-migrations  Run historical migration and upgrade validation separately"
 	@echo "  make test-ui          Run the main UI Vitest suite with coverage"
 	@echo "  make test-ui-admin    Run the admin UI Vitest suite with coverage"
-	@echo "  make test             Run backend tests, then main UI tests, then admin UI tests"
+	@echo "  make test             Run backend, migration, and UI test suites"
 	@echo "  make status           Show local dev infra container status"
 	@echo "  make logs-postgres    Tail Postgres logs"
 	@echo "  make logs-minio       Tail MinIO logs"
@@ -125,6 +133,12 @@ test-backend:
 	fi
 	$(PYTHON) -m pytest $(TEST_RANGE) $(PYTEST_ARGS)
 
+test-migrations:
+	$(PYTHON) -m pytest $(MIGRATION_TEST_PATHS) $(MIGRATION_PYTEST_ARGS)
+
+verify-migration-sequence:
+	$(PYTHON) scripts/verify_migration_sequence.py
+
 test-ui:
 	@if [[ ! -d "$(UI_DIR)" ]]; then \
 		echo "Missing UI directory: $(UI_DIR)" >&2; \
@@ -147,7 +161,7 @@ test-ui-admin:
 	fi
 	pnpm run test:admin
 
-test: test-backend test-ui test-ui-admin
+test: test-backend test-migrations test-ui test-ui-admin
 
 status:
 	docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep 'kohakuhub-dev-' || true

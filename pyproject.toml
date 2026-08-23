@@ -43,6 +43,9 @@ dependencies = [
     "tomli; python_version < '3.11'",
     "uvicorn",
     "pillow",
+    "prometheus-client>=0.20,<1",
+    "procrastinate==3.9.0",
+    "psycopg[binary,pool]>=3.2,<4",
 ]
 urls = { "Homepage" = "https://kblueleaf.net/Kohaku-Hub" }
 

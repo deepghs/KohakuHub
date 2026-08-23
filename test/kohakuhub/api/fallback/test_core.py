@@ -602,6 +602,7 @@ async def test_probe_chain_resolve_postprocess_runs_follow_head_for_non_lfs(
     # Real values from follow-HEAD.
     assert headers.get("content-length") == "987654"
     assert headers.get("etag") == '"real-etag"'
+    assert headers.get("x-linked-size") == "987654"
     assert headers.get("x-repo-commit") == "deadbeef"
     # Location is now absolute (matches what hf_hub would actually follow).
     assert (

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from kohakuhub.config import cfg
-from kohakuhub.db import File, LFSObjectHistory, Repository
+from kohakuhub.db import File, LFSObjectHistory, Repository, db
 from kohakuhub.db_operations import (
     create_lfs_history,
     get_effective_lfs_keep_versions,
@@ -14,7 +14,12 @@ from kohakuhub.db_operations import (
 )
 from kohakuhub.logger import get_logger
 from kohakuhub.utils.lakefs import get_lakefs_client
-from kohakuhub.utils.s3 import delete_objects_with_prefix, get_s3_client, object_exists
+from kohakuhub.utils.s3 import get_s3_client, object_exists
+from kohakuhub import storage_deletion_gateway as deletion_gateway
+
+# Preserve the existing patch point while keeping the implementation in the
+# centralized deletion gateway.
+delete_objects_with_prefix = deletion_gateway.delete_prefix
 
 logger = get_logger("GC")
 
@@ -58,17 +63,40 @@ def track_lfs_object(
         (File.repository == repo) & (File.path_in_repo == path_in_repo)
     )
 
-    # Always create new LFS history entry with FK objects
-    create_lfs_history(
-        repository=repo,
-        path_in_repo=path_in_repo,
-        sha256=sha256,
-        size=size,
-        commit_id=commit_id,
-        file=file_fk,  # Optional FK for faster lookups
-    )
+    # Procrastinate delivery is at-least-once.  Serialize this exact business
+    # key on PostgreSQL and check before inserting so a worker crash after the
+    # insert but before the job acknowledgement cannot duplicate history.
+    # Real Repository rows always have a stable numeric id.  Keep the helper
+    # usable with the lightweight repository doubles used by unit tests and
+    # maintenance tooling without weakening the production lock key.
+    repository_key = getattr(repo, "id", None) or repo.full_id
+    key = f"khub-lfs-history:{repository_key}:{path_in_repo}:{sha256}:{commit_id}"
+    with db.atomic():
+        if cfg.app.db_backend == "postgres" and isinstance(
+            getattr(repo, "id", None), int
+        ):
+            db.execute_sql(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,)
+            )
+        existing = None
+        if isinstance(getattr(repo, "id", None), int):
+            existing = LFSObjectHistory.get_or_none(
+                (LFSObjectHistory.repository == repo)
+                & (LFSObjectHistory.path_in_repo == path_in_repo)
+                & (LFSObjectHistory.sha256 == sha256)
+                & (LFSObjectHistory.commit_id == commit_id)
+            )
+        if existing is None:
+            create_lfs_history(
+                repository=repo,
+                path_in_repo=path_in_repo,
+                sha256=sha256,
+                size=size,
+                commit_id=commit_id,
+                file=file_fk,  # Optional FK for faster lookups
+            )
     logger.success(
-        f"[TRACK_LFS_OBJECT_DONE] Created LFS history for {path_in_repo} "
+        f"[TRACK_LFS_OBJECT_DONE] Recorded LFS history for {path_in_repo} "
         f"(sha256={sha256[:8]}, commit={commit_id[:8]})"
     )
 
@@ -151,8 +179,6 @@ def cleanup_lfs_object(sha256: str, repo: Optional[Repository] = None) -> bool:
     query = File.select().where(
         (File.sha256 == sha256) & (File.lfs == True) & (File.is_deleted == False)
     )
-    if repo:
-        query = query.where(File.repository == repo)
 
     current_uses = query.count()
 
@@ -162,24 +188,25 @@ def cleanup_lfs_object(sha256: str, repo: Optional[Repository] = None) -> bool:
         )
         return False
 
-    # Check if this object is referenced in any commit history (other repos might use it)
-    if not repo:
-        # Global check across all repos
-        history_uses = (
-            LFSObjectHistory.select().where(LFSObjectHistory.sha256 == sha256).count()
-        )
+    # LFS blobs are globally addressed. A repo-scoped cleanup must still
+    # protect active/history references owned by every repository.
+    history_uses = (
+        LFSObjectHistory.select().where(LFSObjectHistory.sha256 == sha256).count()
+    )
 
-        if history_uses > 0:
-            logger.debug(
-                f"LFS object {sha256[:8]} in history ({history_uses} references), keeping"
-            )
-            return False
+    if history_uses > 0:
+        logger.debug(
+            f"LFS object {sha256[:8]} in history ({history_uses} references), keeping"
+        )
+        return False
 
     # Safe to delete from S3
     try:
         lfs_key = f"lfs/{sha256[:2]}/{sha256[2:4]}/{sha256}"
         s3_client = get_s3_client()
-        s3_client.delete_object(Bucket=cfg.s3.bucket, Key=lfs_key)
+        deletion_gateway.delete_object(
+            s3_client, Bucket=cfg.s3.bucket, Key=lfs_key
+        )
 
         logger.success(f"Deleted LFS object from S3: {lfs_key}")
 
@@ -628,7 +655,9 @@ async def cleanup_repository_storage(
 
     # 1. Delete repository folder in S3 (LakeFS data)
     repo_prefix = f"{lakefs_repo}/"
-    repo_objects_deleted = await delete_objects_with_prefix(cfg.s3.bucket, repo_prefix)
+    repo_objects_deleted = await delete_objects_with_prefix(
+        cfg.s3.bucket, repo_prefix
+    )
 
     logger.info(
         f"Deleted {repo_objects_deleted} repository object(s) from S3 prefix: {repo_prefix}"

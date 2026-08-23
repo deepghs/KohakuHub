@@ -17,6 +17,64 @@ from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
 logger = get_logger("QUOTA")
 
 
+def _load_repository_storage_metadata(
+    repository: Repository,
+) -> tuple[dict[str, bool], int, int]:
+    """Run the legacy Peewee scans on a worker thread.
+
+    The quota API is async, but Peewee queries are synchronous. Keeping these
+    scans in a small thread-boundary helper prevents a large repository's
+    post-commit recalculation from blocking the event loop that also drives
+    LakeFS I/O and worker heartbeats.
+    """
+
+    file_is_lfs = {
+        path: lfs
+        for path, lfs in File.select(File.path_in_repo, File.lfs)
+        .where((File.repository == repository) & (File.is_deleted == False))
+        .tuples()
+        .iterator()
+    }
+    lfs_total_bytes = (
+        LFSObjectHistory.select(fn.COALESCE(fn.SUM(LFSObjectHistory.size), 0))
+        .where(LFSObjectHistory.repository == repository)
+        .scalar()
+        or 0
+    )
+    unique_subquery = (
+        LFSObjectHistory.select(LFSObjectHistory.sha256, LFSObjectHistory.size)
+        .where(LFSObjectHistory.repository == repository)
+        .distinct()
+        .alias("u")
+    )
+    lfs_unique_bytes = (
+        LFSObjectHistory.select(fn.COALESCE(fn.SUM(unique_subquery.c.size), 0))
+        .from_(unique_subquery)
+        .scalar()
+        or 0
+    )
+    return file_is_lfs, int(lfs_total_bytes), int(lfs_unique_bytes)
+
+
+def _save_repository_storage(repo: Repository, total_bytes: int) -> None:
+    repo.used_bytes = total_bytes
+    repo.save()
+
+
+def _load_namespace_repositories(namespace: str) -> list[Repository]:
+    return list(Repository.select().where(Repository.namespace == namespace))
+
+
+def _save_namespace_storage(
+    namespace: str, is_org: bool, storage: dict[str, int]
+) -> None:
+    entity = get_organization(namespace) if is_org else User.get(User.username == namespace)
+    if entity:
+        entity.private_used_bytes = storage["private_bytes"]
+        entity.public_used_bytes = storage["public_bytes"]
+        entity.save()
+
+
 async def calculate_repository_storage(repo: Repository) -> dict[str, int]:
     """Calculate total storage usage for a repository.
 
@@ -46,13 +104,9 @@ async def calculate_repository_storage(repo: Repository) -> dict[str, int]:
     # so the per-object loop below is O(1) lookup instead of O(N) DB queries.
     # The (repository, path_in_repo) composite index makes this scan cheap
     # even for repos with tens of thousands of files.
-    file_is_lfs: dict[str, bool] = {
-        path: lfs
-        for path, lfs in File.select(File.path_in_repo, File.lfs)
-        .where((File.repository == repo) & (File.is_deleted == False))
-        .tuples()
-        .iterator()
-    }
+    file_is_lfs, lfs_total_bytes, lfs_unique_bytes = await asyncio.to_thread(
+        _load_repository_storage_metadata, repo
+    )
 
     # Calculate current branch storage (all files)
     current_branch_bytes = 0
@@ -98,31 +152,6 @@ async def calculate_repository_storage(repo: Repository) -> dict[str, int]:
     # Calculate non-LFS storage in current branch
     current_branch_non_lfs_bytes = current_branch_bytes - current_branch_lfs_bytes
 
-    # Calculate LFS storage from history (all versions, including deleted).
-    # SQL aggregation avoids pulling every history row into Python.
-    lfs_total_bytes = (
-        LFSObjectHistory.select(fn.COALESCE(fn.SUM(LFSObjectHistory.size), 0))
-        .where(LFSObjectHistory.repository == repo)
-        .scalar()
-        or 0
-    )
-
-    # Unique LFS storage: SUM over distinct (sha256, size) pairs for this repo.
-    # Built as a subquery so the SUM happens server-side instead of pulling
-    # every distinct row into Python.
-    unique_subquery = (
-        LFSObjectHistory.select(LFSObjectHistory.sha256, LFSObjectHistory.size)
-        .where(LFSObjectHistory.repository == repo)
-        .distinct()
-        .alias("u")
-    )
-    lfs_unique_bytes = (
-        LFSObjectHistory.select(fn.COALESCE(fn.SUM(unique_subquery.c.size), 0))
-        .from_(unique_subquery)
-        .scalar()
-        or 0
-    )
-
     # Total storage = non-LFS in current branch + unique LFS storage (deduplicated)
     # Using lfs_unique_bytes ensures global deduplication works correctly for quota
     # This avoids counting the same SHA256 object multiple times across versions
@@ -154,7 +183,7 @@ async def calculate_namespace_storage(
     """
 
     # Get all repositories in this namespace
-    repos = list(Repository.select().where(Repository.namespace == namespace))
+    repos = await asyncio.to_thread(_load_namespace_repositories, namespace)
 
     # Separate repos by privacy
     private_repos = [r for r in repos if r.private]
@@ -204,16 +233,7 @@ async def update_namespace_storage(
     """
     storage = await calculate_namespace_storage(namespace, is_org)
 
-    # Update database - organizations are now users with is_org=True
-    if is_org:
-        entity = get_organization(namespace)
-    else:
-        entity = User.get(User.username == namespace)
-
-    if entity:
-        entity.private_used_bytes = storage["private_bytes"]
-        entity.public_used_bytes = storage["public_bytes"]
-        entity.save()
+    await asyncio.to_thread(_save_namespace_storage, namespace, is_org, storage)
 
     return storage
 
@@ -546,9 +566,7 @@ async def update_repository_storage(repo: Repository) -> dict[str, int]:
     storage = await calculate_repository_storage(repo)
     total_bytes = storage["total_bytes"]
 
-    # Update repository used_bytes
-    repo.used_bytes = total_bytes
-    repo.save()
+    await asyncio.to_thread(_save_repository_storage, repo, total_bytes)
 
     logger.info(f"Updated storage for repository {repo.full_id}: {total_bytes:,} bytes")
 

@@ -37,9 +37,6 @@ from huggingface_hub import (
     hf_hub_download,
     snapshot_download,
 )
-from huggingface_hub.utils import (
-    RepositoryNotFoundError,
-)
 
 
 def _api(live_server_url: str, token: str) -> HfApi:
@@ -184,6 +181,10 @@ async def test_list_repo_tree_supports_pagination_over_many_entries(
         )
         for i in range(60)
     ]
+    # This must stay one commit: it is the production large-commit regression
+    # for the bounded staging concurrency path, not only a tree-pagination
+    # fixture. The client used by this matrix has a fixed 10-second read
+    # timeout, so the request itself is the performance acceptance criterion.
     await _run(
         api.create_commit,
         repo_id=repo_id,
@@ -271,16 +272,17 @@ async def test_file_exists_respects_explicit_revision(live_server_url, hf_api_to
 async def test_repo_info_raises_named_error_after_delete(
     live_server_url, hf_api_token
 ):
-    """After ``delete_repo``, ``repo_info`` must raise
-    ``RepositoryNotFoundError``, not a generic HTTPError — transformers /
-    diffusers branch on this specific exception subclass."""
+    """Production deletion stays fail-closed until durable cleanup lands."""
     api = _api(live_server_url, hf_api_token)
     repo_id = "owner/hf-surf-delete-reraise"
     await _run(api.create_repo, repo_id)
-    await _run(api.delete_repo, repo_id)
+    # ``huggingface_hub.errors`` is unavailable in the oldest supported
+    # client; ``utils`` remains the cross-version import path.
+    from huggingface_hub.utils import HfHubHTTPError
 
-    with pytest.raises(RepositoryNotFoundError):
-        await _run(api.repo_info, repo_id)
+    with pytest.raises(HfHubHTTPError, match="Service Unavailable"):
+        await _run(api.delete_repo, repo_id)
+    assert await _run(api.repo_exists, repo_id) is True
 
 
 async def test_create_commit_with_deleted_folder_op(live_server_url, hf_api_token):

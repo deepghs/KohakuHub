@@ -93,12 +93,19 @@ class _FakeFileModel:
 
 
 class _FakeRequest:
-    def __init__(self, body: bytes, query_params: dict | None = None):
+    def __init__(
+        self,
+        body: bytes,
+        query_params: dict | None = None,
+        app: object | None = None,
+    ):
         self._body = body
         # Real ``starlette.Request.query_params`` is a QueryParams object,
         # but everything the commit handler does with it goes through
         # ``.get(...)`` — a plain dict suffices for unit tests.
         self.query_params = query_params or {}
+        if app is not None:
+            self.app = app
 
     async def body(self):
         return self._body
@@ -185,6 +192,27 @@ def test_calculate_git_blob_sha1_matches_git_blob_format():
     digest = commit_ops.calculate_git_blob_sha1(content)
 
     assert digest == "95d09f2b10159347eece71399a7e2e907ea3df4f"
+
+
+def test_debug_commit_payload_logging_is_metadata_only(monkeypatch):
+    messages = []
+    monkeypatch.setattr(commit_ops.cfg.app, "debug_log_payloads", True)
+    monkeypatch.setattr(
+        commit_ops.logger,
+        "debug",
+        lambda *args, **kwargs: messages.append((args, kwargs)),
+    )
+
+    raw = b'{"key":"file","value":{"path":"private.txt","content":"secret"}}\n'
+    lines = raw.decode("utf-8").splitlines()
+    commit_ops._log_commit_payload_debug(lines, raw)
+
+    rendered = repr(messages)
+    assert "private.txt" not in rendered
+    assert "secret" not in rendered
+    assert messages == [
+        (("Commit payload received: {} lines, {} bytes", 1, len(raw)), {})
+    ]
 
 
 @pytest.mark.asyncio
@@ -362,8 +390,10 @@ async def test_process_deleted_file_and_folder_cover_success_partial_failures_an
     assert _FakeFileModel.update_query.where_calls
 
     client.raise_on["delete_object"] = RuntimeError("delete failed")
-    deleted = await commit_ops.process_deleted_file("README.md", repo, "lakefs", "main")
-    assert deleted is True
+    with pytest.raises(HTTPException) as delete_error:
+        await commit_ops.process_deleted_file("README.md", repo, "lakefs", "main")
+    assert delete_error.value.status_code == 502
+    assert len(_FakeFileModel.update_query.where_calls) == 1
     client.raise_on.pop("delete_object", None)
 
     client.list_payload = {
@@ -377,8 +407,9 @@ async def test_process_deleted_file_and_folder_cover_success_partial_failures_an
     assert folder_deleted is True
 
     client.raise_on["list_objects"] = RuntimeError("list failed")
-    folder_deleted = await commit_ops.process_deleted_folder("folder", repo, "lakefs", "main")
-    assert folder_deleted is True
+    with pytest.raises(HTTPException) as folder_error:
+        await commit_ops.process_deleted_folder("folder", repo, "lakefs", "main")
+    assert folder_error.value.status_code == 502
 
 
 @pytest.mark.asyncio
@@ -413,11 +444,11 @@ async def test_process_copy_file_covers_validation_success_and_error(monkeypatch
 @pytest.mark.asyncio
 async def test_commit_route_covers_parse_dispatch_noop_and_success_paths(monkeypatch):
     user = SimpleNamespace(username="owner")
-    repo = SimpleNamespace(owner=SimpleNamespace(username="owner"), used_bytes=0)
+    repo = SimpleNamespace(id=1, owner=SimpleNamespace(username="owner"), used_bytes=0)
     client = _FakeLakeFSClient()
     warnings = []
     tracked = []
-    gc_calls = []
+    postprocess_calls = []
 
     monkeypatch.setattr(commit_ops.Repository, "get_or_none", lambda *args: repo)
     monkeypatch.setattr(commit_ops, "check_repo_write_permission", lambda repo_arg, user_arg: None)
@@ -431,12 +462,13 @@ async def test_commit_route_covers_parse_dispatch_noop_and_success_paths(monkeyp
     monkeypatch.setattr(commit_ops, "process_deleted_file", lambda **kwargs: _async_return(True))
     monkeypatch.setattr(commit_ops, "process_deleted_folder", lambda **kwargs: _async_return(True))
     monkeypatch.setattr(commit_ops, "process_copy_file", lambda **kwargs: _async_return(True))
-    monkeypatch.setattr(commit_ops, "track_lfs_object", lambda **kwargs: tracked.append(kwargs))
-    monkeypatch.setattr(commit_ops, "run_gc_for_file", lambda **kwargs: gc_calls.append(kwargs) or 1)
     monkeypatch.setattr(commit_ops, "create_commit", lambda **kwargs: tracked.append({"commit": kwargs["commit_id"]}))
-    monkeypatch.setattr(commit_ops, "update_repository_storage", lambda repo_arg: _async_return(None))
     monkeypatch.setattr(commit_ops, "get_organization", lambda namespace: None)
-    monkeypatch.setattr(commit_ops, "update_namespace_storage", lambda namespace, is_org: _async_return(None))
+    monkeypatch.setattr(
+        commit_ops,
+        "perform_commit_postprocess",
+        lambda payload: postprocess_calls.append(payload) or _async_return({}),
+    )
     monkeypatch.setattr(commit_ops.logger, "warning", lambda message: warnings.append(message))
 
     monkeypatch.setattr(commit_ops.Repository, "get_or_none", lambda *args: None)
@@ -484,7 +516,8 @@ async def test_commit_route_covers_parse_dispatch_noop_and_success_paths(monkeyp
     assert success_response["commitOid"] == "commit-created"
     assert success_response["commitUrl"] == "models/owner/repo/commit/commit-created"
     assert tracked
-    assert gc_calls
+    assert postprocess_calls[-1]["commit_id"] == "commit-created"
+    assert postprocess_calls[-1]["lfs_tracking"]
 
     client.raise_on["commit"] = RuntimeError("commit failed")
     with pytest.raises(HTTPException) as commit_failed:
@@ -493,7 +526,75 @@ async def test_commit_route_covers_parse_dispatch_noop_and_success_paths(monkeyp
 
     client.raise_on.pop("commit", None)
     monkeypatch.setattr(commit_ops, "process_lfs_file", lambda **kwargs: _async_return((False, None)))
-    monkeypatch.setattr(commit_ops, "update_repository_storage", lambda repo_arg: (_ for _ in ()).throw(RuntimeError("storage failed")))
+    monkeypatch.setattr(
+        commit_ops,
+        "perform_commit_postprocess",
+        lambda payload: (_ for _ in ()).throw(RuntimeError("postprocess failed")),
+    )
     success_without_lfs = await commit_ops.commit(commit_ops.RepoType.model, "owner", "repo", "main", _FakeRequest(success_payload), user=user)
     assert success_without_lfs["commitOid"] == "commit-created"
-    assert any("No LFS files to track" in message for message in warnings)
+    assert any("returned NO tracking info" in message for message in warnings)
+    assert any("post-process fallback failed" in message for message in warnings)
+
+
+@pytest.mark.asyncio
+async def test_commit_route_enqueues_postprocess_when_runtime_is_available(monkeypatch):
+    user = SimpleNamespace(id=7, username="owner")
+    repo = SimpleNamespace(id=1, owner=SimpleNamespace(username="owner"))
+    client = _FakeLakeFSClient()
+    accepted = []
+
+    async def accept(**kwargs):
+        accepted.append(kwargs)
+        return SimpleNamespace()
+
+    runtime = SimpleNamespace(
+        service=SimpleNamespace(accept=accept),
+    )
+    request = _FakeRequest(
+        b"\n".join(
+            [
+                json.dumps(
+                    {"key": "header", "value": {"summary": "queued"}}
+                ).encode("utf-8"),
+                json.dumps(
+                    {
+                        "key": "file",
+                        "value": {
+                            "path": "README.md",
+                            "content": "aGVsbG8=",
+                            "encoding": "base64",
+                        },
+                    }
+                ).encode("utf-8"),
+            ]
+        ),
+        app=SimpleNamespace(state=SimpleNamespace(operation_runtime=runtime)),
+    )
+
+    monkeypatch.setattr(commit_ops.Repository, "get_or_none", lambda *args: repo)
+    monkeypatch.setattr(commit_ops, "check_repo_write_permission", lambda *args: None)
+    monkeypatch.setattr(commit_ops, "resolve_lakefs_repo", lambda _repo: "model-owner-repo")
+    monkeypatch.setattr(commit_ops, "get_lakefs_client", lambda: client)
+    monkeypatch.setattr(commit_ops, "process_regular_file", lambda **kwargs: _async_return(True))
+    monkeypatch.setattr(commit_ops, "create_commit", lambda **kwargs: None)
+    monkeypatch.setattr(commit_ops, "get_organization", lambda _namespace: None)
+    monkeypatch.setattr(
+        commit_ops,
+        "perform_commit_postprocess",
+        lambda _payload: (_ for _ in ()).throw(AssertionError("inline fallback used")),
+    )
+
+    response = await commit_ops.commit(
+        commit_ops.RepoType.model,
+        "owner",
+        "repo",
+        "main",
+        request,
+        user=user,
+    )
+
+    assert response["commitOid"] == "commit-created"
+    assert len(accepted) == 1
+    assert accepted[0]["kind"] == "commit.postprocess.v1"
+    assert accepted[0]["repository_id"] == 1

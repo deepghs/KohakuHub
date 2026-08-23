@@ -14,17 +14,45 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from kohakuhub.async_utils import run_in_s3_executor
 from kohakuhub.config import cfg
+from kohakuhub.db import Repository
 from kohakuhub.db_operations import (
     cleanup_expired_confirmation_tokens,
     consume_confirmation_token,
     create_confirmation_token,
 )
 from kohakuhub.logger import get_logger
-from kohakuhub.utils.s3 import delete_objects_with_prefix, get_s3_client
+from kohakuhub.utils.s3 import get_s3_client
+from kohakuhub import storage_deletion_gateway as deletion_gateway
 from kohakuhub.api.admin.utils import verify_admin_token
 
 logger = get_logger("ADMIN")
 router = APIRouter()
+
+
+def _reject_managed_delete_scope(prefix: str) -> None:
+    """Keep the raw admin browser from deleting KHub-owned storage."""
+
+    normalized = prefix.strip().strip("/")
+    if not normalized or normalized == "lfs" or normalized.startswith("lfs/"):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "managed_storage_requires_durable_cleanup"},
+        )
+    managed = [
+        str(row.lakefs_repo).strip().strip("/")
+        for row in Repository.select(Repository.lakefs_repo)
+        if row.lakefs_repo
+    ]
+    if any(
+        normalized == value
+        or normalized.startswith(f"{value}/")
+        or value.startswith(f"{normalized}/")
+        for value in managed
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "managed_storage_requires_durable_cleanup"},
+        )
 
 
 @router.get("/storage/debug")
@@ -366,9 +394,11 @@ async def delete_s3_object(
         Success message
     """
 
+    _reject_managed_delete_scope(key)
+
     def _delete():
         s3 = get_s3_client()
-        s3.delete_object(Bucket=cfg.s3.bucket, Key=key)
+        deletion_gateway.delete_object(s3, Bucket=cfg.s3.bucket, Key=key)
         return {"deleted": 1}
 
     result = await run_in_s3_executor(_delete)
@@ -395,6 +425,8 @@ async def prepare_delete_prefix(
     Returns:
         Confirmation token, prefix, estimated count, expiration
     """
+
+    _reject_managed_delete_scope(prefix)
 
     # Handle R2 path-in-endpoint (same logic as list_objects)
     parsed = urlparse(cfg.s3.endpoint)
@@ -494,6 +526,8 @@ async def delete_s3_prefix(
     if action_data.get("display_prefix") != prefix:
         raise HTTPException(400, detail="Prefix mismatch with confirmation token")
 
+    _reject_managed_delete_scope(str(action_data.get("display_prefix") or ""))
+
     # Use actual S3 prefix and bucket from token (handles R2 path-in-endpoint)
     actual_prefix = action_data.get("actual_prefix")
     actual_bucket = action_data.get("actual_bucket")
@@ -536,7 +570,8 @@ async def delete_s3_prefix(
 
             # Delete batch (max 1000 objects)
             delete_keys = [{"Key": obj["Key"]} for obj in page["Contents"]]
-            response = s3.delete_objects(
+            response = deletion_gateway.delete_objects(
+                s3,
                 Bucket=actual_bucket,
                 Delete={"Objects": delete_keys, "Quiet": True},
             )

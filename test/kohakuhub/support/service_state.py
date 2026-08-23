@@ -207,6 +207,15 @@ class ServiceTestState:
             if objects:
                 self.s3_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
 
+    async def _close_handler_lakefs_client(self) -> None:
+        """Close the handler pool before a test event loop is discarded."""
+
+        module = self.modules.lakefs_rest_client_module
+        client = module._singleton_client
+        module._singleton_client = None
+        if client is not None:
+            await client.aclose()
+
     async def _list_lakefs_repositories(self) -> list[dict[str, Any]]:
         repos: list[dict[str, Any]] = []
         after: str | None = None
@@ -290,7 +299,7 @@ class ServiceTestState:
         # (The dedicated ``self.lakefs_client`` is *not* used through the
         # pool by this state plumbing — see ``_clear_lakefs`` for the raw
         # per-call ``httpx.AsyncClient`` form.)
-        self.modules.lakefs_rest_client_module._singleton_client = None
+        await self._close_handler_lakefs_client()
 
         report("clearing LakeFS repositories")
         await self._clear_lakefs()
@@ -300,21 +309,46 @@ class ServiceTestState:
         self._reset_database()
         report("rebuilding the database schema")
         self.modules.db_module.init_db()
+        # Live-server tests enter FastAPI lifespan, which now opens the
+        # operation enqueue pool. Prepare the same durable worker schema as
+        # production without moving DDL back into API imports.
+        from scripts.khub_migrate import migrate as migrate_worker_schema
+
+        migrate_worker_schema()
         report("initializing the storage bucket")
         self.modules.s3_module.init_storage()
+        # This ASGI transport does not run FastAPI lifespan.  A prior live
+        # server test may nevertheless have left the reusable app with the
+        # lifespan-owned attribute set to None after closing its runtime.
+        # Remove that stale marker so the seed exercises the documented
+        # SQLite/unit-test compatibility path instead of production fail
+        # closed fencing.
+        self.modules.app.state._state.pop("operation_runtime", None)
+        self.modules.app.state._khub_test_compatibility = True
         transport = httpx.ASGITransport(app=self.modules.app)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://testserver",
-            follow_redirects=False,
-        ) as client:
-            report("seeding the backend baseline")
-            await build_baseline(
-                client,
-                self.s3_client,
-                self.modules.config_module.cfg,
-            )
+        previous_db_backend = self.modules.config_module.cfg.app.db_backend
+        # The seed intentionally exercises the direct SQLite/unit-test
+        # compatibility path without a lifespan-owned operation runtime.
+        self.modules.config_module.cfg.app.db_backend = "sqlite"
+        from kohakuhub import lakefs_mutation_gateway
+
+        try:
+            with lakefs_mutation_gateway.test_compatibility():
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                    follow_redirects=False,
+                ) as client:
+                    report("seeding the backend baseline")
+                    await build_baseline(
+                        client,
+                        self.s3_client,
+                        self.modules.config_module.cfg,
+                    )
+        finally:
+            self.modules.config_module.cfg.app.db_backend = previous_db_backend
         self.modules.fallback_cache_module.get_cache().clear()
+        await self._close_handler_lakefs_client()
         report("baseline restore completed")
 
     async def prepare(self) -> None:

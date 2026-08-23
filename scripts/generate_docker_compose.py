@@ -88,6 +88,11 @@ def generate_postgres_service(config: dict) -> str:
       - "25432:5432" # Optional: for external access
     volumes:
       - ./hub-meta/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${{POSTGRES_USER}} -d $${{POSTGRES_DB}}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 """
     return ""
 
@@ -108,6 +113,11 @@ def generate_minio_service(config: dict) -> str:
     volumes:
       - ./hub-storage/minio-data:/data
       - ./hub-meta/minio-data:/root/.minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 """
     return ""
 
@@ -252,12 +262,17 @@ def generate_lakefs_service(config: dict) -> str:
     user: "${{UID}}:${{GID}}"
 {depends_on_str}    volumes:
 {volumes_config}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:28000/_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 {lakefs_networks_str}"""
 
 
 def generate_hub_api_service(config: dict) -> str:
     """Generate hub-api service configuration."""
-    depends_on = ["lakefs"]
+    depends_on = ["khub-migrate", "lakefs"]
 
     if config["postgres_builtin"]:
         depends_on.insert(0, "postgres")
@@ -270,7 +285,12 @@ def generate_hub_api_service(config: dict) -> str:
 
     depends_on_str = "    depends_on:\n"
     for dep in depends_on:
-        depends_on_str += f"      - {dep}\n"
+        condition = (
+            "service_completed_successfully"
+            if dep == "khub-migrate"
+            else "service_healthy"
+        )
+        depends_on_str += f"      {dep}:\n        condition: {condition}\n"
 
     # Add external network if needed (for external postgres or s3)
     networks_str = ""
@@ -366,7 +386,7 @@ def generate_hub_api_service(config: dict) -> str:
       - KOHAKU_HUB_LFS_MULTIPART_CHUNK_SIZE_BYTES=50_000_000 # 50MB - size of each part (min 5MB except last)
       - KOHAKU_HUB_LFS_KEEP_VERSIONS=5
       - KOHAKU_HUB_LFS_AUTO_GC=true
-      - KOHAKU_HUB_AUTO_MIGRATE=true # Auto-confirm database migrations (required for Docker)
+      - KOHAKU_HUB_AUTO_MIGRATE=false # Schema is applied by the one-shot migration service
       - KOHAKU_HUB_LOG_LEVEL=INFO
       - KOHAKU_HUB_LOG_FORMAT=terminal
       - KOHAKU_HUB_LOG_DIR=logs/
@@ -393,7 +413,121 @@ def generate_hub_api_service(config: dict) -> str:
       - KOHAKU_HUB_DEFAULT_ORG_PUBLIC_QUOTA_BYTES=100_000_000{garage_config_section}
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:48888/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 12
 {networks_str}"""
+
+
+def _database_url(config: dict) -> str:
+    if config["postgres_builtin"]:
+        return (
+            f"postgresql://{config['postgres_user']}:{config['postgres_password']}"
+            f"@postgres:5432/{config['postgres_db']}"
+        )
+    return (
+        f"postgresql://{config['postgres_user']}:{config['postgres_password']}"
+        f"@{config['postgres_host']}:{config['postgres_port']}/{config['postgres_db']}"
+    )
+
+
+def generate_khub_migrate_service(config: dict) -> str:
+    """Generate the one-shot service that runs the numbered migration chain."""
+    depends_on = ""
+    if config["postgres_builtin"]:
+        depends_on = (
+            "    depends_on:\n"
+            "      postgres:\n"
+            "        condition: service_healthy\n"
+        )
+    networks = ""
+    if config.get("external_network") and not config["postgres_builtin"]:
+        networks = f"    networks:\n      - default\n      - {config['external_network']}\n"
+    return f"""  khub-migrate:
+    build: .
+    container_name: khub-migrate
+    restart: \"no\"
+    command: [\"python\", \"scripts/run_migrations.py\"]
+{depends_on}    environment:
+      - KOHAKU_HUB_DB_BACKEND=postgres
+      - KOHAKU_HUB_DATABASE_URL={_database_url(config)}
+      # khub-migrate is non-interactive and must confirm the historical 008
+      # upgrade when an older database is being brought to migration 017.
+      - KOHAKU_HUB_AUTO_MIGRATE=true
+{networks}"""
+
+
+def generate_khub_worker_service(config: dict) -> str:
+    """Generate the single durable worker service with all queue lanes."""
+    depends_on = ["khub-migrate", "hub-api", "lakefs"]
+    if config["s3_builtin"]:
+        depends_on.append("garage" if config.get("s3_provider") == "garage" else "minio")
+    depends_on_str = "    depends_on:\n" + "".join(
+        f"      {dependency}:\n        condition: "
+        f"{'service_completed_successfully' if dependency == 'khub-migrate' else 'service_healthy'}\n"
+        for dependency in depends_on
+    )
+    networks = ""
+    if config.get("external_network") and (
+        not config["postgres_builtin"] or not config["s3_builtin"]
+    ):
+        networks = f"    networks:\n      - default\n      - {config['external_network']}\n"
+    if config["s3_builtin"] and config.get("s3_provider") == "garage":
+        s3_endpoint = "http://garage:39000"
+        region = "garage"
+    elif config["s3_builtin"]:
+        s3_endpoint = "http://minio:9000"
+        region = "us-east-1"
+    else:
+        s3_endpoint = config["s3_endpoint"]
+        region = config.get("s3_region", "us-east-1")
+    return f"""  khub-worker:
+    build: .
+    container_name: khub-worker
+    restart: always
+    command: [\"python\", \"docker/worker_startup.py\"]
+{depends_on_str}    environment:
+      - KOHAKU_HUB_DB_BACKEND=postgres
+      - KOHAKU_HUB_DATABASE_URL={_database_url(config)}
+      - KOHAKU_HUB_WORKER_POOL_MIN=1
+      - KOHAKU_HUB_WORKER_POOL_MAX=8
+      - KOHAKU_HUB_WORKER_STARTUP_TIMEOUT_SECONDS=60
+      - KOHAKU_HUB_OPERATION_RETENTION_HOURS=168
+      - KOHAKU_HUB_OPERATION_RETENTION_BATCH=100
+      - KOHAKU_HUB_WORKER_METRICS_HOST=0.0.0.0
+      - KOHAKU_HUB_WORKER_METRICS_PORT=9108
+      - KOHAKU_HUB_LAKEFS_ENDPOINT=http://lakefs:28000
+      - KOHAKU_HUB_LAKEFS_REPO_NAMESPACE=hf
+      - KOHAKU_HUB_S3_ENDPOINT={s3_endpoint}
+      - KOHAKU_HUB_S3_ACCESS_KEY={config['s3_access_key']}
+      - KOHAKU_HUB_S3_SECRET_KEY={config['s3_secret_key']}
+      - KOHAKU_HUB_S3_BUCKET={config['s3_bucket']}
+      - KOHAKU_HUB_S3_REGION={region}
+    expose:
+      - \"9108\"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:9108/readyz', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    volumes:
+      - ./hub-meta/hub-api:/hub-api-creds:ro
+{networks}"""
 
 
 def generate_hub_ui_service() -> str:
@@ -420,6 +554,8 @@ def generate_docker_compose(config: dict) -> str:
     # Add services in order
     services.append(generate_hub_ui_service())
     services.append(generate_hub_api_service(config))
+    services.append(generate_khub_migrate_service(config))
+    services.append(generate_khub_worker_service(config))
 
     if config["s3_builtin"]:
         if config.get("s3_provider") == "garage":
