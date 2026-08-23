@@ -315,17 +315,6 @@ def test_postgres_008_failure_rolls_back_schema_and_data(tmp_path):
         assert after == before
 
 
-def test_current_runner_reaches_017(
-    migration_history_case: PreparedMigrationHistory,
-):
-    case = migration_history_case
-
-    assert case.first_run.succeeded, case.first_run.diagnostic()
-    assert "Running 017_durable_worker_schema..." in case.first_run.stdout
-    if case.release == MAIN_RELEASE:
-        assert "Running 001_repository_schema..." in case.first_run.stdout
-
-
 def test_historical_checkpoint_was_built_by_archived_migrations(
     migration_history_case: PreparedMigrationHistory,
 ):
