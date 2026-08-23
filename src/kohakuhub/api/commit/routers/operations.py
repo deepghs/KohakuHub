@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import weakref
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -38,12 +39,24 @@ from kohakuhub.operations.service import (
 
 logger = get_logger("FILE")
 router = APIRouter()
-# LakeFS stages one object per request. Sixteen concurrent uploads keep a
-# large commit within the Hugging Face client's short request budget while
-# staying below the per-process LakeFS HTTP connection pool (64). The
-# semaphore still bounds pressure from a single commit; branch HEAD/commit
-# calls use the remaining pool capacity.
-COMMIT_STAGE_CONCURRENCY = 16
+# LakeFS stages one object per request. Four concurrent uploads keep a large
+# commit within the Hugging Face client's short request budget while leaving
+# enough of the per-process LakeFS HTTP pool for control calls.
+# The semaphore is shared by commits on the same event loop so concurrent
+# repositories cannot each consume the entire LakeFS pool.
+COMMIT_STAGE_CONCURRENCY = 4
+_STAGE_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _commit_stage_semaphore() -> asyncio.Semaphore:
+    """Return the staging budget shared by commits on this event loop."""
+
+    loop = asyncio.get_running_loop()
+    semaphore = _STAGE_SEMAPHORES.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(COMMIT_STAGE_CONCURRENCY)
+        _STAGE_SEMAPHORES[loop] = semaphore
+    return semaphore
 
 
 def _staging_paths_are_independent(paths: list[str | None]) -> bool:
@@ -1386,7 +1399,7 @@ async def _commit_unlocked(
     # route wrapper is held for this complete staging and commit sequence.
 
     index = 0
-    stage_semaphore = asyncio.Semaphore(COMMIT_STAGE_CONCURRENCY)
+    stage_semaphore = _commit_stage_semaphore()
     while index < len(operations):
         op = operations[index]
         key = op["key"]

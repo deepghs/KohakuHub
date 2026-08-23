@@ -23,10 +23,9 @@ from kohakuhub.logger import get_logger
 logger = get_logger("LAKEFS_REST")
 
 
-# httpx.Limits values picked so a single FastAPI worker can sustain
-# ~16-way concurrent LakeFS calls (see LAST_COMMIT_LOOKUP_CONCURRENCY in
-# tree.py) with headroom for the rest of the request volume. Conservative
-# — bumping them is safe if a deployment fans out heavier.
+# httpx.Limits values leave headroom for control and read calls while the
+# commit route uses a shared four-request staging budget per event loop. The
+# limits are per FastAPI worker because each worker owns one client instance.
 _HTTPX_LIMITS = httpx.Limits(
     max_connections=64,
     max_keepalive_connections=32,

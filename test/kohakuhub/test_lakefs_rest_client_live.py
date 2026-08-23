@@ -27,6 +27,7 @@ import asyncio
 import sys
 
 import pytest
+import pytest_asyncio
 
 
 # Seed fixture: ``owner/demo-model`` is planted by the standard test
@@ -58,23 +59,20 @@ def _demo_lakefs_repo() -> str:
     )
 
 
-@pytest.fixture(autouse=True)
-def _drop_singleton_before_each_test():
+@pytest_asyncio.fixture(autouse=True)
+async def _drop_singleton_before_each_test():
     """httpx.AsyncClient connections bind to the event loop they were
     constructed in. pytest-asyncio gives each test its own loop, so a
     singleton constructed in test A is unusable in test B — we'd hit
     ``RuntimeError: Event loop is closed`` when the GC runs.
 
-    Hard-reset the module-level cache by NULLing the reference. We
-    deliberately do NOT call ``aclose()`` on the leftover instance: that
-    would try to schedule work on the (now-closed) previous loop and
-    raise. Letting GC handle the dangling client is fine for tests; the
-    OS reclaims the sockets.
+    Close the previous pool on the current test loop before replacing it, so
+    a long backend suite does not accumulate keep-alive sockets in LakeFS.
     """
     mod = _live_module()
-    mod._singleton_client = None
+    await mod.close_lakefs_rest_client()
     yield
-    mod._singleton_client = None
+    await mod.close_lakefs_rest_client()
 
 
 @pytest.mark.asyncio

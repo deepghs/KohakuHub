@@ -207,6 +207,15 @@ class ServiceTestState:
             if objects:
                 self.s3_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
 
+    async def _close_handler_lakefs_client(self) -> None:
+        """Close the handler pool before a test event loop is discarded."""
+
+        module = self.modules.lakefs_rest_client_module
+        client = module._singleton_client
+        module._singleton_client = None
+        if client is not None:
+            await client.aclose()
+
     async def _list_lakefs_repositories(self) -> list[dict[str, Any]]:
         repos: list[dict[str, Any]] = []
         after: str | None = None
@@ -290,7 +299,7 @@ class ServiceTestState:
         # (The dedicated ``self.lakefs_client`` is *not* used through the
         # pool by this state plumbing — see ``_clear_lakefs`` for the raw
         # per-call ``httpx.AsyncClient`` form.)
-        self.modules.lakefs_rest_client_module._singleton_client = None
+        await self._close_handler_lakefs_client()
 
         report("clearing LakeFS repositories")
         await self._clear_lakefs()
@@ -339,6 +348,7 @@ class ServiceTestState:
         finally:
             self.modules.config_module.cfg.app.db_backend = previous_db_backend
         self.modules.fallback_cache_module.get_cache().clear()
+        await self._close_handler_lakefs_client()
         report("baseline restore completed")
 
     async def prepare(self) -> None:
