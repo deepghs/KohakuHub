@@ -217,6 +217,27 @@ async def verify_seed_data() -> dict:
                 )
             summary["verified_checks"].append("fallback sources available")
 
+        expected_tasks = sorted(
+            (task["kind"], task["status"]) for task in manifest.get("background_tasks", [])
+        )
+        if expected_tasks:
+            response = await client.get(
+                "/admin/api/tasks",
+                params={"limit": 500},
+                headers={"X-Admin-Token": cfg.admin.secret_token},
+            )
+            response.raise_for_status()
+            seeded_tasks = sorted(
+                (task["kind"], task["status"])
+                for task in response.json()["tasks"]
+                if task["kind"].startswith("demo.")
+            )
+            if seeded_tasks != expected_tasks:
+                raise VerifyError(
+                    f"Seeded background tasks differ: expected {expected_tasks}, found {seeded_tasks}"
+                )
+            summary["verified_checks"].append("background task examples")
+
     return summary
 
 

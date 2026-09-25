@@ -4612,6 +4612,88 @@ def plant_seed_tokens() -> None:
         )
 
 
+# Example rows for the admin "Background Tasks" page. The ``demo.`` kinds are
+# never registered as handlers, so workers leave every row exactly as
+# planted: one of each state the page can show. Offsets are minutes
+# relative to seeding time; payload repo ids are filled in at plant time.
+SEED_BACKGROUND_TASKS: tuple[dict, ...] = (
+    {"kind": "demo.recalculate_repo_storage", "status": "succeeded", "attempts": 1,
+     "created": -52, "started": -52, "finished": -51, "repo": 0},
+    {"kind": "demo.aggregate_download_sessions", "status": "succeeded", "attempts": 1,
+     "created": -34, "started": -34, "finished": -33, "repo": 1},
+    {"kind": "demo.lfs_gc", "status": "succeeded", "attempts": 2,
+     "created": -20, "started": -18, "finished": -17, "repo": 2},
+    {"kind": "demo.recalculate_repo_storage", "status": "failed", "attempts": 5,
+     "created": -45, "started": -13, "finished": -12, "repo": 1,
+     "last_error": (
+         "RuntimeError: LakeFS returned 503 Service Unavailable while listing objects\n"
+         "  GET /api/v1/repositories/{repo}/refs/main/objects/ls?amount=1000\n"
+         "  retry budget exhausted after 5 attempts"
+     )},
+    {"kind": "demo.mirror_sync", "queue": "sync", "status": "failed", "attempts": 1,
+     "created": -125, "started": -125, "finished": -124,
+     "payload": {"source": "huggingface", "upstream": "openai/whisper-tiny.en-archived"},
+     "last_error": "PermanentTaskError: upstream repository openai/whisper-tiny.en-archived no longer exists"},
+    {"kind": "demo.recalculate_repo_storage", "status": "queued", "attempts": 0,
+     "created": -1, "run_after": 0, "repo": 2, "dedupe": "repo-storage"},
+    {"kind": "demo.mirror_sync", "queue": "sync", "status": "queued", "attempts": 0,
+     "created": -5, "run_after": 120,
+     "payload": {"source": "huggingface", "upstream": "Qwen/Qwen2.5-0.5B"}},
+    {"kind": "demo.lfs_gc", "status": "queued", "attempts": 2, "priority": 10,
+     "created": -9, "run_after": 2, "repo": 0,
+     "last_error": "ConnectError: [Errno 111] Connection refused (s3 endpoint)"},
+    {"kind": "demo.rebuild_search_index", "status": "running", "attempts": 1,
+     "created": -3, "started": -3, "lease": 720, "worker": "seed-worker:4242:3f9a1c2e",
+     "payload": {"scope": "models"}},
+    {"kind": "demo.mirror_sync", "queue": "sync", "status": "running", "attempts": 1,
+     "created": -26, "started": -25, "lease": -10, "worker": "seed-worker:4111:0dd1ba5e",
+     "payload": {"source": "huggingface", "upstream": "bigscience/bloom-560m"}},
+)
+
+
+def plant_seed_background_tasks() -> None:
+    """Insert the example background tasks directly into the database."""
+    from datetime import timedelta
+
+    from kohakuhub.db import BackgroundTask, Repository, utcnow
+
+    if BackgroundTask.select().where(BackgroundTask.kind.startswith("demo.")).exists():
+        return  # idempotent, like plant_seed_tokens
+
+    now = utcnow()
+    repos = list(Repository.select().order_by(Repository.id).limit(3))
+    if len(repos) < 3:
+        raise SeedError("plant background tasks needs at least three seeded repositories")
+
+    def at(minutes: int | None):
+        return None if minutes is None else now + timedelta(minutes=minutes)
+
+    for spec in SEED_BACKGROUND_TASKS:
+        repo = repos[spec["repo"]] if "repo" in spec else None
+        payload = spec.get("payload") or {"repo_id": repo.id}
+        BackgroundTask.create(
+            kind=spec["kind"],
+            queue=spec.get("queue", "default"),
+            payload=json.dumps(payload),
+            status=spec["status"],
+            priority=spec.get("priority", 0),
+            dedupe_key=f"{spec['dedupe']}:{repo.id}" if "dedupe" in spec else None,
+            run_after=at(spec.get("run_after", spec["created"])),
+            attempts=spec["attempts"],
+            max_attempts=5,
+            locked_by=spec.get("worker"),
+            locked_until=at(spec.get("lease")),
+            last_error=(
+                spec["last_error"].replace("{repo}", repo.lakefs_repo or repo.name)
+                if "last_error" in spec and repo is not None
+                else spec.get("last_error")
+            ),
+            created_at=at(spec["created"]),
+            started_at=at(spec.get("started")),
+            finished_at=at(spec.get("finished")),
+        )
+
+
 async def plant_seed_ssh_keys(
     authed_clients: dict[str, httpx.AsyncClient],
 ) -> None:
@@ -5154,6 +5236,10 @@ def build_manifest() -> dict:
             }
             for spec in SEED_SSH_KEY_PLANTS
         ],
+        "background_tasks": [
+            {"kind": spec["kind"], "status": spec["status"]}
+            for spec in SEED_BACKGROUND_TASKS
+        ],
     }
 
 
@@ -5240,6 +5326,7 @@ async def seed_demo_data() -> None:
             await like_repo(authed_clients[liker], repo_type, namespace, name)
 
         plant_seed_tokens()
+        plant_seed_background_tasks()
         await plant_seed_ssh_keys(authed_clients)
 
         anon_client = await stack.enter_async_context(
