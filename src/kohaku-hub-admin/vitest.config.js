@@ -55,6 +55,7 @@ export default defineConfig({
         "src/pages/fallback-sources.vue",
         "src/pages/health.vue",
         "src/pages/login.vue",
+        "src/pages/tasks.vue",
         "src/stores/admin.js",
         "src/stores/theme.js",
         "src/utils/api.js",

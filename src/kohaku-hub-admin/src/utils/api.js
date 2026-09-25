@@ -1551,3 +1551,62 @@ export async function deleteS3Prefix(token, prefix, confirmToken) {
   });
   return response.data;
 }
+
+// ===== Background Tasks =====
+
+/**
+ * List background tasks with per-status counts
+ * @param {string} token - Admin token
+ * @param {Object} params - Query parameters
+ * @param {string} [params.status] - Filter by status (queued/running/succeeded/failed)
+ * @param {string} [params.kind] - Filter by task kind
+ * @param {number} params.limit - Max tasks to return
+ * @param {number} params.offset - Offset for pagination
+ * @returns {Promise<Object>} { tasks, total, counts, kinds, limit, offset }
+ */
+export async function listTasks(
+  token,
+  { status, kind, limit = 50, offset = 0 } = {},
+) {
+  const client = createAdminClient(token);
+  const response = await client.get("/tasks", {
+    params: { status, kind, limit, offset },
+  });
+  return response.data;
+}
+
+/**
+ * Get one background task including payload and last error
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @returns {Promise<Object>} Task
+ */
+export async function getTask(token, taskId) {
+  const client = createAdminClient(token);
+  const response = await client.get(`/tasks/${taskId}`);
+  return response.data;
+}
+
+/**
+ * Requeue a failed background task
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @returns {Promise<Object>} Updated task
+ */
+export async function retryTask(token, taskId) {
+  const client = createAdminClient(token);
+  const response = await client.post(`/tasks/${taskId}/retry`);
+  return response.data;
+}
+
+/**
+ * Discard a queued or failed background task
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @returns {Promise<Object>} Deletion result
+ */
+export async function deleteTask(token, taskId) {
+  const client = createAdminClient(token);
+  const response = await client.delete(`/tasks/${taskId}`);
+  return response.data;
+}
