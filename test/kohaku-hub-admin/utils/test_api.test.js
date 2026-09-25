@@ -923,5 +923,15 @@ describe("admin API client", () => {
       id: 7,
     });
     expect(client.delete).toHaveBeenLastCalledWith("/tasks/7");
+
+    client.get.mockResolvedValueOnce({ data: { window: "1h" } });
+    expect(await api.getTaskStats("admin-token")).toEqual({ window: "1h" });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/stats", {
+      params: { window: "1h" },
+    });
+    await api.getTaskStats("admin-token", "7d");
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/stats", {
+      params: { window: "7d" },
+    });
   });
 });

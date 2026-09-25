@@ -1610,3 +1610,15 @@ export async function deleteTask(token, taskId) {
   const response = await client.delete(`/tasks/${taskId}`);
   return response.data;
 }
+
+/**
+ * Background task queue health for the dashboard
+ * @param {string} token - Admin token
+ * @param {string} window - One of 15m, 1h, 6h, 24h, 7d
+ * @returns {Promise<Object>} health, summary, backlog, series, kinds, errors
+ */
+export async function getTaskStats(token, window = "1h") {
+  const client = createAdminClient(token);
+  const response = await client.get("/tasks/stats", { params: { window } });
+  return response.data;
+}

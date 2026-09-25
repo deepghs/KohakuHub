@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     getTask: vi.fn(),
     retryTask: vi.fn(),
     deleteTask: vi.fn(),
+    getTaskStats: vi.fn(),
   },
 }));
 
@@ -28,6 +29,7 @@ vi.mock("@/utils/api", () => ({
   getTask: (...args) => mocks.api.getTask(...args),
   retryTask: (...args) => mocks.api.retryTask(...args),
   deleteTask: (...args) => mocks.api.deleteTask(...args),
+  getTaskStats: (...args) => mocks.api.getTaskStats(...args),
 }));
 
 vi.mock("@/components/AdminLayout.vue", () => ({
@@ -105,6 +107,72 @@ function listResponse(tasks = [QUEUED, RUNNING, FAILED], extra = {}) {
   };
 }
 
+function statsResponse(overrides = {}) {
+  return {
+    window: "1h",
+    window_seconds: 3600,
+    bucket_seconds: 60,
+    generated_at: "2026-09-25T10:00:00+00:00",
+    health: {
+      status: "degraded",
+      reasons: [
+        { level: "degraded", message: "1 task(s) failed in the window" },
+      ],
+    },
+    thresholds: {
+      backlog_warn_seconds: 60,
+      backlog_critical_seconds: 300,
+      failure_rate_warn: 0.1,
+      failure_rate_critical: 0.5,
+    },
+    summary: {
+      finished: 4,
+      succeeded: 3,
+      failed: 1,
+      succeeded_after_retry: 0,
+      failure_rate: 0.25,
+      throughput_per_minute: 0.07,
+      duration_p50: 2,
+      duration_p95: 5,
+      enqueued: 5,
+    },
+    backlog: {
+      due: 1,
+      scheduled: 0,
+      retrying: 0,
+      oldest_due_seconds: 12,
+      running: 1,
+      stuck: 0,
+      active_workers: 1,
+    },
+    series: [
+      {
+        start: "2026-09-25T09:00:00+00:00",
+        succeeded: 3,
+        failed: 1,
+        enqueued: 5,
+      },
+    ],
+    kinds: [
+      {
+        kind: "repo.recalc",
+        succeeded: 3,
+        failed: 1,
+        queued: 1,
+        running: 1,
+        stuck: 0,
+        failure_rate: 0.25,
+        duration_p95: 5,
+        timeline: [{ succeeded: 3, failed: 1 }],
+        last_error: "RuntimeError: boom",
+        last_failed_at: "2026-09-25T09:30:00+00:00",
+      },
+    ],
+    errors: [],
+    ...overrides,
+  };
+}
+
 const noopDirective = { mounted() {}, updated() {}, beforeUnmount() {} };
 
 function mountPage() {
@@ -129,6 +197,7 @@ describe("admin background tasks page", () => {
     mocks.adminStore.logout.mockReset();
     mocks.adminStore.token = "admin-token";
     Object.values(mocks.api).forEach((fn) => fn.mockReset());
+    mocks.api.getTaskStats.mockResolvedValue(statsResponse());
     messageBoxConfirmSpy.mockReset();
     messageSuccessSpy.mockReset();
     messageErrorSpy.mockReset();
@@ -468,6 +537,7 @@ describe("admin background tasks page", () => {
 
     expect(mocks.router.push).toHaveBeenCalledWith("/login");
     expect(mocks.api.listTasks).not.toHaveBeenCalled();
+    expect(mocks.api.getTaskStats).not.toHaveBeenCalled();
   });
 
   it("auto-refreshes on the selected interval and stops on unmount", async () => {
@@ -503,5 +573,89 @@ describe("admin background tasks page", () => {
     await flushPromises();
 
     expect(mocks.api.listTasks).toHaveBeenCalledTimes(2);
+  });
+
+  it("loads queue health on mount and shows the health chip", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(mocks.api.getTaskStats).toHaveBeenCalledWith("admin-token", "1h");
+    expect(wrapper.get('[data-testid="tasks-health"]').text()).toBe("Degraded");
+    expect(wrapper.find('[data-testid="task-overview"]').exists()).toBe(true);
+  });
+
+  it("shows a placeholder until health loads and reports load errors", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    mocks.api.getTaskStats.mockRejectedValue(
+      httpError(500, { error: "stats exploded" }),
+    );
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="tasks-health"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="task-overview"]').exists()).toBe(false);
+    expect(
+      wrapper.find('[data-description="Loading task health…"]').exists(),
+    ).toBe(true);
+    expect(messageErrorSpy).toHaveBeenCalledWith("stats exploded");
+  });
+
+  it("reloads health when the window changes", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    const wrapper = mountPage();
+    await flushPromises();
+
+    await wrapper.get('[data-testid="task-window-24h"]').trigger("click");
+    await flushPromises();
+
+    expect(mocks.api.getTaskStats).toHaveBeenLastCalledWith(
+      "admin-token",
+      "24h",
+    );
+  });
+
+  it("opens the task list filtered by a kind or status picked on the overview", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    const wrapper = mountPage();
+    await flushPromises();
+    const tabs = () =>
+      wrapper.get('[data-el-tabs="true"]').attributes("data-active");
+    expect(tabs()).toBe("overview");
+    // Emit from the overview directly: the ElTabs test stub re-selects the
+    // pane a click lands in, which real Element Plus does not do.
+    const overview = wrapper.findComponent({ name: "TaskOverview" });
+
+    overview.vm.$emit("select-kind", "repo.recalc");
+    await flushPromises();
+    expect(tabs()).toBe("tasks");
+    expect(mocks.api.listTasks).toHaveBeenLastCalledWith(
+      "admin-token",
+      expect.objectContaining({ kind: "repo.recalc", status: undefined }),
+    );
+
+    overview.vm.$emit("select-status", "running");
+    await flushPromises();
+    expect(mocks.api.listTasks).toHaveBeenLastCalledWith(
+      "admin-token",
+      expect.objectContaining({ kind: undefined, status: "running" }),
+    );
+  });
+
+  it("switches to the task list when a status card is clicked from the overview", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    const wrapper = mountPage();
+    await flushPromises();
+
+    const card = wrapper.get('[data-testid="tasks-count-queued"]');
+    expect(card.classes()).toContain("status-queued");
+    expect(card.classes()).not.toContain("active");
+    await card.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.get('[data-el-tabs="true"]').attributes("data-active")).toBe(
+      "tasks",
+    );
+    expect(card.classes()).toContain("active");
   });
 });

@@ -56,6 +56,8 @@ export default defineConfig({
         "src/pages/health.vue",
         "src/pages/login.vue",
         "src/pages/tasks.vue",
+        "src/components/tasks/TaskOverview.vue",
+        "src/components/tasks/TaskTimeline.vue",
         "src/stores/admin.js",
         "src/stores/theme.js",
         "src/utils/api.js",

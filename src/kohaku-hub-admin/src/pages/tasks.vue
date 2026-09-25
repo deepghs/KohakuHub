@@ -2,8 +2,15 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import AdminLayout from "@/components/AdminLayout.vue";
+import TaskOverview from "@/components/tasks/TaskOverview.vue";
 import { useAdminStore } from "@/stores/admin";
-import { deleteTask, getTask, listTasks, retryTask } from "@/utils/api";
+import {
+  deleteTask,
+  getTask,
+  getTaskStats,
+  listTasks,
+  retryTask,
+} from "@/utils/api";
 import { ElMessage, ElMessageBox } from "element-plus";
 import dayjs from "dayjs";
 
@@ -16,6 +23,12 @@ const STATUS_TAG = {
   running: "primary",
   succeeded: "success",
   failed: "danger",
+};
+const HEALTH_TAG = {
+  healthy: { type: "success", label: "Healthy" },
+  degraded: { type: "warning", label: "Degraded" },
+  unhealthy: { type: "danger", label: "Unhealthy" },
+  idle: { type: "info", label: "Idle" },
 };
 const REFRESH_OPTIONS = [
   { label: "Off", value: 0 },
@@ -36,7 +49,14 @@ const pageSize = ref(20);
 const refreshIntervalSeconds = ref(0);
 const detail = ref(null);
 const detailVisible = ref(false);
+const activeTab = ref("overview");
+const statsWindow = ref("1h");
+const stats = ref(null);
 let refreshTimer = null;
+
+const health = computed(() =>
+  stats.value ? HEALTH_TAG[stats.value.health.status] : null,
+);
 
 const statusOptions = computed(() => [
   { label: "All statuses", value: "" },
@@ -81,13 +101,46 @@ async function loadTasks() {
   }
 }
 
+async function loadStats() {
+  if (!adminStore.token) return; // loadTasks handles the redirect
+  try {
+    stats.value = await getTaskStats(adminStore.token, statsWindow.value);
+  } catch (error) {
+    handleError(error, "Failed to load task health");
+  }
+}
+
+function refreshAll() {
+  loadTasks();
+  loadStats();
+}
+
 function applyFilters() {
   currentPage.value = 1;
   loadTasks();
 }
 
+// Status cards toggle their filter; anything picked from the overview opens
+// the task list already filtered.
 function selectStatus(status) {
-  filterStatus.value = filterStatus.value === status ? "" : status;
+  const toggleOff =
+    activeTab.value === "tasks" && filterStatus.value === status;
+  filterStatus.value = toggleOff ? "" : status;
+  activeTab.value = "tasks";
+  applyFilters();
+}
+
+function showStatus(status) {
+  filterStatus.value = status;
+  filterKind.value = "";
+  activeTab.value = "tasks";
+  applyFilters();
+}
+
+function showKind(kind) {
+  filterKind.value = kind;
+  filterStatus.value = "";
+  activeTab.value = "tasks";
   applyFilters();
 }
 
@@ -191,11 +244,13 @@ function stopTimer() {
 watch(refreshIntervalSeconds, (seconds) => {
   stopTimer();
   if (seconds > 0) {
-    refreshTimer = setInterval(loadTasks, seconds * 1000);
+    refreshTimer = setInterval(refreshAll, seconds * 1000);
   }
 });
 
-onMounted(loadTasks);
+watch(statsWindow, loadStats);
+
+onMounted(refreshAll);
 onBeforeUnmount(stopTimer);
 </script>
 
@@ -204,8 +259,18 @@ onBeforeUnmount(stopTimer);
     <div class="page-container">
       <div class="flex justify-between items-center mb-6 gap-4 flex-wrap">
         <div>
-          <h1 class="text-3xl font-bold text-gray-900 dark:text-gray-100">
+          <h1
+            class="text-3xl font-bold text-gray-900 dark:text-gray-100 flex items-center gap-3"
+          >
             Background Tasks
+            <span
+              v-if="health"
+              class="health-chip"
+              :class="health.type"
+              data-testid="tasks-health"
+            >
+              <span class="health-dot" />{{ health.label }}
+            </span>
           </h1>
           <p class="text-gray-500 dark:text-gray-400 text-sm mt-1">
             Durable tasks executed by <code>khub-worker</code>. Tasks run at
@@ -229,7 +294,7 @@ onBeforeUnmount(stopTimer);
           <el-button
             type="primary"
             :loading="loading"
-            @click="loadTasks()"
+            @click="refreshAll()"
             data-testid="tasks-refresh"
           >
             <div class="i-carbon-renew mr-1" />
@@ -244,141 +309,160 @@ onBeforeUnmount(stopTimer);
           :key="status"
           type="button"
           class="status-card"
-          :class="{ active: filterStatus === status }"
+          :class="[
+            `status-${status}`,
+            { active: activeTab === 'tasks' && filterStatus === status },
+          ]"
           :data-testid="`tasks-count-${status}`"
           @click="selectStatus(status)"
         >
-          <span class="status-label">{{ status }}</span>
+          <span class="status-label"
+            ><span class="status-dot" />{{ status }}</span
+          >
           <span class="status-value">{{ counts[status] }}</span>
         </button>
       </div>
 
-      <el-card shadow="never">
-        <div class="flex gap-3 mb-4 flex-wrap">
-          <el-select
-            v-model="filterStatus"
-            class="filter-select"
-            placeholder="Status"
-            data-testid="tasks-filter-status"
-            @change="applyFilters"
-          >
-            <el-option
-              v-for="option in statusOptions"
-              :key="option.value"
-              :label="option.label"
-              :value="option.value"
-            />
-          </el-select>
-          <el-select
-            v-model="filterKind"
-            class="filter-select"
-            placeholder="Kind"
-            data-testid="tasks-filter-kind"
-            @change="applyFilters"
-          >
-            <el-option
-              v-for="option in kindOptions"
-              :key="option.value"
-              :label="option.label"
-              :value="option.value"
-            />
-          </el-select>
-        </div>
-
-        <el-empty
-          v-if="!loading && tasks.length === 0"
-          description="No background tasks"
-          data-testid="tasks-empty"
-        />
-        <el-table
-          v-else
-          v-loading="loading"
-          :data="tasks"
-          data-testid="tasks-table"
-        >
-          <el-table-column prop="id" label="ID" width="70" />
-          <el-table-column
-            prop="kind"
-            label="Kind"
-            min-width="180"
-            show-overflow-tooltip
+      <el-tabs v-model="activeTab" class="task-tabs">
+        <el-tab-pane label="Overview" name="overview">
+          <TaskOverview
+            v-if="stats"
+            v-model:window="statsWindow"
+            :stats="stats"
+            @select-kind="showKind"
+            @select-status="showStatus"
           />
-          <el-table-column label="Status" width="150">
-            <template #default="{ row }">
-              <el-tag :type="STATUS_TAG[row.status]" size="small">
-                {{ row.status }}
-              </el-tag>
-              <el-tag
-                v-if="row.lease_expired"
-                type="warning"
-                size="small"
-                class="ml-1"
-                data-testid="tasks-lease-expired"
+          <el-empty v-else description="Loading task health…" />
+        </el-tab-pane>
+        <el-tab-pane label="Tasks" name="tasks">
+          <el-card shadow="never">
+            <div class="flex gap-3 mb-4 flex-wrap">
+              <el-select
+                v-model="filterStatus"
+                class="filter-select"
+                placeholder="Status"
+                data-testid="tasks-filter-status"
+                @change="applyFilters"
               >
-                lease expired
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="Attempts" width="90">
-            <template #default="{ row }">
-              {{ row.attempts }} / {{ row.max_attempts }}
-            </template>
-          </el-table-column>
-          <el-table-column label="When" min-width="190">
-            <template #default="{ row }">{{ stateTime(row) }}</template>
-          </el-table-column>
-          <el-table-column
-            label="Last error"
-            min-width="180"
-            show-overflow-tooltip
-          >
-            <template #default="{ row }">
-              <span class="error-text">{{ truncate(row.last_error) }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="Actions" width="200">
-            <template #default="{ row }">
-              <el-button
-                link
-                type="primary"
-                :data-testid="`tasks-detail-${row.id}`"
-                @click="openDetail(row)"
+                <el-option
+                  v-for="option in statusOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+              <el-select
+                v-model="filterKind"
+                class="filter-select"
+                placeholder="Kind"
+                data-testid="tasks-filter-kind"
+                @change="applyFilters"
               >
-                Details
-              </el-button>
-              <el-button
-                v-if="canRetry(row)"
-                link
-                type="warning"
-                :data-testid="`tasks-retry-${row.id}`"
-                @click="handleRetry(row)"
-              >
-                Retry
-              </el-button>
-              <el-button
-                v-if="canDiscard(row)"
-                link
-                type="danger"
-                :data-testid="`tasks-discard-${row.id}`"
-                @click="handleDiscard(row)"
-              >
-                Discard
-              </el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+                <el-option
+                  v-for="option in kindOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+            </div>
 
-        <div class="flex justify-end mt-4">
-          <el-pagination
-            :current-page="currentPage"
-            :page-size="pageSize"
-            :total="total"
-            layout="total, prev, pager, next"
-            data-testid="tasks-pagination"
-            @current-change="handlePageChange"
-          />
-        </div>
-      </el-card>
+            <el-empty
+              v-if="!loading && tasks.length === 0"
+              description="No background tasks"
+              data-testid="tasks-empty"
+            />
+            <el-table
+              v-else
+              v-loading="loading"
+              :data="tasks"
+              data-testid="tasks-table"
+            >
+              <el-table-column prop="id" label="ID" width="70" />
+              <el-table-column
+                prop="kind"
+                label="Kind"
+                min-width="180"
+                show-overflow-tooltip
+              />
+              <el-table-column label="Status" width="150">
+                <template #default="{ row }">
+                  <el-tag :type="STATUS_TAG[row.status]" size="small">
+                    {{ row.status }}
+                  </el-tag>
+                  <el-tag
+                    v-if="row.lease_expired"
+                    type="warning"
+                    size="small"
+                    class="ml-1"
+                    data-testid="tasks-lease-expired"
+                  >
+                    lease expired
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="Attempts" width="90">
+                <template #default="{ row }">
+                  {{ row.attempts }} / {{ row.max_attempts }}
+                </template>
+              </el-table-column>
+              <el-table-column label="When" min-width="190">
+                <template #default="{ row }">{{ stateTime(row) }}</template>
+              </el-table-column>
+              <el-table-column
+                label="Last error"
+                min-width="180"
+                show-overflow-tooltip
+              >
+                <template #default="{ row }">
+                  <span class="error-text">{{ truncate(row.last_error) }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="Actions" width="200">
+                <template #default="{ row }">
+                  <el-button
+                    link
+                    type="primary"
+                    :data-testid="`tasks-detail-${row.id}`"
+                    @click="openDetail(row)"
+                  >
+                    Details
+                  </el-button>
+                  <el-button
+                    v-if="canRetry(row)"
+                    link
+                    type="warning"
+                    :data-testid="`tasks-retry-${row.id}`"
+                    @click="handleRetry(row)"
+                  >
+                    Retry
+                  </el-button>
+                  <el-button
+                    v-if="canDiscard(row)"
+                    link
+                    type="danger"
+                    :data-testid="`tasks-discard-${row.id}`"
+                    @click="handleDiscard(row)"
+                  >
+                    Discard
+                  </el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+
+            <div class="flex justify-end mt-4">
+              <el-pagination
+                :current-page="currentPage"
+                :page-size="pageSize"
+                :total="total"
+                layout="total, prev, pager, next"
+                data-testid="tasks-pagination"
+                @current-change="handlePageChange"
+              />
+            </div>
+          </el-card>
+        </el-tab-pane>
+      </el-tabs>
 
       <el-dialog
         v-model="detailVisible"
@@ -484,9 +568,84 @@ onBeforeUnmount(stopTimer);
   text-align: left;
 }
 
+/* Each card borrows its status badge colour (info/primary/success/danger)
+   as an accent, so cards and table badges read as one legend. */
+.status-card {
+  --status-color: var(--el-color-info);
+  --status-tint: var(--el-color-info-light-9);
+  border-left: 3px solid var(--status-color);
+}
+
+.status-card.status-running {
+  --status-color: var(--el-color-primary);
+  --status-tint: var(--el-color-primary-light-9);
+}
+
+.status-card.status-succeeded {
+  --status-color: var(--el-color-success);
+  --status-tint: var(--el-color-success-light-9);
+}
+
+.status-card.status-failed {
+  --status-color: var(--el-color-danger);
+  --status-tint: var(--el-color-danger-light-9);
+}
+
+.status-card:hover {
+  background: var(--status-tint);
+}
+
 .status-card.active {
-  border-color: var(--el-color-primary);
-  box-shadow: 0 0 0 1px var(--el-color-primary);
+  background: var(--status-tint);
+  border-color: var(--status-color);
+  box-shadow: 0 0 0 1px var(--status-color);
+}
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--status-color);
+}
+
+.status-card .status-value {
+  color: var(--status-color);
+}
+
+.health-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  --chip-color: var(--el-color-info);
+  color: var(--chip-color);
+  background: color-mix(in srgb, var(--chip-color) 12%, transparent);
+}
+
+.health-chip.success {
+  --chip-color: var(--el-color-success);
+}
+
+.health-chip.warning {
+  --chip-color: var(--el-color-warning);
+}
+
+.health-chip.danger {
+  --chip-color: var(--el-color-danger);
+}
+
+.health-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--chip-color);
 }
 
 .status-label {
