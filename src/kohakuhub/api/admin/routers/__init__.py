@@ -12,6 +12,7 @@ from kohakuhub.api.admin.routers.repositories import router as repositories_rout
 from kohakuhub.api.admin.routers.search import router as search_router
 from kohakuhub.api.admin.routers.stats import router as stats_router
 from kohakuhub.api.admin.routers.storage import router as storage_router
+from kohakuhub.api.admin.routers.tasks import router as tasks_router
 from kohakuhub.api.admin.routers.users import router as users_router
 
 __all__ = [
@@ -27,5 +28,6 @@ __all__ = [
     "search_router",
     "stats_router",
     "storage_router",
+    "tasks_router",
     "users_router",
 ]
