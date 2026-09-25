@@ -63,7 +63,9 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       minio:
-        image: quay.io/minio/minio:latest
+        # quay.io/minio/minio no longer serves anonymous pulls; use the
+        # community-maintained build of the same server.
+        image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
@@ -191,7 +193,9 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       minio:
-        image: quay.io/minio/minio:latest
+        # quay.io/minio/minio no longer serves anonymous pulls; use the
+        # community-maintained build of the same server.
+        image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
