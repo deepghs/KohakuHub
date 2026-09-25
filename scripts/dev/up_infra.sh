@@ -106,6 +106,7 @@ ensure_minio() {
     return
   fi
 
+  # MinIO: community-maintained build; quay.io/minio/minio no longer serves anonymous pulls.
   docker run -d \
     --name "${MINIO_CONTAINER}" \
     --network "${NETWORK_NAME}" \
@@ -116,7 +117,7 @@ ensure_minio() {
     -e MINIO_API_CORS_ALLOW_ORIGIN="${DEV_MINIO_CORS_ALLOW_ORIGIN}" \
     -v "${MINIO_DATA_DIR}:/data" \
     -v "${MINIO_CONFIG_DIR}:/root/.minio" \
-    quay.io/minio/minio:latest \
+    pgsty/minio:RELEASE.2026-08-04T00-00-00Z \
     server /data --console-address ":29000" >/dev/null
 
   echo "Created ${MINIO_CONTAINER}"

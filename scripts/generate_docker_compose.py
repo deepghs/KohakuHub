@@ -96,7 +96,7 @@ def generate_minio_service(config: dict) -> str:
     """Generate MinIO service configuration."""
     if config["s3_builtin"] and config.get("s3_provider") == "minio":
         return f"""  minio:
-    image: quay.io/minio/minio:latest
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z # community-maintained build; quay.io/minio/minio no longer serves anonymous pulls
     container_name: minio
     command: server /data --console-address ":29000"
     environment:
