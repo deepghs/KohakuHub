@@ -93,6 +93,20 @@ By default, the application looks for `config.toml` in the current working direc
 | `KOHAKU_HUB_FALLBACK_MAX_CONCURRENT` | The max concurrent requests to external sources. | `5` |
 | `KOHAKU_HUB_FALLBACK_SOURCES` | A JSON list of global fallback sources. | `[]` |
 
+## Background Task Worker Settings
+
+Used by `khub-worker` (`python -m kohakuhub.worker`). See [Background Tasks](../development/background-tasks.md).
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `KOHAKU_HUB_WORKER_CONCURRENCY` | Tasks run at once per worker process. | `4` |
+| `KOHAKU_HUB_WORKER_LEASE_SECONDS` | A task is reclaimed by another worker if its lease is not renewed for this long. | `60` |
+| `KOHAKU_HUB_WORKER_POLL_INTERVAL_SECONDS` | Idle wait between claim attempts. | `1.0` |
+| `KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS` | Drain time on SIGTERM before running tasks are cancelled. | `30` |
+| `KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS` | Succeeded tasks are deleted after this many days. | `7` |
+| `KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS` | Failed tasks are deleted after this many days. | `30` |
+| `KOHAKU_HUB_WORKER_QUEUES` | Comma-separated queues this worker consumes; empty consumes all. | `""` |
+
 ## SMTP (Email) Settings
 
 | Variable | Description | Default |

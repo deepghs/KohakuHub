@@ -131,7 +131,22 @@ def run_migrations():
     print("[startup] ✓ Migrations completed successfully\n")
 
 
+def run_worker():
+    """Start khub-worker. hub-api owns LakeFS bootstrap and migrations."""
+    if "KOHAKU_HUB_LAKEFS_ACCESS_KEY" not in os.environ:
+        while not CRED_FILE.exists():
+            print(f"[startup] Waiting for hub-api to write {CRED_FILE}...")
+            time.sleep(2)
+        load_credentials()
+    print("[startup] Starting background task worker...")
+    os.execvp(sys.executable, [sys.executable, "-m", "kohakuhub.worker"])
+
+
 def main():
+    if sys.argv[1:] == ["worker"]:
+        run_worker()
+        return
+
     wait_for_lakefs()
 
     if CRED_FILE.exists() or (

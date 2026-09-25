@@ -139,6 +139,14 @@ make seed-demo
 
 This writes a local manifest to `hub-meta/dev/demo-seed-manifest.json`.
 
+To run background tasks, start the worker in another terminal after the backend is up:
+
+```bash
+make worker
+```
+
+See [Background Tasks](background-tasks.md) for how tasks work.
+
 ## Start The Frontends
 
 Main UI:
