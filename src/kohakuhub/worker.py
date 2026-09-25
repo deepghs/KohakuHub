@@ -20,6 +20,9 @@ from kohakuhub.logger import get_logger
 
 logger = get_logger("WORKER")
 
+# Re-create missing periodic occurrences (e.g. one an admin discarded).
+PERIODIC_RESYNC_SECONDS = 60.0
+
 
 def _reset_connection() -> None:
     """Drop a possibly broken connection; Peewee reconnects on next use."""
@@ -71,18 +74,29 @@ class Worker:
 
     async def run(self, stop: asyncio.Event) -> None:
         """Claim and run tasks until ``stop`` is set, then drain."""
-        tasks.ensure_periodic_tasks()
         logger.info(
             f"Worker {self.worker_id} started "
             f"(concurrency={self.concurrency}, queues={self.queues or 'all'})"
         )
+        loop = asyncio.get_running_loop()
+        next_resync = loop.time()
         while not stop.is_set():
+            if loop.time() >= next_resync:
+                self._resync_periodic()
+                next_resync = loop.time() + PERIODIC_RESYNC_SECONDS
             if len(self._running) < self.concurrency and (row := self._claim()) is not None:
                 self._start(row)
                 continue
             await self._wait(stop)
         await self._drain()
         logger.info(f"Worker {self.worker_id} stopped")
+
+    def _resync_periodic(self) -> None:
+        try:
+            tasks.ensure_periodic_tasks()
+        except Exception as e:
+            logger.exception("Failed to schedule periodic tasks", e)
+            _reset_connection()
 
     def _claim(self) -> BackgroundTask | None:
         try:

@@ -346,3 +346,45 @@ def test_main_runs_serve(monkeypatch):
     worker_module.main()
 
     assert calls == ["serve"]
+
+
+async def test_worker_restores_discarded_periodic_occurrence(monkeypatch):
+    monkeypatch.setattr(worker_module, "PERIODIC_RESYNC_SECONDS", 0.1)
+
+    @tasks.task("test.hourly", every=timedelta(hours=1))
+    async def hourly(payload):
+        return None
+
+    def pending():
+        return BackgroundTask.get_or_none(
+            (BackgroundTask.status == tasks.QUEUED)
+            & (BackgroundTask.dedupe_key == tasks.periodic_key("test.hourly"))
+        )
+
+    discarded = []
+
+    def discard_then_wait_for_resync():
+        row = pending()
+        if row is not None and not discarded:
+            tasks.discard_task(row.id)  # e.g. an admin discarded it
+            discarded.append(row.id)
+            return False
+        return bool(discarded) and row is not None and row.id not in discarded
+
+    await _run_until(_worker(), discard_then_wait_for_resync)
+
+
+async def test_worker_survives_periodic_resync_errors(monkeypatch):
+    monkeypatch.setattr(worker_module, "PERIODIC_RESYNC_SECONDS", 0.05)
+    calls = []
+    real_ensure = tasks.ensure_periodic_tasks
+
+    def flaky_ensure():
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("db hiccup")
+        real_ensure()
+
+    monkeypatch.setattr(tasks, "ensure_periodic_tasks", flaky_ensure)
+
+    await _run_until(_worker(), lambda: len(calls) >= 3)

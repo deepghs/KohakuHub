@@ -64,7 +64,7 @@ Rules:
 | Timeout | Per-kind `timeout` seconds; a timeout counts as a retryable failure. |
 | Dedupe | `dedupe_key` is unique while the task is pending. Claiming the task releases the key, so work arriving while it runs can enqueue a fresh task. |
 | Delay | `enqueue(..., run_after=datetime)`. Timestamps are naive UTC (`kohakuhub.db.utcnow()`). |
-| Periodic | `@task(..., every=timedelta(...))`. Claiming an occurrence inserts the next one in the same transaction, so exactly one is pending at any time. |
+| Periodic | `@task(..., every=timedelta(...))`. Claiming an occurrence inserts the next one in the same transaction, so exactly one is pending at any time. Workers re-create a missing occurrence (for example, one discarded from the admin panel) within a minute. |
 | Retention | The built-in periodic `tasks.cleanup` task deletes finished rows after the configured retention. |
 | Shutdown | SIGTERM stops claiming and drains running tasks for `shutdown_grace_seconds`. It then cancels them and leaves their leases to expire. |
 

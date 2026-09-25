@@ -296,9 +296,9 @@ onBeforeUnmount(stopTimer);
           :data="tasks"
           data-testid="tasks-table"
         >
-          <el-table-column prop="id" label="ID" width="90" />
-          <el-table-column prop="kind" label="Kind" min-width="180" />
-          <el-table-column label="Status" width="170">
+          <el-table-column prop="id" label="ID" width="70" />
+          <el-table-column prop="kind" label="Kind" min-width="160" />
+          <el-table-column label="Status" width="160">
             <template #default="{ row }">
               <el-tag :type="STATUS_TAG[row.status]" size="small">
                 {{ row.status }}
@@ -314,7 +314,7 @@ onBeforeUnmount(stopTimer);
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="Attempts" width="100">
+          <el-table-column label="Attempts" width="90">
             <template #default="{ row }">
               {{ row.attempts }} / {{ row.max_attempts }}
             </template>
@@ -322,12 +322,16 @@ onBeforeUnmount(stopTimer);
           <el-table-column label="When" min-width="200">
             <template #default="{ row }">{{ stateTime(row) }}</template>
           </el-table-column>
-          <el-table-column label="Last error" min-width="220">
+          <el-table-column
+            label="Last error"
+            min-width="200"
+            show-overflow-tooltip
+          >
             <template #default="{ row }">
               <span class="error-text">{{ truncate(row.last_error) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="Actions" width="240" fixed="right">
+          <el-table-column label="Actions" width="260">
             <template #default="{ row }">
               <el-button
                 size="small"
