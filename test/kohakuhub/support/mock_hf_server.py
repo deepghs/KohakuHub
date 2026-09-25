@@ -87,10 +87,13 @@ def build_mock_hf_app() -> FastAPI:
         methods=["HEAD", "GET"],
     )
     async def pattern_b(owner: str, name: str, rev: str, request: Request):
-        # Use the same host as an absolute URL — simulates HF's absolute
+        # An absolute URL on a different hostname — simulates HF's absolute
         # 302 into cas-bridge.xethub.hf.co. khub should pass this Location
         # through untouched (urljoin on an absolute URL is a no-op).
-        cdn_url = str(request.base_url) + "cas/pattern_b.bin"
+        # The hostname must differ from the hub's: hf_hub >= 2.0 follows
+        # HEAD redirects to the same hostname (port ignored), which a real
+        # CDN never shares.
+        cdn_url = str(request.base_url.replace(hostname="localhost")) + "cas/pattern_b.bin"
         if request.method == "HEAD":
             return Response(
                 status_code=302,

@@ -44,13 +44,13 @@ except ImportError:  # pre-1.0 hf_hub matrix cells
     parse_xet_file_data_from_response = None  # type: ignore[assignment]
     HAS_XET = False
 
-# hf_hub migrated its internal HTTP layer from `requests` to `httpx`
-# in 1.0. That migration changed the type `hf_raise_for_status`
-# accepts: older versions expect `requests.Response`, newer ones
-# expect `httpx.Response`. The CLASSIFICATION logic (X-Error-Code →
-# GatedRepoError / EntryNotFoundError / generic HfHubHTTPError) is
-# identical across both branches — only the input type differs, so
-# the pattern-D tests below build whichever Response type the
+# hf_hub has changed its HTTP layer twice: `requests` before 1.0, `httpx`
+# from 1.0, and `httpx2` from 2.0. `hf_raise_for_status` only recognises
+# the status errors of the library it was built on, so a response of the
+# wrong type escapes as a raw `HTTPStatusError` instead of being classified.
+# The CLASSIFICATION logic (X-Error-Code → GatedRepoError /
+# EntryNotFoundError / generic HfHubHTTPError) is identical across all
+# three, so the pattern-D..G tests build whichever Response type the
 # installed hf_hub understands and assert the same classification on
 # every matrix cell.
 import huggingface_hub as _hf
@@ -59,6 +59,12 @@ _hf_version_tuple = tuple(
     int(p) for p in _hf.__version__.split(".")[:2] if p.isdigit()
 )
 _HF_USES_HTTPX = _hf_version_tuple >= (1, 0)
+
+try:
+    # hf_hub >= 1.30 re-exports the HTTP module it is built on (httpx2 on 2.x).
+    from huggingface_hub.utils import httpx as _hf_http
+except ImportError:  # 1.0 - 1.29 use httpx directly
+    _hf_http = httpx
 
 
 def _hf_error(name):
@@ -127,6 +133,7 @@ def _to_hf_response(response, *, request_url: str):
     """Rehydrate a FastAPI ``Response`` as the Response type the
     installed hf_hub's ``hf_raise_for_status`` expects.
 
+    - hf_hub >= 2.0 → ``httpx2.Response``
     - hf_hub >= 1.0 → ``httpx.Response``
     - hf_hub <  1.0 → ``requests.Response``
 
@@ -140,11 +147,11 @@ def _to_hf_response(response, *, request_url: str):
     ]
     body = response.body or b""
     if _HF_USES_HTTPX:
-        return httpx.Response(
+        return _hf_http.Response(
             status_code=response.status_code,
-            headers=httpx.Headers(raw_pairs),
+            headers=_hf_http.Headers(raw_pairs),
             content=body,
-            request=httpx.Request("HEAD", request_url),
+            request=_hf_http.Request("HEAD", request_url),
         )
     # requests branch (0.x hf_hub). Import lazily so the module import
     # does not fail on a hypothetical httpx-only install.
