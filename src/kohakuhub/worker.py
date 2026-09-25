@@ -130,24 +130,30 @@ class Worker:
             return
         logger.info(f"Waiting up to {self.shutdown_grace}s for {len(self._running)} task(s)")
         _, pending = await asyncio.wait(set(self._running), timeout=self.shutdown_grace)
-        # Cancelled tasks keep status=running; their lease expires and
-        # another worker claims them again.
+        # Cancelled tasks are released back to the queue (see _execute).
         for running in pending:
             running.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
 
     async def _execute(self, row: BackgroundTask) -> None:
         spec = tasks.get_spec(row.kind)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         run = asyncio.create_task(self._invoke(spec, row))
         heartbeat = asyncio.create_task(self._heartbeat(row, run))
         try:
             await run
         except asyncio.CancelledError:
             if not (heartbeat.done() and heartbeat.result()):
-                raise  # worker shutdown
+                # Worker shutdown: hand the task back instead of waiting out the lease.
+                self._record(lambda: tasks.release_task(row))
+                raise
             logger.warning(f"Lost the lease on task {row.id} ({row.kind}); abandoned it")
-        except asyncio.TimeoutError:
-            self._record_failure(row, f"Timed out after {spec.timeout}s")
+        except asyncio.TimeoutError as e:
+            if loop.time() - started >= spec.timeout:
+                self._record_failure(row, f"Timed out after {spec.timeout}s")
+            else:  # raised by the handler itself
+                self._record_failure(row, f"TimeoutError: {e}")
         except tasks.PermanentTaskError as e:
             self._record_failure(row, f"PermanentTaskError: {e}", permanent=True)
         except Exception as e:

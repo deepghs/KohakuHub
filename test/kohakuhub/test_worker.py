@@ -215,25 +215,6 @@ async def test_worker_drains_running_tasks_on_stop():
     assert _status(task_id) == tasks.SUCCEEDED
 
 
-async def test_worker_cancels_tasks_exceeding_shutdown_grace():
-    started = asyncio.Event()
-
-    @tasks.task("test.stuck")
-    async def stuck(payload):
-        started.set()
-        await asyncio.sleep(10)
-
-    task_id = tasks.enqueue("test.stuck")
-    stop = asyncio.Event()
-    runner = asyncio.create_task(_worker(shutdown_grace=0.1).run(stop))
-    await started.wait()
-    stop.set()
-    await runner
-
-    # Left running: the lease expires and another worker picks it up.
-    assert _status(task_id) == tasks.RUNNING
-
-
 async def test_worker_starts_periodic_tasks():
     runs = []
 
@@ -401,3 +382,35 @@ async def test_worker_fails_tasks_with_corrupt_payload():
     await _run_until(_worker(), lambda: _status(task_id) == tasks.FAILED)
 
     assert BackgroundTask.get_by_id(task_id).last_error.startswith("JSONDecodeError")
+
+
+async def test_worker_releases_tasks_cancelled_at_shutdown():
+    started = asyncio.Event()
+
+    @tasks.task("test.interrupted", max_attempts=1)
+    async def interrupted(payload):
+        started.set()
+        await asyncio.sleep(10)
+
+    task_id = tasks.enqueue("test.interrupted")
+    stop = asyncio.Event()
+    runner = asyncio.create_task(_worker(shutdown_grace=0.1).run(stop))
+    await started.wait()
+    stop.set()
+    await runner
+
+    # Handed back without spending the attempt, so the next worker runs it.
+    row = BackgroundTask.get_by_id(task_id)
+    assert (row.status, row.attempts, row.locked_by) == (tasks.QUEUED, 0, None)
+    assert row.run_after <= tasks.utcnow()
+
+
+async def test_worker_keeps_handler_timeout_errors_distinct():
+    @tasks.task("test.socket-timeout", max_attempts=1, timeout=30)
+    async def socket_timeout(payload):
+        raise asyncio.TimeoutError("read timed out")
+
+    task_id = tasks.enqueue("test.socket-timeout")
+    await _run_until(_worker(), lambda: _status(task_id) == tasks.FAILED)
+
+    assert BackgroundTask.get_by_id(task_id).last_error == "TimeoutError: read timed out"

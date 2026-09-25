@@ -20,12 +20,19 @@ def _iso(value: datetime | None) -> str | None:
     return value.replace(tzinfo=timezone.utc).isoformat() if value else None
 
 
+def _payload(task: BackgroundTask):
+    try:
+        return json.loads(task.payload)
+    except ValueError:
+        return task.payload  # corrupt rows stay visible so they can be discarded
+
+
 def _serialize(task: BackgroundTask) -> dict:
     return {
         "id": task.id,
         "kind": task.kind,
         "queue": task.queue,
-        "payload": json.loads(task.payload),
+        "payload": _payload(task),
         "status": task.status,
         "priority": task.priority,
         "dedupe_key": task.dedupe_key,

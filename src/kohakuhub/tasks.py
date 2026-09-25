@@ -8,13 +8,17 @@ claims and runs tasks.
 Delivery is at-least-once: a worker holds a lease on the task it runs and
 renews it while the handler is alive. When a worker dies, its lease expires
 and another worker claims the task again, so every handler must be idempotent.
+
+Handlers share the event loop thread's database connection with the worker's
+bookkeeping (as hub-api request handlers do), so never ``await`` inside
+``db.atomic()``.
 """
 
 import inspect
 import json
 import random
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from peewee import PostgresqlDatabase
@@ -107,6 +111,9 @@ def enqueue(
     spec = _registry.get(kind)
     if spec is None:
         raise ValueError(f"Unknown task kind: {kind}")
+    if run_after is not None and run_after.tzinfo is not None:
+        # Columns hold naive UTC; see kohakuhub.db.utcnow.
+        run_after = run_after.astimezone(timezone.utc).replace(tzinfo=None)
     now = utcnow()
     rows = list(
         BackgroundTask.insert(
@@ -228,6 +235,22 @@ def renew_lease(task_row: BackgroundTask, *, lease_seconds: int) -> bool:
 
 def complete_task(task_row: BackgroundTask) -> bool:
     return bool(_finish(task_row, SUCCEEDED, utcnow(), None))
+
+
+def release_task(task_row: BackgroundTask) -> bool:
+    """Hand an interrupted task back to the queue without spending the attempt."""
+    T = BackgroundTask
+    return bool(
+        T.update(
+            status=QUEUED,
+            attempts=T.attempts - 1,
+            run_after=utcnow(),
+            locked_by=None,
+            locked_until=None,
+        )
+        .where(_owned(task_row))
+        .execute()
+    )
 
 
 def retry_delay(attempts: int) -> float:

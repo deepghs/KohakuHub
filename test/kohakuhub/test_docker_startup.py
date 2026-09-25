@@ -57,3 +57,12 @@ def test_main_dispatches_worker_mode(startup, monkeypatch):
     startup.main()
 
     assert startup.execs == [[sys.executable, "-m", "kohakuhub.worker"]]
+
+
+def test_write_credentials_replaces_file_atomically(startup):
+    startup.write_credentials("ak", "sk")
+
+    assert startup.CRED_FILE.read_text() == (
+        "KOHAKU_HUB_LAKEFS_ACCESS_KEY=ak\nKOHAKU_HUB_LAKEFS_SECRET_KEY=sk\n"
+    )
+    assert list(startup.CRED_FILE.parent.iterdir()) == [startup.CRED_FILE]

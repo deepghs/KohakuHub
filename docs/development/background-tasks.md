@@ -52,6 +52,12 @@ Rules:
 - Handlers are async functions and run on the worker's event loop. Offload
   heavy blocking work (hashing, large boto3 calls) the same way API handlers
   do.
+- **Never `await` inside `db.atomic()`.** Handlers share the loop thread's
+  database connection with the worker's own bookkeeping, just as hub-api
+  request handlers share it with each other.
+- Keep handler modules free of `kohakuhub.api` router imports: some routers
+  touch the schema at import time, and the worker must never create tables
+  before hub-api has run migrations.
 
 ## Semantics
 
@@ -66,7 +72,7 @@ Rules:
 | Delay | `enqueue(..., run_after=datetime)`. Timestamps are naive UTC (`kohakuhub.db.utcnow()`). |
 | Periodic | `@task(..., every=timedelta(...))`. Claiming an occurrence inserts the next one in the same transaction, so exactly one is pending at any time. Workers re-create a missing occurrence (for example, one discarded from the admin panel) within a minute. |
 | Retention | The built-in periodic `tasks.cleanup` task deletes finished rows after the configured retention. |
-| Shutdown | SIGTERM stops claiming and drains running tasks for `shutdown_grace_seconds`. It then cancels them and leaves their leases to expire. |
+| Shutdown | SIGTERM stops claiming and drains running tasks for `shutdown_grace_seconds`. It then cancels the rest and hands them back to the queue without spending an attempt. The compose service sets `stop_grace_period: 45s` so Docker does not kill the worker mid-drain. |
 
 ## Running the worker
 

@@ -412,3 +412,31 @@ def test_queue_lifecycle_on_sqlite(registry, tmp_path):
             == 1
         )
     sqlite_db.close()
+
+
+def test_enqueue_normalizes_aware_run_after_to_naive_utc(registry):
+    from datetime import timezone
+
+    _register("test.aware")
+    naive = tasks.utcnow().replace(microsecond=0) + timedelta(hours=1)
+    aware = naive.replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8)))
+
+    row = BackgroundTask.get_by_id(tasks.enqueue("test.aware", run_after=aware))
+
+    assert row.run_after == naive
+
+
+def test_release_task_returns_owned_task_without_spending_attempt(registry):
+    _register("test.release")
+    tasks.enqueue("test.release")
+    claimed = tasks.claim_next(WORKER, lease_seconds=LEASE)
+
+    assert tasks.release_task(claimed) is True
+    row = BackgroundTask.get_by_id(claimed.id)
+    assert (row.status, row.attempts, row.locked_by, row.locked_until) == (
+        tasks.QUEUED,
+        0,
+        None,
+        None,
+    )
+    assert tasks.release_task(claimed) is False  # no longer owned

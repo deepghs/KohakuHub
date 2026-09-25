@@ -411,6 +411,7 @@ def generate_khub_worker_service(config: dict) -> str:
     container_name: khub-worker
     restart: always
     command: ["python", "/app/startup.py", "worker"]
+    stop_grace_period: 45s # > KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS (30) so tasks can drain
     depends_on:
       - hub-api
     environment: *hub-env

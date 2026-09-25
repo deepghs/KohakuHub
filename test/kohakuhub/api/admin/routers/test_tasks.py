@@ -128,3 +128,13 @@ async def test_delete_task_discards_queued_and_failed_but_not_running(admin_clie
     assert conflict.status_code == 409
     assert "running" in conflict.json()["detail"]["error"]
     assert (await admin_client.delete(f"/admin/api/tasks/{failed}")).status_code == 404
+
+
+async def test_list_tasks_tolerates_corrupt_payloads(admin_client):
+    task_id = tasks.enqueue("admin.demo")
+    BackgroundTask.update(payload="{not json").where(BackgroundTask.id == task_id).execute()
+
+    response = await admin_client.get("/admin/api/tasks")
+
+    assert response.status_code == 200
+    assert response.json()["tasks"][0]["payload"] == "{not json"
