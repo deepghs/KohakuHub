@@ -278,6 +278,9 @@ describe("admin background tasks page", () => {
     const detail = wrapper.get('[data-testid="tasks-detail"]');
     expect(detail.text()).toContain('"repo_id": 42');
     expect(detail.text()).toContain("RuntimeError");
+    expect(
+      wrapper.find('[data-testid="tasks-detail-lease-expired"]').exists(),
+    ).toBe(false);
     expect(detail.text()).toContain("—"); // empty fields render a dash
     expect(wrapper.find('[data-testid="tasks-detail-retry"]').exists()).toBe(
       true,
@@ -330,6 +333,9 @@ describe("admin background tasks page", () => {
     expect(wrapper.get('[data-testid="tasks-detail"]').text()).not.toContain(
       "Last error",
     );
+    expect(
+      wrapper.find('[data-testid="tasks-detail-lease-expired"]').exists(),
+    ).toBe(true);
     expect(wrapper.find('[data-testid="tasks-detail-retry"]').exists()).toBe(
       false,
     );

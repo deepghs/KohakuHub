@@ -297,8 +297,13 @@ onBeforeUnmount(stopTimer);
           data-testid="tasks-table"
         >
           <el-table-column prop="id" label="ID" width="70" />
-          <el-table-column prop="kind" label="Kind" min-width="160" />
-          <el-table-column label="Status" width="160">
+          <el-table-column
+            prop="kind"
+            label="Kind"
+            min-width="180"
+            show-overflow-tooltip
+          />
+          <el-table-column label="Status" width="150">
             <template #default="{ row }">
               <el-tag :type="STATUS_TAG[row.status]" size="small">
                 {{ row.status }}
@@ -319,22 +324,23 @@ onBeforeUnmount(stopTimer);
               {{ row.attempts }} / {{ row.max_attempts }}
             </template>
           </el-table-column>
-          <el-table-column label="When" min-width="200">
+          <el-table-column label="When" min-width="190">
             <template #default="{ row }">{{ stateTime(row) }}</template>
           </el-table-column>
           <el-table-column
             label="Last error"
-            min-width="200"
+            min-width="180"
             show-overflow-tooltip
           >
             <template #default="{ row }">
               <span class="error-text">{{ truncate(row.last_error) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="Actions" width="260">
+          <el-table-column label="Actions" width="200">
             <template #default="{ row }">
               <el-button
-                size="small"
+                link
+                type="primary"
                 :data-testid="`tasks-detail-${row.id}`"
                 @click="openDetail(row)"
               >
@@ -342,7 +348,7 @@ onBeforeUnmount(stopTimer);
               </el-button>
               <el-button
                 v-if="canRetry(row)"
-                size="small"
+                link
                 type="warning"
                 :data-testid="`tasks-retry-${row.id}`"
                 @click="handleRetry(row)"
@@ -351,7 +357,7 @@ onBeforeUnmount(stopTimer);
               </el-button>
               <el-button
                 v-if="canDiscard(row)"
-                size="small"
+                link
                 type="danger"
                 :data-testid="`tasks-discard-${row.id}`"
                 @click="handleDiscard(row)"
@@ -384,7 +390,18 @@ onBeforeUnmount(stopTimer);
             <dt>Kind</dt>
             <dd>{{ detail.kind }}</dd>
             <dt>Status</dt>
-            <dd>{{ detail.status }}</dd>
+            <dd>
+              {{ detail.status }}
+              <el-tag
+                v-if="detail.lease_expired"
+                type="warning"
+                size="small"
+                class="ml-1"
+                data-testid="tasks-detail-lease-expired"
+              >
+                lease expired
+              </el-tag>
+            </dd>
             <dt>Queue</dt>
             <dd>{{ detail.queue }}</dd>
             <dt>Priority</dt>
