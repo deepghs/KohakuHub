@@ -74,6 +74,32 @@ Rules:
 | Retention | The built-in periodic `tasks.cleanup` task deletes finished rows after the configured retention. |
 | Shutdown | SIGTERM stops claiming and drains running tasks for `shutdown_grace_seconds`. It then cancels the rest and hands them back to the queue without spending an attempt. The compose service sets `stop_grace_period: 45s` so Docker does not kill the worker mid-drain. |
 
+## Admin panel
+
+**Background Tasks** in the admin panel has two tabs. The status cards and the health chip above them stay visible on both.
+
+- **Overview** is a dashboard for a selectable window (15m, 1h, 6h, 24h, 7d), served by `GET /admin/api/tasks/stats?window=`:
+  - a health verdict with the reasons behind it;
+  - KPI tiles: finished and throughput, success rate, due backlog and oldest wait, retrying, running and stuck, p50/p95 duration;
+  - an activity chart of succeeded and failed tasks per bucket;
+  - health by kind, with a timeline strip per kind;
+  - errors grouped by exception class, counting final failures and pending retries separately.
+
+  Clicking a kind, an error's kind chip, a status card or a KPI tile opens **Tasks** already filtered.
+- **Tasks** is the filterable task list with details, retry and discard.
+
+The health verdict uses these rules:
+
+| Signal | Degraded | Unhealthy |
+| --- | --- | --- |
+| Oldest due task waiting | ≥ 60 s | ≥ 5 min (the queue is not draining) |
+| Failure rate in the window (≥ 5 finished) | ≥ 10 % | ≥ 50 % |
+| Failures with fewer than 5 finished | any | — |
+| Tasks waiting to retry | any | — |
+| Running tasks with an expired lease | — | any (no worker reclaimed them) |
+
+A queued task whose kind no running worker registers never drains, so the backlog rule flags it too.
+
 ## Running the worker
 
 Local development (start `make backend` first; it runs migrations and writes
