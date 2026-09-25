@@ -10,6 +10,7 @@ from functools import partial
 from kohakuhub.constants import DB_ON_DELETE_SET_NULL
 from peewee import (
     AutoField,
+    BigAutoField,
     BigIntegerField,
     BlobField,
     BooleanField,
@@ -522,6 +523,42 @@ class ConfirmationToken(BaseModel):
         indexes = ((("action_type", "expires_at"), False),)  # For cleanup queries
 
 
+def utcnow() -> datetime:
+    """Naive UTC now; ``BackgroundTask`` stores naive UTC so SQL comparisons
+    behave the same on PostgreSQL (``timestamp``) and SQLite (text)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class BackgroundTask(BaseModel):
+    """Durable background task row; see ``kohakuhub.tasks`` for semantics."""
+
+    id = BigAutoField()
+    kind = CharField(max_length=255)
+    queue = CharField(max_length=64, default="default")
+    payload = TextField(default="{}")  # JSON: IDs and small parameters only
+    status = CharField(max_length=16, default="queued")
+    priority = IntegerField(default=0)
+    # Unique while pending; released (NULL) when the task is claimed.
+    dedupe_key = CharField(max_length=255, null=True, unique=True)
+    run_after = DateTimeField(default=utcnow)
+    attempts = IntegerField(default=0)
+    max_attempts = IntegerField(default=5)
+    locked_by = CharField(max_length=255, null=True)
+    locked_until = DateTimeField(null=True)
+    last_error = TextField(null=True)
+    created_at = DateTimeField(default=utcnow)
+    started_at = DateTimeField(null=True)
+    finished_at = DateTimeField(null=True)
+
+    class Meta:
+        table_name = "background_task"
+        indexes = (
+            (("status", "queue", "run_after"), False),
+            (("status", "locked_until"), False),
+            (("status", "finished_at"), False),
+        )
+
+
 def init_db():
     db.connect(reuse_if_open=True)
     db.create_tables(
@@ -544,6 +581,7 @@ def init_db():
             DailyRepoStats,
             FallbackSource,
             ConfirmationToken,
+            BackgroundTask,
         ],
         safe=True,
     )
