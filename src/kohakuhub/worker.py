@@ -138,9 +138,7 @@ class Worker:
 
     async def _execute(self, row: BackgroundTask) -> None:
         spec = tasks.get_spec(row.kind)
-        run = asyncio.create_task(
-            asyncio.wait_for(spec.handler(json.loads(row.payload)), timeout=spec.timeout)
-        )
+        run = asyncio.create_task(self._invoke(spec, row))
         heartbeat = asyncio.create_task(self._heartbeat(row, run))
         try:
             await run
@@ -159,6 +157,11 @@ class Worker:
         finally:
             heartbeat.cancel()
             run.cancel()
+
+    @staticmethod
+    async def _invoke(spec: tasks.TaskSpec, row: BackgroundTask) -> None:
+        # Decoding inside the task routes a corrupt payload through normal failure handling.
+        await asyncio.wait_for(spec.handler(json.loads(row.payload)), timeout=spec.timeout)
 
     async def _heartbeat(self, row: BackgroundTask, run: asyncio.Task) -> bool:
         """Renew the lease; cancel the handler and return ``True`` if it is lost."""

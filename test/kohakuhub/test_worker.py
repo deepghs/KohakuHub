@@ -388,3 +388,16 @@ async def test_worker_survives_periodic_resync_errors(monkeypatch):
     monkeypatch.setattr(tasks, "ensure_periodic_tasks", flaky_ensure)
 
     await _run_until(_worker(), lambda: len(calls) >= 3)
+
+
+async def test_worker_fails_tasks_with_corrupt_payload():
+    @tasks.task("test.corrupt", max_attempts=1)
+    async def corrupt(payload):
+        raise AssertionError("handler must not run")
+
+    task_id = tasks.enqueue("test.corrupt")
+    BackgroundTask.update(payload="{not json").where(BackgroundTask.id == task_id).execute()
+
+    await _run_until(_worker(), lambda: _status(task_id) == tasks.FAILED)
+
+    assert BackgroundTask.get_by_id(task_id).last_error.startswith("JSONDecodeError")
