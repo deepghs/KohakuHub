@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import math
+import random
 import sys
 import tarfile
 import tempfile
@@ -4651,6 +4652,64 @@ SEED_BACKGROUND_TASKS: tuple[dict, ...] = (
 )
 
 
+# A day of finished demo.* history behind the showcase rows, so the dashboard's
+# windows have throughput, durations and an error distribution to show. It
+# includes a LakeFS outage 35-55 minutes before seeding that fails most
+# storage recalculations. Generated from a fixed seed, so it is deterministic.
+SEED_TASK_HISTORY_KINDS = (
+    # kind, queue, (min, max) duration in seconds
+    ("demo.recalculate_repo_storage", "default", (0.4, 6.0)),
+    ("demo.aggregate_download_sessions", "default", (0.1, 1.5)),
+    ("demo.lfs_gc", "default", (2.0, 40.0)),
+    ("demo.mirror_sync", "sync", (5.0, 120.0)),
+)
+SEED_TASK_HISTORY_ERRORS = (
+    "TimeoutError: upstream did not answer within 30s",
+    "KeyError: 'lfs_oid'",
+    "ConnectError: [Errno 111] Connection refused (lakefs)",
+)
+SEED_TASK_OUTAGE_ERROR = (
+    "RuntimeError: LakeFS returned 503 Service Unavailable while listing objects"
+)
+
+
+def seed_task_history(now, repo_ids: list[int]) -> list[dict]:
+    from datetime import timedelta
+
+    rng = random.Random(104)
+    rows: list[dict] = []
+
+    def add(kind: str, queue: str, finished_minutes_ago: float, duration: float,
+            failed: bool, error: str | None) -> None:
+        finished = now - timedelta(minutes=finished_minutes_ago)
+        started = finished - timedelta(seconds=duration)
+        attempts = 5 if failed else (2 if rng.random() < 0.1 else 1)
+        rows.append({
+            "kind": kind,
+            "queue": queue,
+            "payload": json.dumps({"repo_id": rng.choice(repo_ids)}),
+            "status": "failed" if failed else "succeeded",
+            "attempts": attempts,
+            "max_attempts": 5,
+            "run_after": started,
+            "created_at": started - timedelta(seconds=rng.uniform(0.2, 3.0)),
+            "started_at": started,
+            "finished_at": finished,
+            "last_error": error if failed else None,
+        })
+
+    for hour in range(24):
+        for kind, queue, (low, high) in SEED_TASK_HISTORY_KINDS:
+            for _ in range(rng.randint(1, 4)):
+                failed = rng.random() < 0.03
+                add(kind, queue, hour * 60 + rng.uniform(0.5, 59.5), rng.uniform(low, high),
+                    failed, rng.choice(SEED_TASK_HISTORY_ERRORS))
+    for _ in range(10):  # the outage
+        add("demo.recalculate_repo_storage", "default", rng.uniform(35, 55),
+            rng.uniform(0.4, 6.0), rng.random() < 0.7, SEED_TASK_OUTAGE_ERROR)
+    return rows
+
+
 def plant_seed_background_tasks() -> None:
     """Insert the example background tasks directly into the database."""
     from datetime import timedelta
@@ -4664,6 +4723,8 @@ def plant_seed_background_tasks() -> None:
     repos = list(Repository.select().order_by(Repository.id).limit(3))
     if len(repos) < 3:
         raise SeedError("plant background tasks needs at least three seeded repositories")
+    for row in seed_task_history(now, [repo.id for repo in repos]):
+        BackgroundTask.create(**row)
 
     def at(minutes: int | None):
         return None if minutes is None else now + timedelta(minutes=minutes)
@@ -5165,6 +5226,8 @@ async def trigger_download(
 
 
 def build_manifest() -> dict:
+    from kohakuhub.db import utcnow
+
     return {
         "seed_version": SEED_VERSION,
         "manifest_path": str(MANIFEST_PATH),
@@ -5240,6 +5303,7 @@ def build_manifest() -> dict:
             {"kind": spec["kind"], "status": spec["status"]}
             for spec in SEED_BACKGROUND_TASKS
         ],
+        "background_task_history": len(seed_task_history(utcnow(), [1, 2, 3])),
     }
 
 

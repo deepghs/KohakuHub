@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import hashlib
 import json
 import sys
@@ -227,14 +228,16 @@ async def verify_seed_data() -> dict:
                 headers={"X-Admin-Token": cfg.admin.secret_token},
             )
             response.raise_for_status()
-            seeded_tasks = sorted(
+            seeded_tasks = Counter(
                 (task["kind"], task["status"])
                 for task in response.json()["tasks"]
                 if task["kind"].startswith("demo.")
             )
-            if seeded_tasks != expected_tasks:
+            expected_total = len(expected_tasks) + manifest.get("background_task_history", 0)
+            if Counter(expected_tasks) - seeded_tasks or sum(seeded_tasks.values()) != expected_total:
                 raise VerifyError(
-                    f"Seeded background tasks differ: expected {expected_tasks}, found {seeded_tasks}"
+                    f"Seeded background tasks differ: expected {expected_total} rows including "
+                    f"{expected_tasks}, found {sum(seeded_tasks.values())}"
                 )
             summary["verified_checks"].append("background task examples")
 
