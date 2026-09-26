@@ -2,6 +2,7 @@
 
 import json
 import math
+from operator import itemgetter
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -231,9 +232,13 @@ def build_task_stats(window: str, now: datetime) -> dict:
             T.locked_until,
             T.last_error,
         )
-        .where(T.status.in_([QUEUED, RUNNING]) | (T.finished_at >= since) | (T.created_at >= since))
-        .order_by(T.id)
-        .dicts()
+        # Rows created in the window are either still queued/running or
+        # finished after creation, so these two clauses cover them too. The
+        # finished clause matches the (status, finished_at) index.
+        .where(
+            T.status.in_([QUEUED, RUNNING])
+            | (T.status.in_([SUCCEEDED, FAILED]) & (T.finished_at >= since))
+        ).dicts()
     )
 
     def bucket_of(moment: datetime) -> int:
@@ -260,26 +265,21 @@ def build_task_stats(window: str, now: datetime) -> dict:
                 "stuck": 0,
                 "durations": [],
                 "timeline": [{"succeeded": 0, "failed": 0} for _ in range(bucket_count)],
-                "last_error": None,
-                "last_failed_at": None,
+                "failures": [],  # (finished_at, first error line)
             },
         )
-
-    def note_failure(stats: dict, row: dict, finished_at: datetime) -> None:
-        if stats["last_failed_at"] is None or finished_at > stats["last_failed_at"]:
-            stats["last_failed_at"] = finished_at
-            stats["last_error"] = _first_line(row["last_error"])
 
     def record_error(row: dict, seen_at: datetime, field: str) -> None:
         group = errors.setdefault(
             _error_class(row["last_error"]),
-            {"failed": 0, "retrying": 0, "kinds": set(), "example": None, "last_seen": None},
+            {"failed": 0, "retrying": 0, "kinds": set(), "seen": []},
         )
         group[field] += 1
         group["kinds"].add(row["kind"])
-        if group["last_seen"] is None or seen_at > group["last_seen"]:
-            group["last_seen"] = seen_at
-            group["example"] = _first_line(row["last_error"])
+        group["seen"].append((seen_at, _first_line(row["last_error"])))
+
+    # Newest-wins picks use max() so the result does not depend on row order.
+    newest = itemgetter(0)
 
     for row in rows:
         stats = kind_stats(row["kind"])
@@ -288,7 +288,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
             series[bucket_of(row["created_at"])]["enqueued"] += 1
         finished_at = row["finished_at"]
         match row["status"]:
-            case "succeeded" | "failed" if finished_at and finished_at >= since:
+            case "succeeded" | "failed":
                 status = row["status"]
                 index = bucket_of(finished_at)
                 series[index][status] += 1
@@ -304,7 +304,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
                 else:
                     failed += 1
                     record_error(row, finished_at, "failed")
-                    note_failure(stats, row, finished_at)
+                    stats["failures"].append((finished_at, _first_line(row["last_error"])))
             case "queued":
                 stats["queued"] += 1
                 if row["run_after"] <= now:
@@ -315,7 +315,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
                 if row["attempts"] > 0 and row["last_error"]:
                     retrying += 1
                     record_error(row, row["started_at"] or row["created_at"], "retrying")
-            case "running":
+            case _:  # running: the query selects no other status
                 running += 1
                 stats["running"] += 1
                 if row["locked_until"] is None or row["locked_until"] < now:
@@ -324,13 +324,15 @@ def build_task_stats(window: str, now: datetime) -> dict:
                 else:
                     workers.add(row["locked_by"])
 
-    # A kind whose only row was enqueued without finishing, queueing or
-    # running (an anomalous row) says nothing about this window.
-    active_kinds = [
-        k for k in kinds.values() if k["succeeded"] + k["failed"] + k["queued"] + k["running"]
-    ]
     finished = succeeded + failed
     oldest_due_seconds = (now - oldest_due).total_seconds() if oldest_due else None
+    for kind in kinds.values():
+        kind["last_failed_at"], kind["last_error"] = max(
+            kind.pop("failures"), key=newest, default=(None, None)
+        )
+    for group in errors.values():
+        group["last_seen"], group["example"] = max(group.pop("seen"), key=newest)
+
     status, reasons = _health(
         finished=finished,
         failed=failed,
@@ -388,7 +390,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
                 "last_failed_at": _iso(kind["last_failed_at"]),
             }
             for kind in sorted(
-                active_kinds,
+                kinds.values(),
                 key=lambda k: (
                     -k["failed"],
                     -(k["succeeded"] + k["queued"] + k["running"]),
@@ -414,8 +416,11 @@ def build_task_stats(window: str, now: datetime) -> dict:
 
 
 @router.get("/tasks/stats")
-async def task_stats(window: str = "1h", _admin: bool = Depends(verify_admin_token)):
+def task_stats(window: str = "1h", _admin: bool = Depends(verify_admin_token)):
     """Queue health for the admin dashboard over a recent window.
+
+    A plain ``def`` so FastAPI runs the query and aggregation in its
+    threadpool instead of blocking the event loop.
 
     Args:
         window: One of 15m, 1h, 6h, 24h, 7d

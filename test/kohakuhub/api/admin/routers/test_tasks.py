@@ -317,13 +317,13 @@ def test_percentile_handles_small_samples():
     assert tasks_router._percentile([1.0, 2.0, 3.0, 4.0], 0.5) == 2.0
 
 
-async def test_stats_edge_cases_keep_latest_error_and_skip_anomalies(admin_client):
+async def test_stats_edge_cases_keep_latest_error_and_ignore_anomalies(admin_client):
     # Two failures of the same kind and error class: the newest one wins.
     _row(status="failed", finished_ago=5, duration=1, error="RuntimeError: newest")
     _row(status="failed", finished_ago=40, duration=1, error="RuntimeError: older")
     # Finished without a recorded start: counted, but not in durations.
     _row(kind="admin.other", finished_ago=10, duration=None)
-    # Anomalous row (finished status, no finished_at): only counts as enqueued.
+    # Anomalous row (finished status, no finished_at): outside every window.
     BackgroundTask.insert(
         kind="admin.ghost", status="succeeded", created_at=tasks.utcnow()
     ).execute()
@@ -331,7 +331,7 @@ async def test_stats_edge_cases_keep_latest_error_and_skip_anomalies(admin_clien
     body = (await admin_client.get("/admin/api/tasks/stats")).json()
 
     assert body["summary"]["finished"] == 3
-    assert body["summary"]["enqueued"] == 3 + 1
+    assert body["summary"]["enqueued"] == 3
     assert body["summary"]["duration_p50"] == pytest.approx(1)
     demo = next(k for k in body["kinds"] if k["kind"] == "admin.demo")
     assert demo["last_error"] == "RuntimeError: newest"
