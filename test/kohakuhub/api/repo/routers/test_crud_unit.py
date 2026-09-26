@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 import kohakuhub.api.repo.routers.crud as repo_crud
 import kohakuhub.api.operation_capabilities as operation_capabilities
+from kohakuhub.utils.lakefs import lakefs_repo_name
 
 
 class _Expr:
@@ -491,6 +492,8 @@ async def test_move_repo_covers_validation_quota_and_metadata_only_success(monke
     monkeypatch.setattr(repo_crud, "_update_repository_database_records", lambda **kwargs: atomic_state.setdefault("updated", []).append(kwargs))
     monkeypatch.setattr(repo_crud, "db", SimpleNamespace(atomic=lambda: _AtomicContext(atomic_state)))
     monkeypatch.setattr(repo_crud.cfg.app, "base_url", "https://hub.example.com")
+    monkeypatch.setattr(repo_crud, "Repository", _FakeRepositoryModel)
+    _FakeRepositoryModel.reset()
     for name in (
         "_migrate_lakefs_repository",
         "allocate_lakefs_repo_name",
@@ -1528,6 +1531,8 @@ async def test_move_repo_reports_a_lost_rename_race_as_exists(monkeypatch):
     )
     monkeypatch.setattr(repo_crud, "_update_repository_database_records", _lost_race)
     monkeypatch.setattr(repo_crud, "db", SimpleNamespace(atomic=lambda: _AtomicContext({})))
+    monkeypatch.setattr(repo_crud, "Repository", _FakeRepositoryModel)
+    _FakeRepositoryModel.reset()
 
     response = await repo_crud.move_repo(
         repo_crud.MoveRepoPayload(fromRepo="owner/from", toRepo="owner/to", type="model"),
@@ -1596,3 +1601,140 @@ async def test_create_repo_reports_a_concurrent_winner_as_exists_not_retry(monke
         "a permanently taken name must not be advertised as retryable"
     )
     assert sleeps == [], "no need to pace a client that should stop retrying"
+
+
+def _move_env(monkeypatch, repo_row, siblings):
+    """Stubs for move tests: `siblings` are the target namespace's repositories."""
+    updates = []
+    monkeypatch.setattr(repo_crud, "check_repo_delete_permission", lambda repo, user, is_admin=False: None)
+    monkeypatch.setattr(repo_crud, "check_namespace_permission", lambda namespace, user, is_admin=False: None)
+    monkeypatch.setattr(
+        repo_crud,
+        "get_repository",
+        lambda repo_type, namespace, name: repo_row if (namespace, name) == ("owner", repo_row.name) else None,
+    )
+    monkeypatch.setattr(repo_crud, "_update_repository_database_records", lambda **kwargs: updates.append(kwargs))
+    monkeypatch.setattr(repo_crud, "db", SimpleNamespace(atomic=lambda: _AtomicContext({})))
+    monkeypatch.setattr(repo_crud, "Repository", _FakeRepositoryModel)
+    _FakeRepositoryModel.reset()
+    _FakeRepositoryModel.select_query = _Query(items=siblings)
+    return updates
+
+
+@pytest.mark.asyncio
+async def test_move_repo_rejects_a_target_that_normalizes_to_an_existing_name(monkeypatch):
+    """Create refuses names that differ only by case, '-' or '_' from an existing
+    repository; a move must not be a way around that."""
+    repo_row = SimpleNamespace(id=1, name="from", private=False, repo_type="model", full_id="owner/from", lakefs_repo="m-owner-from")
+    existing = SimpleNamespace(id=2, name="demo_model")
+    updates = _move_env(monkeypatch, repo_row, [repo_row, existing])
+
+    response = await repo_crud.move_repo(
+        repo_crud.MoveRepoPayload(fromRepo="owner/from", toRepo="owner/Demo-Model", type="model"),
+        auth=(SimpleNamespace(username="owner"), False),
+    )
+
+    assert response.status_code == 409
+    assert response.headers.get("x-error-code") == repo_crud.HFErrorCode.REPO_EXISTS
+    assert "demo_model" in json.loads(bytes(response.body))["error"]
+    assert updates == []
+
+
+@pytest.mark.asyncio
+async def test_move_repo_allows_renaming_a_repository_to_a_variant_of_its_own_name(monkeypatch):
+    """Changing only case or separators of a repository's own name is allowed:
+    the only normalized match is the repository being renamed."""
+    repo_row = SimpleNamespace(id=1, name="demo-model", private=False, repo_type="model", full_id="owner/demo-model", lakefs_repo="m-owner-demo-model")
+    updates = _move_env(monkeypatch, repo_row, [repo_row])
+
+    response = await repo_crud.move_repo(
+        repo_crud.MoveRepoPayload(fromRepo="owner/demo-model", toRepo="owner/Demo_Model", type="model"),
+        auth=(SimpleNamespace(username="owner"), False),
+    )
+
+    assert response["success"] is True
+    assert updates[-1]["to_name"] == "Demo_Model"
+
+
+@pytest.mark.asyncio
+async def test_move_repo_pins_the_derived_lakefs_id_of_a_legacy_row(monkeypatch):
+    """A row from before migration 016 has no stored LakeFS id and derives it from
+    its repo id. After a rename it would derive from the *new* id - a repository
+    that does not exist - so the move must store the old derivation explicitly."""
+    repo_row = SimpleNamespace(id=1, name="legacy", private=False, repo_type="model", full_id="owner/legacy", lakefs_repo=None)
+    updates = _move_env(monkeypatch, repo_row, [repo_row])
+
+    response = await repo_crud.move_repo(
+        repo_crud.MoveRepoPayload(fromRepo="owner/legacy", toRepo="owner/renamed", type="model"),
+        auth=(SimpleNamespace(username="owner"), False),
+    )
+
+    assert response["success"] is True
+    assert updates[-1]["to_lakefs_repo"] == lakefs_repo_name("model", "owner/legacy")
+    assert updates[-1]["to_lakefs_repo"] != lakefs_repo_name("model", "owner/renamed")
+
+
+class _RowAlreadyThere(_FakeRepositoryModel):
+    @classmethod
+    def get_or_create(cls, **kwargs):
+        cls.get_or_create_calls.append(kwargs)
+        return SimpleNamespace(full_id=kwargs["full_id"]), False
+
+
+class _RowInsertFails(_FakeRepositoryModel):
+    @classmethod
+    def get_or_create(cls, **kwargs):
+        raise RuntimeError("database connection lost")
+
+
+@pytest.mark.asyncio
+async def test_create_repo_reports_a_row_claimed_during_the_lakefs_create_as_exists(monkeypatch):
+    """Two concurrent creates of one name: the loser's LakeFS create can succeed
+    (on another id) before the winner's row is visible. The loser must then drop
+    its own LakeFS repository and answer "exists", not report success."""
+    client = _FakeClient()
+    _create_repo_env(monkeypatch, client, ["m-owner-demo-gen0"])
+    monkeypatch.setattr(repo_crud, "Repository", _RowAlreadyThere)
+    _RowAlreadyThere.get_or_create_calls = []
+
+    response = await repo_crud.create_repo(
+        repo_crud.CreateRepoPayload(type="model", name="demo-model"),
+        user=SimpleNamespace(username="owner"),
+    )
+
+    assert response.status_code == 409
+    assert response.headers.get("x-error-code") == repo_crud.HFErrorCode.REPO_EXISTS
+    assert ("delete_repository", {"repository": "m-owner-demo-gen0", "force": True}) in client.calls
+
+
+@pytest.mark.asyncio
+async def test_create_repo_removes_its_lakefs_repo_when_the_row_insert_fails(monkeypatch):
+    """A LakeFS repository without a row is unreachable: remove it on failure."""
+    client = _FakeClient()
+    _create_repo_env(monkeypatch, client, ["m-owner-demo-gen0"])
+    monkeypatch.setattr(repo_crud, "Repository", _RowInsertFails)
+
+    response = await repo_crud.create_repo(
+        repo_crud.CreateRepoPayload(type="model", name="demo-model"),
+        user=SimpleNamespace(username="owner"),
+    )
+
+    assert response.status_code == 500
+    assert response.headers.get("x-error-code") == repo_crud.HFErrorCode.SERVER_ERROR
+    assert ("delete_repository", {"repository": "m-owner-demo-gen0", "force": True}) in client.calls
+
+
+@pytest.mark.asyncio
+async def test_create_repo_row_failure_survives_lakefs_cleanup_errors(monkeypatch):
+    """Removing the orphan is best effort; its failure must not mask the error."""
+    client = _FakeClient()
+    client.raise_on["delete_repository"] = RuntimeError("lakefs down")
+    _create_repo_env(monkeypatch, client, ["m-owner-demo-gen0"])
+    monkeypatch.setattr(repo_crud, "Repository", _RowInsertFails)
+
+    response = await repo_crud.create_repo(
+        repo_crud.CreateRepoPayload(type="model", name="demo-model"),
+        user=SimpleNamespace(username="owner"),
+    )
+
+    assert response.status_code == 500

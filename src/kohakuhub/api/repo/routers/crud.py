@@ -295,6 +295,14 @@ async def _create_lakefs_repository(
     return None
 
 
+async def _drop_unclaimed_lakefs_repository(client, lakefs_repo: str) -> None:
+    """Best-effort removal of a LakeFS repository no row points at."""
+    try:
+        await client.delete_repository(repository=lakefs_repo, force=True)
+    except Exception as e:
+        logger.warning(f"Failed to remove unclaimed LakeFS repository {lakefs_repo}: {e}")
+
+
 async def _wait_for_lakefs_repo_deletion(client, lakefs_repo: str) -> bool:
     """Wait, bounded, for LakeFS to finish deleting `lakefs_repo`.
 
@@ -525,17 +533,30 @@ async def create_repo(
     # Store in database for listing/metadata.
     # `lakefs_repo` records which LakeFS repository this row owns; every read
     # path resolves through it (see `resolve_lakefs_repo`).
-    Repository.get_or_create(
-        repo_type=payload.type,
-        namespace=namespace,
-        name=payload.name,
-        full_id=full_id,
-        defaults={
-            "private": resolved_private,
-            "owner": user,
-            "lakefs_repo": lakefs_repo,
-        },
-    )
+    try:
+        _row, created = Repository.get_or_create(
+            repo_type=payload.type,
+            namespace=namespace,
+            name=payload.name,
+            full_id=full_id,
+            defaults={
+                "private": resolved_private,
+                "owner": user,
+                "lakefs_repo": lakefs_repo,
+            },
+        )
+    except Exception as e:
+        # A LakeFS repository without a row is unreachable; do not leave it.
+        logger.exception(f"Failed to record repository {full_id}", e)
+        await _drop_unclaimed_lakefs_repository(client, lakefs_repo)
+        return hf_server_error(f"Failed to record repository: {str(e)}")
+    if not created:
+        # A concurrent create inserted the row first: its LakeFS create landed on
+        # another id before this request's did (the loser steps over a taken id
+        # while the winner's row is not visible yet). The name is theirs.
+        logger.info(f"Concurrent create won the race for {full_id}; dropping {lakefs_repo}")
+        await _drop_unclaimed_lakefs_repository(client, lakefs_repo)
+        return _repo_exists_response(payload.type, full_id)
 
     # Strict-freshness invalidation (#79): a fallback ghost binding for
     # this repo (written before the local repo existed) must be evicted
@@ -1063,6 +1084,20 @@ async def move_repo(
     existing = get_repository(repo_type, to_namespace, to_name)
     if existing:
         return _repo_exists_response(repo_type, to_id)
+
+    # Create refuses names that differ from another repository only by case,
+    # "-" or "_"; a move must not be a way around that. The repository being
+    # moved is skipped, so renaming it to a variant of its own name is fine.
+    normalized = normalize_name(to_name)
+    for sibling in Repository.select().where(
+        (Repository.repo_type == repo_type) & (Repository.namespace == to_namespace)
+    ):
+        if sibling.id != repo_row.id and normalize_name(sibling.name) == normalized:
+            return _repo_exists_response(
+                repo_type,
+                f"{to_namespace}/{sibling.name}",
+                message=f"Repository name conflicts with existing repository: {sibling.name}",
+            )
 
     # Check storage quota (only for users, admin bypasses)
     repo_size = 0

@@ -630,3 +630,36 @@ async def test_hf_move_repo_keeps_history_branches_and_tags(
     )
     assert data == b"y" * 4096
 
+
+
+async def test_hf_move_repo_refuses_a_name_that_normalizes_to_another_repo(
+    live_server_url,
+    hf_api_token,
+):
+    """Create refuses `My_Repo` next to `my-repo`; a move must refuse it too,
+    while still allowing a repository to change the case of its own name."""
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+    for repo_id in ("owner/issue108-norm", "owner/issue108-other"):
+        await asyncio.to_thread(
+            lambda: api.create_repo(repo_id=repo_id, repo_type="model", private=True)
+        )
+
+    # Status is read off the response so this holds across huggingface_hub
+    # versions whose HTTP error classes live in different modules.
+    with pytest.raises(Exception) as conflict:
+        await asyncio.to_thread(
+            lambda: api.move_repo(
+                from_id="owner/issue108-other", to_id="owner/Issue108_Norm", repo_type="model"
+            )
+        )
+    assert getattr(getattr(conflict.value, "response", None), "status_code", None) == 409
+
+    await asyncio.to_thread(
+        lambda: api.move_repo(
+            from_id="owner/issue108-norm", to_id="owner/Issue108-Norm", repo_type="model"
+        )
+    )
+    renamed = await asyncio.to_thread(
+        lambda: api.repo_info(repo_id="owner/Issue108-Norm", repo_type="model")
+    )
+    assert renamed.id == "owner/Issue108-Norm"
