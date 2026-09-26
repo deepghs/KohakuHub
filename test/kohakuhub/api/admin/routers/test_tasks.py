@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from kohakuhub import tasks
-from kohakuhub.db import BackgroundTask
+from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog
 
 
 @pytest.fixture(autouse=True)
@@ -47,7 +47,13 @@ async def test_list_tasks_returns_rows_counts_and_kinds(admin_client):
     body = response.json()
     assert body["total"] == 2
     assert [row["id"] for row in body["tasks"]] == [failed, queued]
-    assert body["counts"] == {"queued": 1, "running": 0, "succeeded": 0, "failed": 1}
+    assert body["counts"] == {
+        "queued": 1,
+        "running": 0,
+        "succeeded": 0,
+        "failed": 1,
+        "cancelled": 0,
+    }
     assert body["kinds"] == ["admin.demo", "admin.other"]
     assert (body["limit"], body["offset"]) == (50, 0)
     failed_row = body["tasks"][0]
@@ -55,6 +61,9 @@ async def test_list_tasks_returns_rows_counts_and_kinds(admin_client):
     assert failed_row["last_error"] == "RuntimeError: boom"
     assert failed_row["finished_at"].endswith("+00:00")
     assert failed_row["lease_expired"] is False
+    assert (failed_row["cancel_requested"], failed_row["stalled"]) == (False, False)
+    assert failed_row["progress"] is None
+    assert failed_row["stall_seconds"] == 600
     assert body["tasks"][1]["priority"] == 3
     assert body["tasks"][1]["started_at"] is None
 
@@ -100,7 +109,7 @@ async def test_get_task_reports_expired_leases(admin_client):
     assert (await admin_client.get("/admin/api/tasks/999999")).status_code == 404
 
 
-async def test_retry_task_requeues_failed_tasks_only(admin_client):
+async def test_retry_task_requeues_failed_or_cancelled_tasks_only(admin_client):
     failed = _failed_task()
     queued = tasks.enqueue("admin.demo")
 
@@ -115,19 +124,233 @@ async def test_retry_task_requeues_failed_tasks_only(admin_client):
     assert (await admin_client.post("/admin/api/tasks/999999/retry")).status_code == 404
 
 
-async def test_delete_task_discards_queued_and_failed_but_not_running(admin_client):
+async def test_delete_task_discards_failed_and_cancelled_tasks_only(admin_client):
     failed = _failed_task()
     running = tasks.enqueue("admin.demo")
     tasks.claim_next("w-admin", lease_seconds=60)
+    queued = tasks.enqueue("admin.demo")
+    cancelled = tasks.enqueue("admin.other")
+    tasks.request_cancel(cancelled)
 
     assert (await admin_client.delete(f"/admin/api/tasks/{failed}")).json() == {
         "success": True,
         "id": failed,
     }
-    conflict = await admin_client.delete(f"/admin/api/tasks/{running}")
-    assert conflict.status_code == 409
-    assert "running" in conflict.json()["detail"]["error"]
+    assert (await admin_client.delete(f"/admin/api/tasks/{cancelled}")).status_code == 200
+    for task_id, status in ((running, "running"), (queued, "queued")):
+        conflict = await admin_client.delete(f"/admin/api/tasks/{task_id}")
+        assert conflict.status_code == 409
+        assert "cancel" in conflict.json()["detail"]["error"]
+        assert status in conflict.json()["detail"]["error"]
     assert (await admin_client.delete(f"/admin/api/tasks/{failed}")).status_code == 404
+
+
+async def test_cancel_task_cancels_queued_and_flags_running_tasks(admin_client):
+    queued = tasks.enqueue("admin.demo")
+    running = tasks.enqueue("admin.other", priority=10)
+    tasks.claim_next("w-admin", lease_seconds=60)
+
+    response = await admin_client.post(f"/admin/api/tasks/{queued}/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+    response = await admin_client.post(f"/admin/api/tasks/{running}/cancel")
+    assert response.status_code == 200
+    assert (response.json()["status"], response.json()["cancel_requested"]) == ("running", True)
+
+    again = await admin_client.post(f"/admin/api/tasks/{running}/cancel")
+    assert again.status_code == 409
+    assert "already requested" in again.json()["detail"]["error"]
+    finished = await admin_client.post(f"/admin/api/tasks/{queued}/cancel")
+    assert finished.status_code == 409
+    assert "task is cancelled" in finished.json()["detail"]["error"]
+    assert (await admin_client.post("/admin/api/tasks/999999/cancel")).status_code == 404
+
+
+async def test_get_task_returns_timeline_attempts_progress_and_log_counts(
+    admin_client, monkeypatch
+):
+    monkeypatch.setattr(tasks, "retry_delay", lambda attempts: 0)
+    task_id = tasks.enqueue("admin.demo", {"repo_id": 9})
+    first = tasks.claim_next("w-1", lease_seconds=60)
+    tasks.record_stage(first, "listing")
+    tasks.write_logs(first, [{"at": tasks.utcnow(), "level": "INFO", "message": "one"}])
+    tasks.fail_task(first, "RuntimeError: flaky")
+    second = tasks.claim_next("w-2", lease_seconds=60)
+    ctx = tasks.TaskContext(second, log_limit_bytes=1000)
+    ctx.checkpoint({"cursor": "b/7"})
+    ctx.progress(40, 100)
+    tasks.heartbeat(second, lease_seconds=60, progress=ctx.pending_progress())
+    tasks.write_logs(
+        second, [{"at": tasks.utcnow(), "level": "INFO", "message": m} for m in ("a", "b")]
+    )
+
+    body = (await admin_client.get(f"/admin/api/tasks/{task_id}")).json()
+
+    assert [event["type"] for event in body["events"]] == [
+        "created",
+        "claimed",
+        "stage",
+        "retry_scheduled",
+        "claimed",
+    ]
+    assert body["events"][2]["detail"] == {"stage": "listing"}
+    assert body["checkpoint"] == {"cursor": "b/7"}
+    assert body["log_lines"] == 3
+    first_attempt, second_attempt = body["runs"]
+    assert (first_attempt["worker"], first_attempt["outcome"]) == ("w-1", "failed")
+    assert first_attempt["error"] == "RuntimeError: flaky"
+    assert [s["stage"] for s in first_attempt["stages"]] == ["listing"]
+    assert (first_attempt["log_lines"], second_attempt["log_lines"]) == (1, 2)
+    assert (second_attempt["outcome"], second_attempt["finished_at"]) == ("running", None)
+    progress = body["progress"]
+    assert (progress["done"], progress["total"], progress["stage"]) == (40, 100, "listing")
+    assert progress["eta_seconds"] is None  # a single report has no rate yet
+    assert progress["updated_at"].endswith("+00:00")
+
+
+async def test_get_task_tolerates_corrupt_checkpoints_and_event_details(admin_client):
+    task_id = tasks.enqueue("admin.demo")
+    BackgroundTask.update(checkpoint="{bad").where(BackgroundTask.id == task_id).execute()
+    BackgroundTaskEvent.update(detail="{bad").where(BackgroundTaskEvent.task == task_id).execute()
+
+    body = (await admin_client.get(f"/admin/api/tasks/{task_id}")).json()
+
+    assert body["checkpoint"] == "{bad"
+    assert body["events"][0]["detail"] == {"raw": "{bad"}
+    assert body["runs"] == [] and body["log_lines"] == 0
+
+
+async def test_list_tasks_reports_progress_eta_and_stalls(admin_client):
+    now = tasks.utcnow()
+    moving = tasks.enqueue("admin.demo")
+    tasks.claim_next("w-1", lease_seconds=60)
+    BackgroundTask.update(
+        progress_done=50,
+        progress_total=100,
+        progress_at=now,
+        progress_base_done=0,
+        progress_base_at=now - timedelta(seconds=50),
+    ).where(BackgroundTask.id == moving).execute()
+    stuck = tasks.enqueue("admin.other")
+    tasks.claim_next("w-1", lease_seconds=60)
+    BackgroundTask.update(
+        started_at=now - timedelta(minutes=30), progress_stage="waiting on LakeFS"
+    ).where(BackgroundTask.id == stuck).execute()
+
+    rows = {row["id"]: row for row in (await admin_client.get("/admin/api/tasks")).json()["tasks"]}
+
+    assert rows[moving]["progress"]["eta_seconds"] == pytest.approx(50, abs=2)
+    assert rows[moving]["stalled"] is False
+    assert rows[stuck]["stalled"] is True
+    assert rows[stuck]["progress"] == {
+        "done": None,
+        "total": None,
+        "stage": "waiting on LakeFS",
+        "updated_at": None,
+        "eta_seconds": None,
+    }
+
+
+def _logs(task_id, attempt, count, prefix="line"):
+    BackgroundTaskLog.insert_many(
+        [
+            {
+                "task": task_id,
+                "attempt": attempt,
+                "at": tasks.utcnow(),
+                "level": "INFO",
+                "message": f"{prefix} {i}",
+            }
+            for i in range(count)
+        ]
+    ).execute()
+
+
+async def test_task_logs_page_filter_and_tail(admin_client):
+    task_id = tasks.enqueue("admin.demo")
+    _logs(task_id, 1, 3, "first")
+    _logs(task_id, 2, 2, "second")
+
+    page = (await admin_client.get(f"/admin/api/tasks/{task_id}/logs", params={"limit": 2})).json()
+    assert [line["message"] for line in page["lines"]] == ["first 0", "first 1"]
+    assert page["has_more"] is True
+    assert page["status"] == "queued"
+    rest = (
+        await admin_client.get(
+            f"/admin/api/tasks/{task_id}/logs", params={"after_id": page["next_after_id"]}
+        )
+    ).json()
+    assert [line["message"] for line in rest["lines"]] == [
+        "first 2",
+        "second 0",
+        "second 1",
+    ]
+    assert rest["has_more"] is False
+    assert rest["lines"][0]["at"].endswith("+00:00")
+
+    tail = (
+        await admin_client.get(
+            f"/admin/api/tasks/{task_id}/logs", params={"after_id": rest["next_after_id"]}
+        )
+    ).json()
+    assert tail["lines"] == [] and tail["next_after_id"] == rest["next_after_id"]
+
+    second = (
+        await admin_client.get(f"/admin/api/tasks/{task_id}/logs", params={"attempt": 2})
+    ).json()
+    assert [line["attempt"] for line in second["lines"]] == [2, 2]
+    assert (await admin_client.get("/admin/api/tasks/999999/logs")).status_code == 404
+
+
+async def test_task_logs_download_streams_plain_text_in_batches(admin_client, monkeypatch):
+    monkeypatch.setattr(tasks_router, "LOG_DOWNLOAD_BATCH", 2)
+    task_id = tasks.enqueue("admin.demo")
+    _logs(task_id, 1, 3, "first")
+    _logs(task_id, 2, 2, "second")
+
+    response = await admin_client.get(f"/admin/api/tasks/{task_id}/logs/download")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert f'filename="task-{task_id}.log"' in response.headers["content-disposition"]
+    lines = response.text.splitlines()
+    assert lines[0] == f"# Task {task_id} (admin.demo), status queued"
+    assert len(lines) == 6
+    assert lines[1].endswith("first 0") and "[attempt 1] INFO" in lines[1]
+    assert lines[-1].endswith("second 1")
+
+    one = await admin_client.get(f"/admin/api/tasks/{task_id}/logs/download", params={"attempt": 2})
+    assert f'filename="task-{task_id}-attempt-2.log"' in one.headers["content-disposition"]
+    assert len(one.text.splitlines()) == 3
+    assert (await admin_client.get("/admin/api/tasks/999999/logs/download")).status_code == 404
+
+
+def test_build_runs_ignores_events_outside_a_run():
+    at = "2026-01-01T00:00:00+00:00"
+
+    def event(type_, attempt, **detail):
+        return {"type": type_, "attempt": attempt, "worker": "w", "at": at, "detail": detail}
+
+    attempts = tasks_router.build_runs(
+        [
+            event("created", 0),
+            event("cancel_requested", 1),  # before any claim of attempt 1
+            event("claimed", 1),
+            event("lease_expired", 1),
+            event("succeeded", 1),  # after the attempt already ended
+            event("claimed", 2),
+            event("released", 2),  # shutdown: the next run reuses attempt 2
+            event("claimed", 2),
+            event("cancel_requested", 2),  # neither a stage nor an outcome
+            event("cancelled", 2),
+        ]
+    )
+
+    assert [(a["attempt"], a["outcome"]) for a in attempts] == [
+        (1, "lease expired"),
+        (2, "released"),
+        (2, "cancelled"),
+    ]
 
 
 async def test_list_tasks_tolerates_corrupt_payloads(admin_client):
@@ -157,6 +380,8 @@ def _row(
     lease_in=None,
     worker=None,
     error=None,
+    stall_seconds=None,
+    cancel_requested=False,
 ):
     now = tasks.utcnow()
 
@@ -176,6 +401,8 @@ def _row(
         locked_by=worker,
         locked_until=None if lease_in is None else now + timedelta(seconds=lease_in),
         last_error=error,
+        stall_seconds=stall_seconds,
+        cancel_requested=cancel_requested,
     ).execute()
 
 
@@ -347,3 +574,23 @@ def test_health_tolerates_failure_rate_below_threshold():
         finished=20, failed=1, stuck=0, oldest_due=None, retrying=0, busy=True
     )
     assert (status, reasons) == ("healthy", [])
+
+
+async def test_stats_counts_cancellations_and_stalls_without_calling_them_failures(
+    admin_client,
+):
+    _row(finished_ago=5, created_ago=6, duration=1)
+    _row(status="cancelled", finished_ago=4, created_ago=6)
+    # Started a minute ago with no progress since, past a 30 s threshold.
+    _row(status="running", created_ago=2, lease_in=60, worker="w-1", stall_seconds=30)
+    _row(status="running", created_ago=2, lease_in=60, worker="w-1", cancel_requested=True)
+
+    body = (await admin_client.get("/admin/api/tasks/stats", params={"window": "15m"})).json()
+
+    assert (body["summary"]["finished"], body["summary"]["cancelled"]) == (1, 1)
+    assert body["summary"]["failure_rate"] == 0
+    assert (body["backlog"]["stalled"], body["backlog"]["cancel_requested"]) == (1, 1)
+    demo = next(k for k in body["kinds"] if k["kind"] == "admin.demo")
+    assert demo["cancelled"] == 1
+    assert body["health"]["status"] == "degraded"
+    assert "no progress" in body["health"]["reasons"][0]["message"]

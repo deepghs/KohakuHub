@@ -4,19 +4,25 @@ import json
 import math
 from operator import itemgetter
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from peewee import fn
 
-from kohakuhub.db import BackgroundTask, utcnow
+from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, utcnow
 from kohakuhub.logger import get_logger
 from kohakuhub.tasks import (
+    CANCELLED,
     FAILED,
     QUEUED,
     RUNNING,
     STATUSES,
     SUCCEEDED,
     discard_task,
+    estimate_eta_seconds,
+    is_stalled,
+    request_cancel,
     retry_failed_task,
 )
 from kohakuhub.api.admin.utils import verify_admin_token
@@ -38,6 +44,17 @@ FAILURE_RATE_WARN = 0.10
 FAILURE_RATE_CRITICAL = 0.50
 MIN_RATE_SAMPLES = 5
 TOP_ERRORS = 8
+LOG_PAGE_MAX = 2000
+LOG_DOWNLOAD_BATCH = 1000
+# Events that end an attempt, for the per-attempt summary.
+ATTEMPT_OUTCOMES = {
+    "succeeded": "succeeded",
+    "failed": "failed",
+    "retry_scheduled": "failed",
+    "cancelled": "cancelled",
+    "released": "released",
+    "lease_expired": "lease expired",
+}
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -52,7 +69,20 @@ def _payload(task: BackgroundTask):
         return task.payload  # corrupt rows stay visible so they can be discarded
 
 
+def _progress(task: BackgroundTask, now: datetime) -> dict | None:
+    if task.progress_done is None and task.progress_stage is None:
+        return None
+    return {
+        "done": task.progress_done,
+        "total": task.progress_total,
+        "stage": task.progress_stage,
+        "updated_at": _iso(task.progress_at),
+        "eta_seconds": estimate_eta_seconds(task, now),
+    }
+
+
 def _serialize(task: BackgroundTask) -> dict:
+    now = utcnow()
     return {
         "id": task.id,
         "kind": task.kind,
@@ -68,7 +98,11 @@ def _serialize(task: BackgroundTask) -> dict:
         "locked_until": _iso(task.locked_until),
         "lease_expired": task.status == RUNNING
         and task.locked_until is not None
-        and task.locked_until < utcnow(),
+        and task.locked_until < now,
+        "cancel_requested": task.cancel_requested,
+        "stalled": is_stalled(task, now),
+        "stall_seconds": task.stall_seconds,
+        "progress": _progress(task, now),
         "last_error": task.last_error,
         "created_at": _iso(task.created_at),
         "started_at": _iso(task.started_at),
@@ -94,7 +128,7 @@ async def list_tasks(
     """List background tasks, newest first, with per-status counts.
 
     Args:
-        status: Filter by status (queued, running, succeeded, failed)
+        status: Filter by status (queued, running, succeeded, failed, cancelled)
         kind: Filter by task kind
         limit: Maximum number to return
         offset: Offset for pagination
@@ -173,6 +207,7 @@ def _health(
     oldest_due: float | None,
     retrying: int,
     busy: bool,
+    stalled: int = 0,
 ) -> tuple[str, list[dict]]:
     """Classify queue health and explain why, most severe signals first."""
     reasons: list[dict] = []
@@ -203,6 +238,8 @@ def _health(
         add("degraded", f"{failed} task(s) failed in the window")
     if retrying:
         add("degraded", f"{retrying} task(s) are waiting to retry after an error")
+    if stalled:
+        add("degraded", f"{stalled} running task(s) have made no progress for a while")
 
     if any(reason["level"] == "unhealthy" for reason in reasons):
         return "unhealthy", reasons
@@ -231,13 +268,16 @@ def build_task_stats(window: str, now: datetime) -> dict:
             T.locked_by,
             T.locked_until,
             T.last_error,
+            T.stall_seconds,
+            T.cancel_requested,
+            T.progress_at,
         )
         # Rows created in the window are either still queued/running or
         # finished after creation, so these two clauses cover them too. The
         # finished clause matches the (status, finished_at) index.
         .where(
             T.status.in_([QUEUED, RUNNING])
-            | (T.status.in_([SUCCEEDED, FAILED]) & (T.finished_at >= since))
+            | (T.status.in_([SUCCEEDED, FAILED, CANCELLED]) & (T.finished_at >= since))
         ).dicts()
     )
 
@@ -248,8 +288,8 @@ def build_task_stats(window: str, now: datetime) -> dict:
     kinds: dict[str, dict] = {}
     errors: dict[str, dict] = {}
     durations: list[float] = []
-    succeeded = failed = after_retry = enqueued = 0
-    due = scheduled = retrying = running = stuck = 0
+    succeeded = failed = cancelled = after_retry = enqueued = 0
+    due = scheduled = retrying = running = stuck = stalled = cancelling = 0
     oldest_due: datetime | None = None
     workers: set[str] = set()
 
@@ -263,6 +303,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
                 "queued": 0,
                 "running": 0,
                 "stuck": 0,
+                "cancelled": 0,
                 "durations": [],
                 "timeline": [{"succeeded": 0, "failed": 0} for _ in range(bucket_count)],
                 "failures": [],  # (finished_at, first error line)
@@ -305,6 +346,11 @@ def build_task_stats(window: str, now: datetime) -> dict:
                     failed += 1
                     record_error(row, finished_at, "failed")
                     stats["failures"].append((finished_at, _first_line(row["last_error"])))
+            case "cancelled":
+                # An admin decision, not a failure: counted, but kept out of
+                # the failure rate and the success/failure series.
+                cancelled += 1
+                stats["cancelled"] += 1
             case "queued":
                 stats["queued"] += 1
                 if row["run_after"] <= now:
@@ -323,6 +369,8 @@ def build_task_stats(window: str, now: datetime) -> dict:
                     stats["stuck"] += 1
                 else:
                     workers.add(row["locked_by"])
+                    stalled += is_stalled(SimpleNamespace(**row), now)
+                cancelling += row["cancel_requested"]
 
     finished = succeeded + failed
     oldest_due_seconds = (now - oldest_due).total_seconds() if oldest_due else None
@@ -340,6 +388,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
         oldest_due=oldest_due_seconds,
         retrying=retrying,
         busy=bool(due or scheduled or running),
+        stalled=stalled,
     )
 
     return {
@@ -358,6 +407,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
             "finished": finished,
             "succeeded": succeeded,
             "failed": failed,
+            "cancelled": cancelled,
             "succeeded_after_retry": after_retry,
             "failure_rate": failed / finished if finished else None,
             "throughput_per_minute": finished / (span.total_seconds() / 60),
@@ -372,6 +422,8 @@ def build_task_stats(window: str, now: datetime) -> dict:
             "oldest_due_seconds": oldest_due_seconds,
             "running": running,
             "stuck": stuck,
+            "stalled": stalled,
+            "cancel_requested": cancelling,
             "active_workers": len(workers),
         },
         "series": [
@@ -432,34 +484,225 @@ def task_stats(window: str = "1h", _admin: bool = Depends(verify_admin_token)):
     return build_task_stats(window, utcnow())
 
 
+def _event_detail(event: BackgroundTaskEvent) -> dict:
+    try:
+        return json.loads(event.detail) if event.detail else {}
+    except ValueError:
+        return {"raw": event.detail}
+
+
+def build_runs(events: list[dict]) -> list[dict]:
+    """One entry per run, in claim order: where it ran, how it ended and why.
+
+    A run handed back at shutdown does not spend its attempt, so the next run
+    reuses the number; events attach to the latest run with their number.
+    """
+    runs: list[dict] = []
+    latest: dict[int, dict] = {}
+    for event in events:
+        if event["type"] == "claimed":
+            run = {
+                "attempt": event["attempt"],
+                "worker": event["worker"],
+                "started_at": event["at"],
+                "finished_at": None,
+                "outcome": "running",
+                "error": None,
+                "stages": [],
+            }
+            runs.append(run)
+            latest[event["attempt"]] = run
+            continue
+        run = latest.get(event["attempt"])
+        if run is None or run["outcome"] != "running":
+            continue  # not tied to a claim, or after the run already ended
+        if event["type"] == "stage":
+            run["stages"].append({"at": event["at"], "stage": event["detail"].get("stage")})
+        elif event["type"] in ATTEMPT_OUTCOMES:
+            run["finished_at"] = event["at"]
+            run["outcome"] = ATTEMPT_OUTCOMES[event["type"]]
+            run["error"] = event["detail"].get("error")
+    return runs
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: int, _admin: bool = Depends(verify_admin_token)):
-    """Get one background task including payload and last error."""
-    return _serialize(_get_task(task_id))
+    """Get one task with its timeline, one summary per run and log sizes."""
+    task = _get_task(task_id)
+    events = [
+        {
+            "id": event.id,
+            "at": _iso(event.at),
+            "type": event.type,
+            "attempt": event.attempt,
+            "worker": event.worker,
+            "detail": _event_detail(event),
+        }
+        for event in BackgroundTaskEvent.select()
+        .where(BackgroundTaskEvent.task == task_id)
+        .order_by(BackgroundTaskEvent.id)
+    ]
+    L = BackgroundTaskLog
+    log_lines = {
+        attempt: count
+        for attempt, count in L.select(L.attempt, fn.COUNT(L.id))
+        .where(L.task == task_id)
+        .group_by(L.attempt)
+        .tuples()
+    }
+    runs = build_runs(events)
+    for run in runs:
+        run["log_lines"] = log_lines.get(run["attempt"], 0)
+    try:
+        checkpoint = json.loads(task.checkpoint) if task.checkpoint else None
+    except ValueError:
+        checkpoint = task.checkpoint
+    return {
+        **_serialize(task),
+        "checkpoint": checkpoint,
+        "events": events,
+        "runs": runs,
+        "log_lines": sum(log_lines.values()),
+    }
 
 
 @router.post("/tasks/{task_id}/retry")
 async def retry_task(task_id: int, _admin: bool = Depends(verify_admin_token)):
-    """Requeue a failed task with a fresh attempt budget."""
+    """Requeue a failed or cancelled task with a fresh attempt budget."""
     task = _get_task(task_id)
     if not retry_failed_task(task_id):
         raise HTTPException(
-            409, detail={"error": f"Only failed tasks can be retried (task is {task.status})"}
+            409,
+            detail={
+                "error": f"Only failed or cancelled tasks can be retried (task is {task.status})"
+            },
         )
     logger.info(f"Admin requeued background task {task_id} ({task.kind})")
     return _serialize(_get_task(task_id))
 
 
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: int, _admin: bool = Depends(verify_admin_token)):
+    """Cancel a queued task, or ask the worker running a task to stop it."""
+    task = _get_task(task_id)
+    outcome = request_cancel(task_id)
+    if outcome is None:
+        reason = (
+            "cancellation was already requested"
+            if task.status == RUNNING and task.cancel_requested
+            else f"task is {task.status}"
+        )
+        raise HTTPException(
+            409, detail={"error": f"Only queued or running tasks can be cancelled ({reason})"}
+        )
+    logger.info(
+        f"Admin {'cancelled' if outcome == CANCELLED else 'requested cancellation of'} "
+        f"background task {task_id} ({task.kind})"
+    )
+    return _serialize(_get_task(task_id))
+
+
 @router.delete("/tasks/{task_id}")
 async def delete_task(task_id: int, _admin: bool = Depends(verify_admin_token)):
-    """Discard a queued or failed task."""
+    """Delete a failed or cancelled task with its timeline and logs."""
     task = _get_task(task_id)
     if not discard_task(task_id):
         raise HTTPException(
             409,
             detail={
-                "error": f"Only queued or failed tasks can be discarded (task is {task.status})"
+                "error": "Only failed or cancelled tasks can be discarded; cancel queued or "
+                f"running tasks instead (task is {task.status})"
             },
         )
     logger.info(f"Admin discarded background task {task_id} ({task.kind})")
     return {"success": True, "id": task_id}
+
+
+def _log_query(task_id: int, attempt: int | None):
+    query = BackgroundTaskLog.select().where(BackgroundTaskLog.task == task_id)
+    if attempt is not None:
+        query = query.where(BackgroundTaskLog.attempt == attempt)
+    return query
+
+
+@router.get("/tasks/{task_id}/logs")
+async def get_task_logs(
+    task_id: int,
+    attempt: int | None = None,
+    after_id: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=LOG_PAGE_MAX),
+    _admin: bool = Depends(verify_admin_token),
+):
+    """Page through a task's log, oldest first.
+
+    Pass the returned ``next_after_id`` back as ``after_id`` to tail new
+    records while the task runs.
+
+    Args:
+        attempt: Only this attempt's records
+        after_id: Only records after this id
+        limit: Maximum number of records
+    """
+    task = _get_task(task_id)
+    rows = list(
+        _log_query(task_id, attempt)
+        .where(BackgroundTaskLog.id > after_id)
+        .order_by(BackgroundTaskLog.id)
+        .limit(limit + 1)
+    )
+    has_more, rows = len(rows) > limit, rows[:limit]
+    return {
+        "lines": [
+            {
+                "id": row.id,
+                "attempt": row.attempt,
+                "at": _iso(row.at),
+                "level": row.level,
+                "message": row.message,
+            }
+            for row in rows
+        ],
+        "next_after_id": rows[-1].id if rows else after_id,
+        "has_more": has_more,
+        "status": task.status,
+    }
+
+
+def _format_log_line(row: BackgroundTaskLog) -> str:
+    stamp = row.at.replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds")
+    return f"{stamp} [attempt {row.attempt}] {row.level:<8} {row.message}\n"
+
+
+@router.get("/tasks/{task_id}/logs/download")
+def download_task_logs(
+    task_id: int, attempt: int | None = None, _admin: bool = Depends(verify_admin_token)
+):
+    """Download a task's log (or one attempt's) as plain text.
+
+    A plain ``def`` so the query runs in FastAPI's threadpool.
+
+    Args:
+        attempt: Only this attempt's records
+    """
+    task = _get_task(task_id)
+
+    def lines():
+        yield f"# Task {task_id} ({task.kind}), status {task.status}\n"
+        after_id = 0
+        # Batched by id so a large log is never held in memory at once.
+        while batch := list(
+            _log_query(task_id, attempt)
+            .where(BackgroundTaskLog.id > after_id)
+            .order_by(BackgroundTaskLog.id)
+            .limit(LOG_DOWNLOAD_BATCH)
+        ):
+            for row in batch:
+                yield _format_log_line(row)
+            after_id = batch[-1].id
+
+    suffix = f"-attempt-{attempt}" if attempt is not None else ""
+    return StreamingResponse(
+        lines(),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="task-{task_id}{suffix}.log"'},
+    )
