@@ -255,6 +255,18 @@ def generate_lakefs_service(config: dict) -> str:
 {lakefs_networks_str}"""
 
 
+def generate_external_networks(config: dict) -> str:
+    """Networks block for services that reach external postgres or s3."""
+    if config.get("external_network") and (
+        not config["postgres_builtin"] or not config["s3_builtin"]
+    ):
+        return f"""    networks:
+      - default
+      - {config["external_network"]}
+"""
+    return ""
+
+
 def generate_hub_api_service(config: dict) -> str:
     """Generate hub-api service configuration."""
     depends_on = ["lakefs"]
@@ -272,15 +284,7 @@ def generate_hub_api_service(config: dict) -> str:
     for dep in depends_on:
         depends_on_str += f"      - {dep}\n"
 
-    # Add external network if needed (for external postgres or s3)
-    networks_str = ""
-    if config.get("external_network") and (
-        not config["postgres_builtin"] or not config["s3_builtin"]
-    ):
-        networks_str = f"""    networks:
-      - default
-      - {config["external_network"]}
-"""
+    networks_str = generate_external_networks(config)
 
     # Database configuration
     if config["postgres_builtin"]:
@@ -328,7 +332,8 @@ def generate_hub_api_service(config: dict) -> str:
     restart: always
     ports:
       - "48888:48888" # Internal API port (optional, for debugging)
-{depends_on_str}    environment:
+{depends_on_str}    # Anchored so khub-worker reuses exactly the same settings.
+    environment: &hub-env
       ## ===== CRITICAL: Endpoint Configuration (MUST CHANGE) =====
       ## These determine how users access your KohakuHub instance
       - KOHAKU_HUB_BASE_URL=http://127.0.0.1:28080 # Change to your public URL (e.g., https://hub.example.com)
@@ -391,9 +396,28 @@ def generate_hub_api_service(config: dict) -> str:
       - KOHAKU_HUB_DEFAULT_USER_PUBLIC_QUOTA_BYTES=100_000_000
       - KOHAKU_HUB_DEFAULT_ORG_PRIVATE_QUOTA_BYTES=10_000_000
       - KOHAKU_HUB_DEFAULT_ORG_PUBLIC_QUOTA_BYTES=100_000_000{garage_config_section}
+
+      ## ===== Background Task Worker (khub-worker) =====
+      # - KOHAKU_HUB_WORKER_CONCURRENCY=4 # Tasks run at once per worker
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds
 {networks_str}"""
+
+
+def generate_khub_worker_service(config: dict) -> str:
+    """Generate khub-worker service configuration (background tasks)."""
+    return f"""  khub-worker:
+    build: .
+    container_name: khub-worker
+    restart: always
+    command: ["python", "/app/startup.py", "worker"]
+    stop_grace_period: 45s # > KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS (30) so tasks can drain
+    depends_on:
+      - hub-api
+    environment: *hub-env
+    volumes:
+      - ./hub-meta/hub-api:/hub-api-creds:ro
+{generate_external_networks(config)}"""
 
 
 def generate_hub_ui_service() -> str:
@@ -420,6 +444,7 @@ def generate_docker_compose(config: dict) -> str:
     # Add services in order
     services.append(generate_hub_ui_service())
     services.append(generate_hub_api_service(config))
+    services.append(generate_khub_worker_service(config))
 
     if config["s3_builtin"]:
         if config.get("s3_provider") == "garage":

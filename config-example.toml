@@ -54,6 +54,16 @@ timeout_seconds = 10
 max_concurrent_requests = 5
 # sources = []  # JSON list of fallback sources (optional)
 
+[worker]
+# Background task worker: python -m kohakuhub.worker (khub-worker service)
+concurrency = 4                  # Tasks run at once per worker process
+lease_seconds = 60               # A task is reclaimed if its worker stops renewing this long
+poll_interval_seconds = 1.0      # Idle wait between claim attempts
+shutdown_grace_seconds = 30.0    # Drain time on SIGTERM before cancelling running tasks
+succeeded_retention_days = 7     # Finished tasks are deleted after these retention windows
+failed_retention_days = 30
+queues = []                      # Empty = consume every queue
+
 [app]
 base_url = "http://127.0.0.1:28080"  # Use nginx port (28080), not direct backend (48888)
 internal_base_url = "http://127.0.0.1:48888"  # Optional: backend self-calls use this instead of base_url

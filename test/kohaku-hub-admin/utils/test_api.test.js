@@ -888,4 +888,50 @@ describe("admin API client", () => {
     expect(reset).toEqual({ reset: true });
     expect(client.post).toHaveBeenCalledWith("/cache/metrics/reset");
   });
+
+  it("background task helpers route through the admin client", async () => {
+    const api = await loadModule();
+    client.get
+      .mockResolvedValueOnce({ data: { tasks: [], total: 0 } })
+      .mockResolvedValueOnce({ data: { tasks: [], total: 0 } })
+      .mockResolvedValueOnce({ data: { id: 7 } });
+    client.post.mockResolvedValueOnce({ data: { id: 7, status: "queued" } });
+    client.delete.mockResolvedValueOnce({ data: { success: true, id: 7 } });
+
+    await api.listTasks("admin-token");
+    expect(client.get).toHaveBeenLastCalledWith("/tasks", {
+      params: { status: undefined, kind: undefined, limit: 50, offset: 0 },
+    });
+    await api.listTasks("admin-token", {
+      status: "failed",
+      kind: "tasks.cleanup",
+      limit: 20,
+      offset: 40,
+    });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks", {
+      params: { status: "failed", kind: "tasks.cleanup", limit: 20, offset: 40 },
+    });
+    expect(await api.getTask("admin-token", 7)).toEqual({ id: 7 });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/7");
+    expect(await api.retryTask("admin-token", 7)).toEqual({
+      id: 7,
+      status: "queued",
+    });
+    expect(client.post).toHaveBeenLastCalledWith("/tasks/7/retry");
+    expect(await api.deleteTask("admin-token", 7)).toEqual({
+      success: true,
+      id: 7,
+    });
+    expect(client.delete).toHaveBeenLastCalledWith("/tasks/7");
+
+    client.get.mockResolvedValueOnce({ data: { window: "1h" } });
+    expect(await api.getTaskStats("admin-token")).toEqual({ window: "1h" });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/stats", {
+      params: { window: "1h" },
+    });
+    await api.getTaskStats("admin-token", "7d");
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/stats", {
+      params: { window: "7d" },
+    });
+  });
 });

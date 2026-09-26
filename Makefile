@@ -14,7 +14,7 @@ UI_ADMIN_DIR ?= src/kohaku-hub-admin
 UI_ADMIN_TEST_ROOT ?= test/kohaku-hub-admin
 
 .PHONY: help init-env install-backend install-frontend install infra-up infra-down \
-	backend seed-demo reset-local-data reset-and-seed ui ui-only admin status \
+	backend worker seed-demo reset-local-data reset-and-seed ui ui-only admin status \
 	logs-postgres logs-minio logs-lakefs test test-backend test-ui test-ui-admin \
 	verify-seed-demo
 
@@ -31,6 +31,7 @@ help:
 	@echo "  make reset-local-data Dangerously clear local KohakuHub dev data through the local reset helper"
 	@echo "  make reset-and-seed   Reset persisted local data, then bootstrap fresh demo data"
 	@echo "  make backend          Run FastAPI backend in reload mode"
+	@echo "  make worker           Run the background task worker (start make backend first)"
 	@echo "  make ui               Run main UI on :5173 with admin mounted at /admin (admin Vite on :5174)"
 	@echo "  make ui-only          Run only the main Vite frontend on :5173 (no admin)"
 	@echo "  make admin            Run only the admin Vite frontend on :5174"
@@ -75,6 +76,9 @@ infra-down:
 
 backend: init-env
 	./scripts/dev/run_backend.sh
+
+worker: init-env
+	./scripts/dev/run_worker.sh
 
 seed-demo: infra-up
 	# Force the one-time local demo bootstrap even if auto-seed is disabled in .env.dev.

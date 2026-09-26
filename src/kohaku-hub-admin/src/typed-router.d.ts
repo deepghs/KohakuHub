@@ -31,6 +31,7 @@ declare module 'vue-router/auto-routes' {
     '/quotas': RouteRecordInfo<'/quotas', '/quotas', Record<never, never>, Record<never, never>>,
     '/repositories': RouteRecordInfo<'/repositories', '/repositories', Record<never, never>, Record<never, never>>,
     '/storage': RouteRecordInfo<'/storage', '/storage', Record<never, never>, Record<never, never>>,
+    '/tasks': RouteRecordInfo<'/tasks', '/tasks', Record<never, never>, Record<never, never>>,
     '/users': RouteRecordInfo<'/users', '/users', Record<never, never>, Record<never, never>>,
   }
 
@@ -95,6 +96,10 @@ declare module 'vue-router/auto-routes' {
     }
     'src/pages/storage.vue': {
       routes: '/storage'
+      views: never
+    }
+    'src/pages/tasks.vue': {
+      routes: '/tasks'
       views: never
     }
     'src/pages/users.vue': {

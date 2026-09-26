@@ -26,7 +26,8 @@ services:
       - lakefs
       - minio
       - valkey
-    environment:
+    # Anchored so khub-worker reuses exactly the same settings.
+    environment: &hub-env
       ## ===== CRITICAL: Endpoint Configuration (MUST CHANGE) =====
       ## These determine how users access your KohakuHub instance
       - KOHAKU_HUB_BASE_URL=http://127.0.0.1:28080 # Change to your public URL (e.g., https://hub.example.com)
@@ -98,8 +99,27 @@ services:
       - KOHAKU_HUB_CACHE_ENABLED=true
       - KOHAKU_HUB_CACHE_URL=redis://valkey:6379/0
       # - KOHAKU_HUB_CACHE_NAMESPACE=kh # Override if multiple deployments share Valkey
+
+      ## ===== Background Task Worker (khub-worker) =====
+      # - KOHAKU_HUB_WORKER_CONCURRENCY=4 # Tasks run at once per worker
+      # - KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS=7
+      # - KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS=30
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds
+
+  # Runs durable background tasks (see kohakuhub.tasks). Same image as hub-api;
+  # hub-api runs migrations and writes the LakeFS credentials it reads.
+  khub-worker:
+    build: .
+    container_name: khub-worker
+    restart: always
+    command: ["python", "/app/startup.py", "worker"]
+    stop_grace_period: 45s # > KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS (30) so tasks can drain
+    depends_on:
+      - hub-api
+    environment: *hub-env
+    volumes:
+      - ./hub-meta/hub-api:/hub-api-creds:ro
 
   minio:
     image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z # community-maintained build; quay.io/minio/minio no longer serves anonymous pulls

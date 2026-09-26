@@ -240,3 +240,37 @@ def test_load_config_explicit_disable_wins_over_implicit_enable(monkeypatch):
 
     cfg = hub_config.load_config()
     assert cfg.cache.enabled is False
+
+
+def test_load_config_worker_env_vars(monkeypatch):
+    hub_config.load_config.cache_clear()
+    monkeypatch.setattr(hub_config.os.path, "exists", lambda _path: False)
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_CONCURRENCY", "8")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_LEASE_SECONDS", "120")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_POLL_INTERVAL_SECONDS", "0.5")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS", "10")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS", "3")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS", "90")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_QUEUES", " default, bulk ,,")
+
+    cfg = hub_config.load_config()
+    assert cfg.worker.concurrency == 8
+    assert cfg.worker.lease_seconds == 120
+    assert cfg.worker.poll_interval_seconds == pytest.approx(0.5)
+    assert cfg.worker.shutdown_grace_seconds == pytest.approx(10)
+    assert cfg.worker.succeeded_retention_days == 3
+    assert cfg.worker.failed_retention_days == 90
+    assert cfg.worker.queues == ["default", "bulk"]
+    hub_config.load_config.cache_clear()
+
+
+def test_load_config_worker_defaults(monkeypatch):
+    hub_config.load_config.cache_clear()
+    monkeypatch.setattr(hub_config.os.path, "exists", lambda _path: False)
+    for name in list(hub_config.os.environ):
+        if name.startswith("KOHAKU_HUB_WORKER_"):
+            monkeypatch.delenv(name)
+
+    cfg = hub_config.load_config()
+    assert cfg.worker == hub_config.WorkerConfig()
+    hub_config.load_config.cache_clear()
