@@ -1,6 +1,7 @@
 """Tests for storage cleanup of repositories deleted without the regular delete path."""
 
 import asyncio
+import importlib
 import json
 import uuid
 
@@ -19,8 +20,17 @@ from kohakuhub.db import (
 )
 from kohakuhub.db_operations import delete_repository
 from kohakuhub.task_testing import RecordingContext, run_with_interruptions
-from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
+from kohakuhub.utils.lakefs import resolve_lakefs_repo
 from kohakuhub.utils.s3 import get_s3_client
+
+
+def _live(module):
+    """The currently registered module. The backend fixtures reload kohakuhub
+    once the test environment, LakeFS credentials included, is configured, so
+    a module imported at collection time can hold stale settings; anything
+    that talks to the real LakeFS goes through the live module.
+    """
+    return importlib.import_module(module)
 
 
 @pytest.fixture(autouse=True)
@@ -293,7 +303,7 @@ def test_s3_helpers_delete_in_batches_and_report_refusals(monkeypatch):
 @pytest.fixture
 async def orphan():
     name = f"m-orphan-{uuid.uuid4().hex[:10]}"
-    client = get_lakefs_client()
+    client = _live("kohakuhub.utils.lakefs").get_lakefs_client()
     await client.create_repository(name=name, storage_namespace=f"s3://{cfg.s3.bucket}/{name}")
     yield name
     try:
@@ -303,12 +313,11 @@ async def orphan():
 
 
 async def test_find_orphans_lists_unreferenced_lakefs_repositories(orphan, monkeypatch):
-    monkeypatch.setattr(storage_cleanup, "LAKEFS_LIST_PAGE", 1)  # exercise pagination
+    live = _live("kohakuhub.storage_cleanup")
+    monkeypatch.setattr(live, "LAKEFS_LIST_PAGE", 1)  # exercise pagination
     referenced = storage_cleanup._referenced_lakefs_repos()
 
-    found = {
-        entry["id"]: entry for entry in await storage_cleanup.find_orphan_lakefs_repositories()
-    }
+    found = {entry["id"]: entry for entry in await live.find_orphan_lakefs_repositories()}
 
     assert orphan in found
     assert not referenced & set(found)
@@ -318,9 +327,7 @@ async def test_find_orphans_lists_unreferenced_lakefs_repositories(orphan, monke
     storage_cleanup.enqueue_purge(orphan, f"orphan:{orphan}")
     corrupt = storage_cleanup.enqueue_purge("m-corrupt-0000", "orphan:m-corrupt-0000")
     BackgroundTask.update(payload="{broken").where(BackgroundTask.id == corrupt).execute()
-    found = {
-        entry["id"]: entry for entry in await storage_cleanup.find_orphan_lakefs_repositories()
-    }
+    found = {entry["id"]: entry for entry in await live.find_orphan_lakefs_repositories()}
     assert found[orphan]["purge_pending"] is True
 
 
@@ -342,13 +349,13 @@ async def test_admin_can_review_and_purge_orphans(admin_client, orphan):
     assert missing.status_code == 404
 
     (payload,) = _queued(storage_cleanup.PURGE_KIND)
-    await storage_cleanup.purge_repository(payload, RecordingContext())
+    await _live("kohakuhub.storage_cleanup").purge_repository(payload, RecordingContext())
     assert await _gone(orphan)
 
 
 async def _gone(lakefs_repo, timeout=30.0):
     """LakeFS deletes repositories asynchronously (#93); wait for it."""
-    client = get_lakefs_client()
+    client = _live("kohakuhub.utils.lakefs").get_lakefs_client()
     deadline = asyncio.get_running_loop().time() + timeout
     while await client.repository_exists(lakefs_repo):
         if asyncio.get_running_loop().time() > deadline:

@@ -4,6 +4,7 @@ Each test deletes baseline rows, so each restores the baseline first.
 """
 
 import asyncio
+import importlib
 import json
 
 import pytest
@@ -13,11 +14,19 @@ from kohakuhub import lakefs_rest_client, storage_cleanup, tasks
 from kohakuhub.config import cfg
 from kohakuhub.db import BackgroundTask, File, LfsGcCandidate, Repository, User
 from kohakuhub.db_operations import delete_organization, delete_repository
-from kohakuhub.utils.lakefs import get_lakefs_client, resolve_lakefs_repo
+from kohakuhub.utils.lakefs import resolve_lakefs_repo
 from kohakuhub.utils.s3 import get_s3_client
-from kohakuhub.worker import Worker
 
 pytestmark = pytest.mark.backend_per_test
+
+
+def _live(module):
+    """The currently registered module. The backend fixtures reload kohakuhub
+    once the test environment, LakeFS credentials included, is configured, so
+    a module imported at collection time can hold stale settings; anything
+    that talks to the real LakeFS goes through the live module.
+    """
+    return importlib.import_module(module)
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +69,9 @@ async def _drain_storage_tasks(timeout=60.0):
         )
 
     stop = asyncio.Event()
-    worker = Worker(worker_id="w-cleanup", concurrency=2, lease_seconds=30, poll_interval=0.05)
+    worker = _live("kohakuhub.worker").Worker(
+        worker_id="w-cleanup", concurrency=2, lease_seconds=30, poll_interval=0.05
+    )
     runner = asyncio.create_task(worker.run(stop))
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -79,7 +90,7 @@ async def _drain_storage_tasks(timeout=60.0):
 
 async def _gone(lakefs_repo, timeout=30.0):
     """LakeFS deletes repositories asynchronously (#93); wait for it."""
-    client = get_lakefs_client()
+    client = _live("kohakuhub.utils.lakefs").get_lakefs_client()
     deadline = asyncio.get_running_loop().time() + timeout
     while await client.repository_exists(lakefs_repo):
         if asyncio.get_running_loop().time() > deadline:
@@ -96,7 +107,12 @@ async def test_force_deleting_a_user_cleans_their_storage(admin_client):
         row.sha256 for row in File.select().where(File.repository.in_(repos) & (File.lfs == True))
     }
     assert repos and lfs_shas
-    assert all([await get_lakefs_client().repository_exists(name) for name in lakefs_repos])
+    assert all(
+        [
+            await _live("kohakuhub.utils.lakefs").get_lakefs_client().repository_exists(name)
+            for name in lakefs_repos
+        ]
+    )
     assert any(_prefix_keys(name) for name in lakefs_repos)
     assert all(_object_exists(storage_cleanup.lfs_key(sha)) for sha in lfs_shas)
 
