@@ -218,26 +218,38 @@ async def verify_seed_data() -> dict:
                 )
             summary["verified_checks"].append("fallback sources available")
 
-        expected_tasks = sorted(
+        expected_tasks = Counter(
             (task["kind"], task["status"]) for task in manifest.get("background_tasks", [])
         )
         if expected_tasks:
-            response = await client.get(
-                "/admin/api/tasks",
-                params={"limit": 500},
-                headers={"X-Admin-Token": cfg.admin.secret_token},
-            )
-            response.raise_for_status()
-            seeded_tasks = Counter(
-                (task["kind"], task["status"])
-                for task in response.json()["tasks"]
-                if task["kind"].startswith("demo.")
-            )
-            expected_total = len(expected_tasks) + manifest.get("background_task_history", 0)
-            if Counter(expected_tasks) - seeded_tasks or sum(seeded_tasks.values()) != expected_total:
+            admin = {"X-Admin-Token": cfg.admin.secret_token}
+
+            async def list_tasks(**params) -> dict:
+                response = await client.get(
+                    "/admin/api/tasks", params={"limit": 500, **params}, headers=admin
+                )
+                response.raise_for_status()
+                return response.json()
+
+            # Query per demo kind so the worker's own growing rows (e.g.
+            # tasks.cleanup) can never push demo rows off the page.
+            seeded_tasks: Counter = Counter()
+            for kind in (await list_tasks())["kinds"]:
+                if kind.startswith("demo."):
+                    seeded_tasks.update(
+                        (task["kind"], task["status"])
+                        for task in (await list_tasks(kind=kind))["tasks"]
+                    )
+            showcase = sum(expected_tasks.values())
+            most = showcase + manifest.get("background_task_history", 0)
+            found = sum(seeded_tasks.values())
+            # History ages out through the worker's retention cleanup, so it
+            # may shrink over time; the showcase rows never finish.
+            if expected_tasks - seeded_tasks or not showcase <= found <= most:
                 raise VerifyError(
-                    f"Seeded background tasks differ: expected {expected_total} rows including "
-                    f"{expected_tasks}, found {sum(seeded_tasks.values())}"
+                    f"Seeded background tasks differ: expected the showcase rows "
+                    f"{sorted(expected_tasks.elements())} and {showcase}-{most} demo rows "
+                    f"in total, found {found}"
                 )
             summary["verified_checks"].append("background task examples")
 
