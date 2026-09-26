@@ -7,6 +7,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
+from peewee import IntegrityError
 from pydantic import BaseModel
 
 from kohakuhub.config import cfg
@@ -218,6 +219,82 @@ def _repo_recycling_response(repo_type: str, full_id: str) -> Response:
     )
 
 
+# How many LakeFS ids `_create_lakefs_repository` tries before giving up. Each
+# failed id is excluded from the next allocation, and allocation itself falls
+# back to random ids, so running out means LakeFS is refusing every new id.
+LAKEFS_CREATE_ATTEMPTS = 4
+
+
+class _RepoIdClaimed(Exception):
+    """A concurrent request created the KHub repository while we were creating."""
+
+
+async def _create_lakefs_repository(
+    client,
+    repo_type: str,
+    repo_id: str,
+    *,
+    still_unclaimed=None,
+) -> str | None:
+    """Allocate a LakeFS id for `repo_id` and create the repository.
+
+    Every path that creates a LakeFS repository goes through here, so each one
+    steps over ids that turn out to be unusable at create time instead of
+    surfacing LakeFS's error:
+
+    - `409 not unique`: LakeFS still holds the id (asynchronous deletion, #93,
+      or a probe/create race). The id is excluded and a fresh one allocated.
+    - storage namespace already in use: an orphaned namespace. It is healed when
+      that is provably safe; otherwise the id is excluded as well.
+
+    Args:
+        client: LakeFS client.
+        repo_type: Repository type (model/dataset/space).
+        repo_id: KHub repository id the LakeFS repository will back.
+        still_unclaimed: Optional check run when an id is taken. Returning False
+            means a concurrent request now owns `repo_id`; the create stops with
+            `_RepoIdClaimed` rather than making a second, orphaned repository.
+
+    Returns:
+        The created LakeFS id, which the caller must persist on the row, or
+        None if every attempt found its id unusable.
+
+    Raises:
+        _RepoIdClaimed: See `still_unclaimed`.
+        Exception: Any other LakeFS error, unchanged.
+    """
+    tried: set[str] = set()
+    for _ in range(LAKEFS_CREATE_ATTEMPTS):
+        lakefs_repo = await allocate_lakefs_repo_name(client, repo_type, repo_id, exclude=tried)
+        storage_namespace = f"s3://{cfg.s3.bucket}/{lakefs_repo}"
+        try:
+            await client.create_repository(
+                name=lakefs_repo,
+                storage_namespace=storage_namespace,
+                default_branch="main",
+            )
+            return lakefs_repo
+        except Exception as e:
+            if _is_lakefs_repo_id_taken_error(e):
+                if still_unclaimed is not None and not still_unclaimed():
+                    raise _RepoIdClaimed(repo_id) from e
+                logger.warning(f"LakeFS id {lakefs_repo} for {repo_id} is taken; trying another")
+            elif _is_lakefs_namespace_in_use_error(e, storage_namespace):
+                healed = await _cleanup_orphan_namespace_if_safe(
+                    client, lakefs_repo, allow_empty_internal_marker=True
+                )
+                logger.warning(
+                    f"Storage namespace of {lakefs_repo} for {repo_id} is in use "
+                    f"(healed={healed}); {'retrying it' if healed else 'trying another id'}"
+                )
+                if healed:
+                    continue  # the same id is usable again
+            else:
+                raise
+        tried.add(lakefs_repo)
+    return None
+
+
 async def _wait_for_lakefs_repo_deletion(client, lakefs_repo: str) -> bool:
     """Wait, bounded, for LakeFS to finish deleting `lakefs_repo`.
 
@@ -412,91 +489,38 @@ async def create_repo(
                 message=f"Repository name conflicts with existing repository: {repo.name}",
             )
 
-    # Create LakeFS repository.
-    # The id is allocated rather than derived: a repo id whose previous
-    # incarnation is still being deleted by LakeFS cannot reuse the derived
-    # (generation 0) name yet, so allocation steps to the next generation. The
-    # result is persisted below - deriving it again later would address the wrong
-    # repository.
+    # Create the LakeFS repository under a freshly allocated id. The helper
+    # steps over ids that turn out to be unusable (still being deleted, or a
+    # leftover storage namespace), so users only see an error for real failures.
     client = get_lakefs_client()
     try:
-        lakefs_repo = await allocate_lakefs_repo_name(client, payload.type, full_id)
-    except Exception as e:
-        # Allocation probes LakeFS, so it is a new place this request can fail.
-        # Keep the header-based error shape the rest of the API uses rather than
-        # letting the exception escape as a bare 500.
-        logger.exception(f"LakeFS repository allocation failed for {full_id}", e)
-        return hf_server_error(f"LakeFS repository allocation failed: {str(e)}")
-
-    storage_namespace = f"s3://{cfg.s3.bucket}/{lakefs_repo}"
-
-    try:
-        await client.create_repository(
-            name=lakefs_repo,
-            storage_namespace=storage_namespace,
-            default_branch="main",
+        lakefs_repo = await _create_lakefs_repository(
+            client,
+            payload.type,
+            full_id,
+            still_unclaimed=lambda: get_repository(payload.type, namespace, payload.name)
+            is None,
         )
-    except Exception as e:
-        if _is_lakefs_repo_id_taken_error(e):
-            # The id was free when we probed and taken by the time we created.
-            # Two different things look like this, and they need opposite
-            # answers, so re-check the DB to tell them apart.
-            if get_repository(payload.type, namespace, payload.name):
-                # A concurrent create won the race. The name is taken for good,
-                # so telling the client to retry would only make it spin before
-                # learning the same thing.
-                logger.info(
-                    f"Concurrent create won the race for {full_id}; "
-                    f"reporting it as an existing repository"
-                )
-                return _repo_exists_response(payload.type, full_id)
-
-            # Nobody owns the name here: LakeFS is still deleting a previous
-            # incarnation of it. Hand the client a conflict it knows to retry,
-            # after a short hold to pace hf_hub's sleepless retry loop.
-            logger.warning(
-                f"LakeFS repository id {lakefs_repo} for {full_id} is still held "
-                f"(async deletion in progress); returning retryable conflict"
-            )
-            await asyncio.sleep(LAKEFS_RECYCLING_HOLD_SECONDS)
-            return _repo_recycling_response(payload.type, full_id)
-
-        namespace_in_use = _is_lakefs_namespace_in_use_error(e, storage_namespace)
-        logger.warning(
-            f"LakeFS create_repository failed for {full_id}; "
-            f"namespace_in_use_recoverable={namespace_in_use}; error={e}"
+    except _RepoIdClaimed:
+        # A concurrent create won the race. The name is taken for good, so
+        # telling the client to retry would only make it spin before learning
+        # the same thing.
+        logger.info(
+            f"Concurrent create won the race for {full_id}; "
+            f"reporting it as an existing repository"
         )
+        return _repo_exists_response(payload.type, full_id)
+    except Exception as e:
+        logger.exception(f"LakeFS repository creation failed for {full_id}", e)
+        return hf_server_error(f"LakeFS repository creation failed: {str(e)}")
 
-        if namespace_in_use:
-            cleaned = await _cleanup_orphan_namespace_if_safe(
-                client,
-                lakefs_repo,
-                allow_empty_internal_marker=True,
-            )
-            logger.warning(
-                f"Orphan namespace cleanup result for {lakefs_repo}: cleaned={cleaned}"
-            )
-            if cleaned:
-                try:
-                    await client.create_repository(
-                        name=lakefs_repo,
-                        storage_namespace=storage_namespace,
-                        default_branch="main",
-                    )
-                except Exception as retry_error:
-                    logger.exception(
-                        f"LakeFS repository creation retry failed for {full_id}",
-                        retry_error,
-                    )
-                    return hf_server_error(
-                        f"LakeFS repository creation failed: {str(retry_error)}"
-                    )
-            else:
-                logger.exception(f"LakeFS repository creation failed for {full_id}", e)
-                return hf_server_error(f"LakeFS repository creation failed: {str(e)}")
-        else:
-            logger.exception(f"LakeFS repository creation failed for {full_id}", e)
-            return hf_server_error(f"LakeFS repository creation failed: {str(e)}")
+    if lakefs_repo is None:
+        # Every fresh id was taken as well - LakeFS is still releasing several
+        # previous incarnations. Hand the client a conflict it knows to retry,
+        # after a short hold to pace hf_hub's sleepless retry loop.
+        logger.warning(f"No usable LakeFS id for {full_id} yet; returning retryable conflict")
+        await asyncio.sleep(LAKEFS_RECYCLING_HOLD_SECONDS)
+        return _repo_recycling_response(payload.type, full_id)
 
     # Store in database for listing/metadata.
     # `lakefs_repo` records which LakeFS repository this row owns; every read
@@ -660,8 +684,7 @@ async def _migrate_lakefs_repository(
     to_id: str,
     *,
     from_lakefs_repo: str,
-    to_lakefs_repo: str,
-) -> None:
+) -> str:
     """Migrate LakeFS repository with proper LFS handling using File table.
 
     Strategy:
@@ -683,16 +706,15 @@ async def _migrate_lakefs_repository(
         from_lakefs_repo: LakeFS repository currently backing `from_id`, resolved
             by the caller from the DB row (never re-derived here - a row created
             at generation > 0 does not derive back to its own id).
-        to_lakefs_repo: LakeFS repository to create for `to_id`, allocated by the
-            caller so it cannot collide with a pending deletion.
+
+    Returns:
+        The LakeFS repository created for `to_id`. It is allocated here through
+        `_create_lakefs_repository`, so it never collides with an id LakeFS still
+        holds; the caller must persist it on the row.
 
     Raises:
         HTTPException: If migration fails
     """
-    if from_lakefs_repo == to_lakefs_repo:
-        # No migration needed (e.g., just renaming within namespace)
-        return
-
     # Get source repository object for File table queries
     from_parts = from_id.split("/", 1)
     from_namespace, from_name = from_parts
@@ -706,6 +728,7 @@ async def _migrate_lakefs_repository(
 
     client = get_lakefs_client()
     from_s3_prefix = f"{from_lakefs_repo}/"
+    to_lakefs_repo = None
 
     try:
         # 1. Get list of all objects with metadata from old repo
@@ -742,18 +765,16 @@ async def _migrate_lakefs_repository(
 
         logger.info(f"Found {len(objects_to_migrate)} object(s) to migrate")
 
-        # 2. Create new LakeFS repository
-        storage_namespace = f"s3://{cfg.s3.bucket}/{to_lakefs_repo}"
-        await client.create_repository(
-            name=to_lakefs_repo,
-            storage_namespace=storage_namespace,
-            default_branch="main",
-        )
+        # 2. Create new LakeFS repository under a fresh id
+        to_lakefs_repo = await _create_lakefs_repository(client, repo_type, to_id)
+        if to_lakefs_repo is None:
+            raise RuntimeError(f"No usable LakeFS repository id for {to_id}")
         logger.info(f"Created new LakeFS repository: {to_lakefs_repo}")
 
         # 3. Process each object using File table to determine LFS status
         lfs_count = 0
         regular_count = 0
+        failed_paths: list[str] = []
 
         for obj in objects_to_migrate:
             obj_path = obj["path"]
@@ -831,7 +852,17 @@ async def _migrate_lakefs_repository(
 
             except Exception as e:
                 logger.warning(f"Failed to migrate object {obj_path}: {e}")
-                # Continue with other objects
+                failed_paths.append(obj_path)
+
+        # Never commit a partial copy: the steps below delete the source
+        # repository and its S3 prefix, which would lose these objects (#107).
+        # Raising lands in the handler that removes the half-built target.
+        if failed_paths:
+            shown = ", ".join(failed_paths[:5])
+            more = f" and {len(failed_paths) - 5} more" if len(failed_paths) > 5 else ""
+            raise RuntimeError(
+                f"{len(failed_paths)} object(s) failed to migrate: {shown}{more}"
+            )
 
         logger.success(
             f"Migrated {lfs_count + regular_count} object(s): "
@@ -873,17 +904,19 @@ async def _migrate_lakefs_repository(
         logger.success(
             f"Successfully migrated repository from {from_lakefs_repo} to {to_lakefs_repo}"
         )
+        return to_lakefs_repo
 
     except Exception as e:
         # Clean up on failure
         logger.exception(f"LakeFS repository migration failed: {e}")
 
         # Try to delete new LakeFS repo if it was created
-        try:
-            await client.delete_repository(repository=to_lakefs_repo, force=True)
-            logger.info(f"Cleaned up new LakeFS repo: {to_lakefs_repo}")
-        except Exception:
-            pass
+        if to_lakefs_repo is not None:
+            try:
+                await client.delete_repository(repository=to_lakefs_repo, force=True)
+                logger.info(f"Cleaned up new LakeFS repo: {to_lakefs_repo}")
+            except Exception:
+                pass
 
         raise HTTPException(
             status_code=500,
@@ -916,9 +949,9 @@ def _update_repository_database_records(
         to_name: Target repository name
         moving_namespace: Whether namespace is changing
         repo_size: Repository size in bytes
-        to_lakefs_repo: LakeFS repository the migration created for `to_id`. The
-            row must point at it explicitly, since the destination may have been
-            allocated at generation > 0 and would not derive back to this id.
+        to_lakefs_repo: LakeFS repository the row should point at afterwards:
+            the one a move keeps, or the one a squash migration created. It is
+            stored explicitly because it need not derive back from `to_id`.
         preserve_quota: Whether to preserve repository quota settings (default: True)
     """
     # Preserve current quota settings before update
@@ -1073,65 +1106,30 @@ async def move_repo(
             f"(repo size: {repo_size:,} bytes)"
         )
 
-    # Migrate LakeFS repository FIRST (before updating DB)
-    # This ensures File table queries use correct from_id
-    from_lakefs_repo = resolve_lakefs_repo(repo_row)
-    # Allocate the destination id instead of deriving it: if the destination name
-    # was used before and its LakeFS repository is still being deleted, the
-    # derived name is not available yet.
+    # A move only renames the KHub row. Since migration 016 the LakeFS
+    # repository id is stored on the row rather than derived from the repo id,
+    # so the row keeps its LakeFS repository - with every commit, branch and
+    # tag - and no data is copied or deleted (#107). The old repo id is free
+    # at once: a new repository created under it allocates a different LakeFS
+    # id because this one stays taken.
+    lakefs_repo = resolve_lakefs_repo(repo_row)
     try:
-        to_lakefs_repo = await allocate_lakefs_repo_name(
-            get_lakefs_client(), repo_type, to_id
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"LakeFS repository allocation failed for {to_id}", e)
-        raise HTTPException(
-            status_code=500,
-            detail={"error": f"Failed to allocate LakeFS repository: {str(e)}"},
-        )
-
-    await _migrate_lakefs_repository(
-        repo_type=repo_type,
-        from_id=from_id,
-        to_id=to_id,
-        from_lakefs_repo=from_lakefs_repo,
-        to_lakefs_repo=to_lakefs_repo,
-    )
-
-    # Update database records AFTER successful LakeFS migration
-    with db.atomic():
-        _update_repository_database_records(
-            repo_row=repo_row,
-            from_id=from_id,
-            to_id=to_id,
-            from_namespace=from_namespace,
-            to_namespace=to_namespace,
-            to_name=to_name,
-            moving_namespace=moving_namespace,
-            repo_size=repo_size,
-            to_lakefs_repo=to_lakefs_repo,
-        )
-
-    # Clean up old S3 storage after successful migration
-    # Note: Migration already deleted the old LakeFS repo, but S3 data remains
-    # We need to clean up the S3 folder and unreferenced LFS objects
-    try:
-        cleanup_stats = await cleanup_repository_storage(
-            repo_type=repo_type,
-            namespace=from_namespace,
-            name=from_name,
-            lakefs_repo=from_lakefs_repo,
-        )
-        logger.info(
-            f"S3 cleanup for moved repo {from_id}: "
-            f"{cleanup_stats['repo_objects_deleted']} repo objects, "
-            f"{cleanup_stats['lfs_objects_deleted']} LFS objects deleted"
-        )
-    except Exception as e:
-        # S3 cleanup failure is non-fatal - repository is already moved successfully
-        logger.warning(f"S3 cleanup failed for {from_id} (non-fatal): {e}")
+        with db.atomic():
+            _update_repository_database_records(
+                repo_row=repo_row,
+                from_id=from_id,
+                to_id=to_id,
+                from_namespace=from_namespace,
+                to_namespace=to_namespace,
+                to_name=to_name,
+                moving_namespace=moving_namespace,
+                repo_size=repo_size,
+                to_lakefs_repo=lakefs_repo,
+            )
+    except IntegrityError:
+        # Lost a race for the target name to a concurrent create or move; the
+        # unique (repo_type, namespace, name) index rejected this update.
+        return _repo_exists_response(repo_type, to_id)
 
     # Strict-freshness invalidation (#79): both ids change occupancy.
     # The old id transitions from "local-occupied" to "fallback-eligible";
@@ -1212,19 +1210,14 @@ async def squash_repo(
         logger.info(f"Step 1: Moving {repo_id} to temporary {temp_id}")
 
         # Use internal move logic
-        client = get_lakefs_client()
         from_lakefs_repo = resolve_lakefs_repo(repo_row)
-        temp_lakefs_repo = await allocate_lakefs_repo_name(
-            client, repo_type, temp_id
-        )
 
         # Migrate LakeFS FIRST (before updating DB)
-        await _migrate_lakefs_repository(
+        temp_lakefs_repo = await _migrate_lakefs_repository(
             repo_type=repo_type,
             from_id=repo_id,
             to_id=temp_id,
             from_lakefs_repo=from_lakefs_repo,
-            to_lakefs_repo=temp_lakefs_repo,
         )
 
         # Update DB AFTER successful migration
@@ -1252,25 +1245,21 @@ async def squash_repo(
         logger.success(f"Moved to temporary repository: {temp_id}")
 
         # `_migrate_lakefs_repository` already waited for the old repository's
-        # asynchronous deletion, so the original id is free to reuse below. If it
-        # timed out, allocation picks the next generation instead of colliding.
+        # asynchronous deletion, so the original id is usually free again. If it
+        # is not, the migration allocates another id instead of colliding.
 
         # Step 2: Move back to original name
         logger.info(f"Step 2: Moving {temp_id} back to {repo_id}")
 
         # Reload repo row (it was updated to temp name)
         repo_row = get_repository(repo_type, namespace, temp_name)
-        final_lakefs_repo = await allocate_lakefs_repo_name(
-            client, repo_type, repo_id
-        )
 
         # Migrate LakeFS FIRST (before updating DB)
-        await _migrate_lakefs_repository(
+        final_lakefs_repo = await _migrate_lakefs_repository(
             repo_type=repo_type,
             from_id=temp_id,
             to_id=repo_id,
             from_lakefs_repo=resolve_lakefs_repo(repo_row),
-            to_lakefs_repo=final_lakefs_repo,
         )
 
         # Update DB AFTER successful migration

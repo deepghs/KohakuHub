@@ -101,9 +101,10 @@ Create, read, update, delete, move, and squash repositories.
 
 ## Move/Rename Repository
 
-> **Known issue (#107):** a move or rename currently recreates the repository
-> from the `main` head only. Other branches, tags, and the commit history are
-> not carried over.
+A move or rename keeps everything: the commit history, all branches, and all
+tags. Only the repository's name changes; no data is copied. The old name is
+free again immediately, and a new repository created under it is independent
+of the moved one.
 
 **Pattern:** `POST /api/repos/move`
 
@@ -226,9 +227,7 @@ When enabled, the normal authentication and permission checks still apply.
 
 Squash is disabled by default until its #99 fixes land; see
 [Defaults and reopening plan](branches.md#defaults-and-reopening-plan). #107
-tracks further known issues in Squash and in Move/Rename. In particular, Move
-currently keeps only the `main` head, not other branches, tags, or commit
-history.
+tracks further known issues in Squash.
 
 ---
 
