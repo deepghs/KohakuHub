@@ -105,9 +105,12 @@ Used by `khub-worker` (`python -m kohakuhub.worker`). See [Background Tasks](../
 | `KOHAKU_HUB_WORKER_CONCURRENCY` | Tasks run at once per worker process. | `4` |
 | `KOHAKU_HUB_WORKER_LEASE_SECONDS` | A task is reclaimed by another worker if its lease is not renewed for this long. | `60` |
 | `KOHAKU_HUB_WORKER_POLL_INTERVAL_SECONDS` | Idle wait between claim attempts. | `1.0` |
-| `KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS` | Drain time on SIGTERM before running tasks are cancelled. | `30` |
+| `KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS` | Drain time on SIGTERM before running tasks are cancelled. Also how long a task whose cancellation was requested may take to stop on its own before it is interrupted. | `30` |
+| `KOHAKU_HUB_WORKER_FLUSH_INTERVAL_SECONDS` | How often a running task's progress and logs are stored and a cancellation request is noticed. The lease is renewed at least every `lease_seconds / 3` regardless. | `5.0` |
+| `KOHAKU_HUB_WORKER_LOG_MAX_BYTES_PER_ATTEMPT` | Cap on the log captured for one attempt of a task. Records past it are dropped after a truncation notice. | `10485760` |
 | `KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS` | Succeeded tasks are deleted after this many days. | `7` |
-| `KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS` | Failed tasks are deleted after this many days. | `30` |
+| `KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS` | Failed and cancelled tasks are deleted after this many days. | `30` |
+| `KOHAKU_HUB_WORKER_NAME` | Optional prefix for the worker name shown in the admin panel (`<name>-<hostname>`). Empty uses the hostname alone, which already tells replicas apart. | `""` |
 | `KOHAKU_HUB_WORKER_QUEUES` | Comma-separated queues this worker consumes; empty consumes all. | `""` |
 
 ## SMTP (Email) Settings

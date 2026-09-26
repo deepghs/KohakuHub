@@ -381,6 +381,21 @@ export const ElementPlusStubs = {
         });
     },
   }),
+  ElProgress: defineComponent({
+    name: "ElProgress",
+    props: {
+      percentage: { type: Number, default: 0 },
+      status: { type: String, default: "" },
+    },
+    setup(props) {
+      return () =>
+        h("div", {
+          "data-el-progress": "true",
+          "data-percentage": String(props.percentage),
+          "data-status": props.status,
+        });
+    },
+  }),
   ElDialog: defineComponent({
     name: "ElDialog",
     props: {

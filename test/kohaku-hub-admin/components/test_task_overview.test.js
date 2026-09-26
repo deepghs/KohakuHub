@@ -155,6 +155,27 @@ describe("TaskOverview", () => {
     expect(tile(bad, "backlog").text()).toContain("1h 6m");
     expect(tile(bad, "running").classes()).toContain("bad");
     expect(tile(bad, "running").text()).toContain("1 stuck (lease expired)");
+
+    const slow = mountOverview(
+      makeStats({
+        summary: { ...makeStats().summary, cancelled: 3 },
+        backlog: {
+          ...makeStats().backlog,
+          stuck: 1,
+          stalled: 2,
+          cancel_requested: 1,
+        },
+      }),
+    );
+    expect(tile(slow, "running").text()).toContain(
+      "1 stuck (lease expired) · 2 stalled · 1 cancelling",
+    );
+    expect(tile(slow, "success").text()).toContain("3 cancelled");
+    const stalled = mountOverview(
+      makeStats({ backlog: { ...makeStats().backlog, stalled: 1 } }),
+    );
+    expect(tile(stalled, "running").classes()).toContain("warn");
+    expect(tile(stalled, "running").text()).toContain("1 stalled");
     const reasons = bad.findAll('[data-testid="task-health-reasons"] li');
     expect(reasons.map((r) => r.classes()[0])).toEqual([
       "unhealthy",

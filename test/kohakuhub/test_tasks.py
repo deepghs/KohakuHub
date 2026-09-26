@@ -10,7 +10,8 @@ from kohakuhub import tasks
 from kohakuhub.config import cfg
 from peewee import SqliteDatabase
 
-from kohakuhub.db import BackgroundTask, db
+from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, db
+from kohakuhub.task_testing import RecordingContext, run_with_interruptions
 
 WORKER = "worker-a"
 LEASE = 60
@@ -189,7 +190,7 @@ def test_claim_reclaims_expired_lease(registry):
     assert reclaimed.locked_by == WORKER
     assert reclaimed.attempts == 2
     # The stale owner can no longer touch the row.
-    assert tasks.renew_lease(stale, lease_seconds=LEASE) is False
+    assert tasks.heartbeat(stale, lease_seconds=LEASE) == tasks.LEASE_LOST
     assert tasks.complete_task(stale) is False
     assert tasks.fail_task(stale, "late") is None
 
@@ -270,13 +271,29 @@ def test_periodic_claim_schedules_exactly_one_next_occurrence(registry):
     assert BackgroundTask.select().where(BackgroundTask.status == tasks.QUEUED).count() == 1
 
 
-def test_renew_lease_extends_owned_task(registry):
+def test_heartbeat_extends_owned_task_and_stores_progress(registry):
     _register("test.renew")
     tasks.enqueue("test.renew")
     claimed = tasks.claim_next(WORKER, lease_seconds=1)
 
-    assert tasks.renew_lease(claimed, lease_seconds=LEASE) is True
-    assert BackgroundTask.get_by_id(claimed.id).locked_until > claimed.locked_until
+    state = tasks.heartbeat(
+        claimed, lease_seconds=LEASE, progress={"progress_done": 3, "progress_total": 9}
+    )
+
+    assert state == tasks.LEASE_OWNED
+    row = BackgroundTask.get_by_id(claimed.id)
+    assert row.locked_until > claimed.locked_until
+    assert (row.progress_done, row.progress_total) == (3, 9)
+
+
+def test_heartbeat_reports_a_cancellation_request_while_still_renewing(registry):
+    _register("test.renew")
+    task_id = tasks.enqueue("test.renew")
+    claimed = tasks.claim_next(WORKER, lease_seconds=1)
+    assert tasks.request_cancel(task_id) == tasks.RUNNING
+
+    assert tasks.heartbeat(claimed, lease_seconds=LEASE) == tasks.LEASE_CANCEL
+    assert BackgroundTask.get_by_id(task_id).locked_until > claimed.locked_until
 
 
 def test_complete_task_marks_success(registry):
@@ -331,8 +348,13 @@ def test_retry_delay_grows_exponentially_with_bounded_jitter(monkeypatch):
     assert tasks.retry_delay(2) == tasks.RETRY_BASE_SECONDS * 2
 
 
-def test_retry_failed_task_requeues_only_failed(registry):
+def test_retry_failed_task_requeues_only_failed_or_cancelled(registry):
     _register("test.admin-retry")
+    cancelled = tasks.enqueue("test.admin-retry", priority=-1)
+    tasks.request_cancel(cancelled)
+    assert tasks.retry_failed_task(cancelled) is True
+    assert BackgroundTask.get_by_id(cancelled).status == tasks.QUEUED
+    tasks.request_cancel(cancelled)
     task_id = tasks.enqueue("test.admin-retry")
     assert tasks.retry_failed_task(task_id) is False
 
@@ -348,16 +370,24 @@ def test_retry_failed_task_requeues_only_failed(registry):
     assert tasks.retry_failed_task(999_999) is False
 
 
-def test_discard_task_rejects_running_and_finished_tasks(registry):
+def test_discard_task_deletes_only_failed_or_cancelled_tasks(registry):
     _register("test.discard")
     queued = tasks.enqueue("test.discard")
-    running = tasks.enqueue("test.discard", priority=1)
+    running = tasks.enqueue("test.discard", priority=2)
+    failed = tasks.enqueue("test.discard", priority=1)
+    succeeded = tasks.enqueue("test.discard", priority=1)
     tasks.claim_next(WORKER, lease_seconds=LEASE)
+    tasks.fail_task(tasks.claim_next(WORKER, lease_seconds=LEASE), "boom", permanent=True)
+    tasks.complete_task(tasks.claim_next(WORKER, lease_seconds=LEASE))
+    cancelled = tasks.enqueue("test.discard")
+    tasks.request_cancel(cancelled)
 
-    assert tasks.discard_task(running) is False
-    assert tasks.discard_task(queued) is True
-    assert tasks.discard_task(queued) is False
-    assert BackgroundTask.select().count() == 1
+    for task_id in (queued, running, succeeded):
+        assert tasks.discard_task(task_id) is False
+    assert tasks.discard_task(failed) is True
+    assert tasks.discard_task(cancelled) is True
+    assert tasks.discard_task(failed) is False
+    assert {row.id for row in BackgroundTask.select()} == {queued, running, succeeded}
 
 
 async def test_cleanup_task_deletes_expired_finished_rows(registry, monkeypatch):
@@ -374,25 +404,60 @@ async def test_cleanup_task_deletes_expired_finished_rows(registry, monkeypatch)
     fresh_success = row(tasks.SUCCEEDED, 6)
     old_failure = row(tasks.FAILED, 31)
     fresh_failure = row(tasks.FAILED, 8)
+    old_cancel = row(tasks.CANCELLED, 31)
+    fresh_cancel = row(tasks.CANCELLED, 8)
     queued = BackgroundTask.insert(kind="test.row").execute()
+    tasks._record_event(old_failure, "failed", 1)
+    BackgroundTaskLog.insert(
+        task=old_failure, attempt=1, at=now, level="INFO", message="gone with its task"
+    ).execute()
 
-    await tasks.cleanup_finished_tasks({})
+    ctx = RecordingContext()
+    await tasks.cleanup_finished_tasks({}, ctx)
 
     remaining = {r.id for r in BackgroundTask.select(BackgroundTask.id)}
-    assert remaining == {fresh_success, fresh_failure, queued}
-    assert old_success not in remaining and old_failure not in remaining
+    assert remaining == {fresh_success, fresh_failure, fresh_cancel, queued}
+    assert not {old_success, old_failure, old_cancel} & remaining
+    assert ctx.reports == [(3, 3)]
+    # Events and logs go with their task (ON DELETE CASCADE).
+    assert not BackgroundTaskEvent.select().where(BackgroundTaskEvent.task == old_failure).exists()
+    assert not BackgroundTaskLog.select().where(BackgroundTaskLog.task == old_failure).exists()
 
-    await tasks.cleanup_finished_tasks({})  # nothing left to delete
-    assert BackgroundTask.select().count() == 3
+    ctx = RecordingContext()
+    await tasks.cleanup_finished_tasks({}, ctx)  # nothing left to delete
+    assert BackgroundTask.select().count() == 4
+    assert ctx.reports == []
+
+
+async def test_cleanup_task_survives_interruptions(registry, monkeypatch):
+    monkeypatch.setattr(tasks, "CLEANUP_BATCH", 2)
+    now = tasks.utcnow()
+
+    def reset():
+        BackgroundTask.delete().execute()
+        for age_days in (40, 41, 42, 43, 44, 1):
+            BackgroundTask.insert(
+                kind="test.row", status=tasks.FAILED, finished_at=now - timedelta(days=age_days)
+            ).execute()
+
+    def snapshot():
+        return sorted(r.finished_at for r in BackgroundTask.select())
+
+    points = await run_with_interruptions(
+        tasks.cleanup_finished_tasks, {}, reset=reset, snapshot=snapshot
+    )
+
+    assert points == 6  # three batches, two points per progress report
 
 
 def test_queue_lifecycle_on_sqlite(registry, tmp_path):
     """SQLite has no SKIP LOCKED; the compare-and-set claim still works."""
     _register("test.sqlite")
     _register("test.sqlite-periodic", every=timedelta(minutes=1))
-    sqlite_db = SqliteDatabase(str(tmp_path / "tasks.db"))
-    with BackgroundTask.bind_ctx(sqlite_db):
-        sqlite_db.create_tables([BackgroundTask])
+    sqlite_db = SqliteDatabase(str(tmp_path / "tasks.db"), pragmas={"foreign_keys": 1})
+    models = [BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog]
+    with sqlite_db.bind_ctx(models):
+        sqlite_db.create_tables(models)
         task_id = tasks.enqueue("test.sqlite", {"n": 1}, dedupe_key="k")
         assert tasks.enqueue("test.sqlite", dedupe_key="k") is None
         tasks.ensure_periodic_tasks()
@@ -401,7 +466,10 @@ def test_queue_lifecycle_on_sqlite(registry, tmp_path):
         second = tasks.claim_next(WORKER, lease_seconds=LEASE)
         assert {first.kind, second.kind} == {"test.sqlite", "test.sqlite-periodic"}
         assert tasks.claim_next(WORKER, lease_seconds=LEASE) is None
+        tasks.assert_owned(first)  # no row lock on SQLite; the fence check still applies
         assert tasks.complete_task(first) is True
+        with pytest.raises(tasks.LeaseLost):
+            tasks.assert_owned(first)
         assert tasks.fail_task(second, "boom") == tasks.QUEUED
         assert BackgroundTask.get_by_id(task_id).dedupe_key is None
         # The periodic kind left exactly one next occurrence behind.
@@ -411,6 +479,14 @@ def test_queue_lifecycle_on_sqlite(registry, tmp_path):
             .count()
             == 1
         )
+        assert [
+            e.type
+            for e in BackgroundTaskEvent.select()
+            .where(BackgroundTaskEvent.task == task_id)
+            .order_by(BackgroundTaskEvent.id)
+        ][:2] == ["created", "claimed"]
+        sqlite_db.execute_sql("DELETE FROM background_task")
+        assert BackgroundTaskEvent.select().count() == 0  # cascades on SQLite too
     sqlite_db.close()
 
 

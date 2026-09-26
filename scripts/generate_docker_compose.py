@@ -355,7 +355,7 @@ def generate_hub_api_service(config: dict) -> str:
       - KOHAKU_HUB_S3_ENDPOINT={s3_endpoint_internal}
       - KOHAKU_HUB_S3_ACCESS_KEY={config["s3_access_key"]}
       - KOHAKU_HUB_S3_SECRET_KEY={config["s3_secret_key"]}
-      - KOHAKU_HUB_S3_BUCKET={config["s3_bucket"]}
+      - KOHAKU_HUB_S3_BUCKET={config.get("s3_bucket") or "hub-storage"}
       - KOHAKU_HUB_S3_REGION={s3_region}  # auto (recommended), us-east-1, or your AWS region
 {s3_sig_version_line}
 
@@ -415,9 +415,15 @@ def generate_hub_api_service(config: dict) -> str:
 
 def generate_khub_worker_service(config: dict) -> str:
     """Generate khub-worker service configuration (background tasks)."""
-    return f"""  khub-worker:
+    return f"""  # Replicas share the queue safely, so pick how many to run at startup:
+  #   KOHAKU_HUB_WORKER_REPLICAS=3 docker compose up -d
+  #   docker compose up -d --scale khub-worker=3
+  # No container_name: Docker needs a unique name per replica
+  # (<project>-khub-worker-1, -2, ...); use `docker compose logs khub-worker`.
+  khub-worker:
     build: .
-    container_name: khub-worker
+    deploy:
+      replicas: ${{KOHAKU_HUB_WORKER_REPLICAS:-1}}
     restart: always
     command: ["python", "/app/startup.py", "worker"]
     stop_grace_period: 45s # > KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS (30) so tasks can drain

@@ -117,9 +117,16 @@ class WorkerConfig(BaseModel):
     lease_seconds: int = 60  # A task is reclaimed if its worker stops renewing
     poll_interval_seconds: float = 1.0  # Idle wait between claim attempts
     shutdown_grace_seconds: float = 30.0  # Drain time on SIGTERM before cancelling
+    # How often a running task's progress and logs are stored (and cancellation
+    # is noticed); the lease is renewed at least every lease_seconds / 3 anyway.
+    flush_interval_seconds: float = 5.0
+    log_max_bytes_per_attempt: int = 10 * 1024 * 1024  # Later records are dropped
     succeeded_retention_days: int = 7
     failed_retention_days: int = 30
     queues: list[str] = []  # Empty = consume every queue
+    # Optional prefix for the name shown in the admin panel ("<name>-<hostname>");
+    # the hostname alone tells replicas apart, so leaving it empty is fine.
+    name: str = ""
 
 
 class AppConfig(BaseModel):
@@ -469,11 +476,15 @@ def load_config(path: str = None) -> Config:
         ("KOHAKU_HUB_WORKER_LEASE_SECONDS", "lease_seconds", int),
         ("KOHAKU_HUB_WORKER_POLL_INTERVAL_SECONDS", "poll_interval_seconds", float),
         ("KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS", "shutdown_grace_seconds", float),
+        ("KOHAKU_HUB_WORKER_FLUSH_INTERVAL_SECONDS", "flush_interval_seconds", float),
+        ("KOHAKU_HUB_WORKER_LOG_MAX_BYTES_PER_ATTEMPT", "log_max_bytes_per_attempt", int),
         ("KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS", "succeeded_retention_days", int),
         ("KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS", "failed_retention_days", int),
     ):
         if env_name in os.environ:
             worker_env[key] = parse(os.environ[env_name])
+    if "KOHAKU_HUB_WORKER_NAME" in os.environ:
+        worker_env["name"] = os.environ["KOHAKU_HUB_WORKER_NAME"].strip()
     if "KOHAKU_HUB_WORKER_QUEUES" in os.environ:
         worker_env["queues"] = [
             queue.strip()

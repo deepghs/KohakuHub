@@ -937,4 +937,54 @@ describe("admin API client", () => {
       params: { window: "7d" },
     });
   });
+
+  it("task cancel, log paging and log download helpers", async () => {
+    const api = await loadModule();
+    client.post.mockResolvedValueOnce({ data: { id: 7, status: "cancelled" } });
+    client.get
+      .mockResolvedValueOnce({ data: { lines: [] } })
+      .mockResolvedValueOnce({ data: { lines: [] } })
+      .mockResolvedValueOnce({ data: "blob" })
+      .mockResolvedValueOnce({ data: "blob" });
+
+    expect(await api.cancelTask("admin-token", 7)).toEqual({
+      id: 7,
+      status: "cancelled",
+    });
+    expect(client.post).toHaveBeenLastCalledWith("/tasks/7/cancel");
+
+    await api.getTaskLogs("admin-token", 7);
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/7/logs", {
+      params: { attempt: undefined, after_id: 0, limit: 500 },
+    });
+    await api.getTaskLogs("admin-token", 7, {
+      attempt: 2,
+      afterId: 40,
+      limit: 10,
+    });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/7/logs", {
+      params: { attempt: 2, after_id: 40, limit: 10 },
+    });
+
+    expect(await api.downloadTaskLogs("admin-token", 7)).toBe("blob");
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/7/logs/download", {
+      params: { attempt: undefined },
+      responseType: "blob",
+    });
+    await api.downloadTaskLogs("admin-token", 7, 3);
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/7/logs/download", {
+      params: { attempt: 3 },
+      responseType: "blob",
+    });
+    client.get.mockResolvedValueOnce({ data: { workers: [] } });
+    expect(await api.listWorkers("admin-token")).toEqual({ workers: [] });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/workers", {
+      params: { include_inactive: false },
+    });
+    client.get.mockResolvedValueOnce({ data: { workers: [] } });
+    await api.listWorkers("admin-token", { includeInactive: true });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/workers", {
+      params: { include_inactive: true },
+    });
+  });
 });

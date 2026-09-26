@@ -325,6 +325,20 @@ except Exception as e:
 **Pre-created loggers available:**
 - `logger_auth`, `logger_file`, `logger_lfs`, `logger_repo`, `logger_org`, `logger_settings`, `logger_api`, `logger_db`, `logger_admin`, `logger_quota`, `logger_likes`, `logger_stats`
 
+### Background Tasks
+
+Task handlers (`@task` in `kohakuhub.tasks`) follow the handler contract in
+[docs/development/background-tasks.md](docs/development/background-tasks.md#handler-contract).
+In short: any attempt can stop at any `await` without running its cleanup, so
+**the next attempt cleans up after the previous one**.
+
+- Make handlers re-runnable. Keep intermediate artifacts under the task's
+  deterministic `ctx.scratch_prefix`, never under random names.
+- Stage work privately and publish it in one atomic step, fenced with
+  `ctx.assert_owned()`.
+- Report progress with `ctx.progress()`, and checkpoint long work with `ctx.checkpoint()`.
+- Every handler that is not trivial gets a `run_with_interruptions` test (`kohakuhub.task_testing`).
+
 ### Frontend Code Style
 
 **Core Principles:**

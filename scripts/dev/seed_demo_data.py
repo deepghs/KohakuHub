@@ -4617,6 +4617,8 @@ def plant_seed_tokens() -> None:
 # never registered as handlers, so workers leave every row exactly as
 # planted: one of each state the page can show. Offsets are minutes
 # relative to seeding time; payload repo ids are filled in at plant time.
+# Each row also gets a timeline matching its state (seed_task_events);
+# ``progress``, ``stages`` and ``logs`` fill the progress, stage and log views.
 SEED_BACKGROUND_TASKS: tuple[dict, ...] = (
     {"kind": "demo.recalculate_repo_storage", "status": "succeeded", "attempts": 1,
      "created": -52, "started": -52, "finished": -51, "repo": 0},
@@ -4626,6 +4628,9 @@ SEED_BACKGROUND_TASKS: tuple[dict, ...] = (
      "created": -20, "started": -18, "finished": -17, "repo": 2},
     {"kind": "demo.recalculate_repo_storage", "status": "failed", "attempts": 5,
      "created": -45, "started": -13, "finished": -12, "repo": 1,
+     "stages": ["listing objects"],
+     "logs": [(1, "INFO", "Recalculating storage for the repository"),
+              (40, "WARNING", "LakeFS listing slow: 1000 objects in 38.2s")],
      "last_error": (
          "RuntimeError: LakeFS returned 503 Service Unavailable while listing objects\n"
          "  GET /api/v1/repositories/{repo}/refs/main/objects/ls?amount=1000\n"
@@ -4645,7 +4650,42 @@ SEED_BACKGROUND_TASKS: tuple[dict, ...] = (
      "last_error": "ConnectError: [Errno 111] Connection refused (s3 endpoint)"},
     {"kind": "demo.rebuild_search_index", "status": "running", "attempts": 1,
      "created": -3, "started": -3, "lease": 720, "worker": "seed-worker:4242:3f9a1c2e",
-     "payload": {"scope": "models"}},
+     "payload": {"scope": "models"}, "stages": ["indexing model cards"],
+     # No total: an indeterminate count.
+     "progress": {"done": 18420, "at": -0.05, "base_done": 0, "base_at": -3},
+     "logs": [(2, "INFO", "Rebuilding the search index for scope=models"),
+              (95, "INFO", "Indexed 10000 model cards"),
+              (170, "INFO", "Indexed 18420 model cards")]},
+    {"kind": "demo.lfs_gc", "status": "running", "attempts": 1, "priority": 5,
+     "created": -5, "started": -4, "lease": 720, "worker": "seed-worker:4242:3f9a1c2e",
+     "repo": 1, "stages": ["listing LFS objects", "deleting unreferenced objects"],
+     "progress": {"done": 3400, "total": 8000, "at": -0.05, "base_done": 0, "base_at": -3.5},
+     "checkpoint": {"after": "lfs/7c/4a/7c4a8d09ca3762af61e59520943dc26494f8941b"},
+     "logs": [(1, "INFO", "Listing LFS objects referenced by any commit"),
+              (28, "INFO", "8000 unreferenced objects to delete in 8 batches"),
+              (60, "INFO", "Deleted batch 1/8 (1000 objects)"),
+              (115, "INFO", "Deleted batch 2/8 (2000 objects)"),
+              (150, "WARNING", "S3 DeleteObjects throttled (SlowDown); retrying in 2s"),
+              (175, "INFO", "Deleted batch 3/8 (3000 objects)"),
+              (205, "INFO", "Deleted 400 of batch 4/8")]},
+    {"kind": "demo.mirror_sync", "queue": "sync", "status": "running", "attempts": 1,
+     "created": -26, "started": -25, "lease": 720, "worker": "seed-worker:4242:3f9a1c2e",
+     "payload": {"source": "huggingface", "upstream": "stabilityai/stable-diffusion-xl-base-1.0"},
+     "stages": ["downloading safetensors shards"],
+     # Alive (valid lease) but no progress for 22 minutes: flagged stalled.
+     "progress": {"done": 120, "total": 400, "at": -22, "base_done": 0, "base_at": -25},
+     "logs": [(3, "INFO", "Mirroring 400 files from huggingface"),
+              (160, "INFO", "Downloaded 120 of 400 files"),
+              (170, "WARNING", "Upstream answered 429 Too Many Requests; waiting")]},
+    {"kind": "demo.rebuild_search_index", "status": "running", "attempts": 1,
+     "created": -8, "started": -7, "lease": 720, "worker": "seed-worker:4111:0dd1ba5e",
+     "payload": {"scope": "datasets"}, "stages": ["indexing dataset cards"],
+     "cancel_requested": True,
+     "progress": {"done": 4100, "total": 9000, "at": -0.1, "base_done": 0, "base_at": -7},
+     "logs": [(2, "INFO", "Rebuilding the search index for scope=datasets"),
+              (300, "WARNING", "Cancellation requested; interrupting in 30s unless the task stops first")]},
+    {"kind": "demo.recalculate_repo_storage", "status": "cancelled", "attempts": 0,
+     "created": -40, "finished": -38, "repo": 0},
     {"kind": "demo.mirror_sync", "queue": "sync", "status": "running", "attempts": 1,
      "created": -26, "started": -25, "lease": -10, "worker": "seed-worker:4111:0dd1ba5e",
      "payload": {"source": "huggingface", "upstream": "bigscience/bloom-560m"}},
@@ -4710,11 +4750,97 @@ def seed_task_history(now, repo_ids: list[int]) -> list[dict]:
     return rows
 
 
+SEED_TASK_WORKER = "seed-worker:4242:3f9a1c2e"
+
+# Worker roster examples; live workers register themselves when they start.
+# Offsets are minutes relative to seeding time. The lost one is the worker
+# that held the expired-lease demo.mirror_sync task.
+SEED_WORKERS: tuple[dict, ...] = (
+    {"id": "seed-worker:4111:0dd1ba5e", "name": "seed-worker", "state": "running",
+     "started": -180, "heartbeat": -10, "succeeded": 57, "failed": 4},
+    {"id": "old-box:2210:5c1e9a07", "name": "old-box", "state": "stopped",
+     "started": -600, "heartbeat": -190, "succeeded": 812, "failed": 3},
+    # Silent for days: kept, but hidden in the admin panel by default.
+    {"id": "old-box:1987:0b77d2c4", "name": "old-box", "state": "stopped",
+     "started": -5000, "heartbeat": -4300, "succeeded": 4409, "failed": 21},
+)
+
+
+def _seed_traceback(error: str) -> str:
+    return (
+        "Traceback (most recent call last):\n"
+        '  File "/app/src/kohakuhub/worker.py", line 214, in _invoke\n'
+        "    await asyncio.wait_for(spec.handler(*args), timeout=spec.timeout)\n"
+        '  File "/app/src/kohakuhub/demo_tasks.py", line 41, in handler\n'
+        "    await recalculate(payload)\n"
+        f"{error.splitlines()[0]}"
+    )
+
+
+def seed_task_events(row, *, stages=(), cancel_requested=False) -> tuple[list, list]:
+    """Timeline and failure logs matching a planted task's state.
+
+    Earlier attempts end in ``retry_scheduled`` with the row's error; the last
+    one ends as the row's status says (still open for running rows).
+    """
+    from datetime import timedelta
+
+    events: list[dict] = []
+    logs: list[dict] = []
+    worker = row.locked_by or SEED_TASK_WORKER
+    error = row.last_error or "RuntimeError: transient failure"
+
+    def add(at, type_, attempt, by_worker=None, **detail):
+        events.append({
+            "task": row.id, "at": at, "type": type_, "attempt": attempt,
+            "worker": by_worker, "detail": json.dumps(detail) if detail else None,
+        })
+
+    def fail_log(at, attempt):
+        logs.append({"task": row.id, "attempt": attempt, "at": at, "level": "ERROR",
+                     "message": _seed_traceback(error)})
+
+    add(row.created_at, "created", 0)
+    if row.status == "cancelled" and row.attempts == 0:
+        add(row.finished_at, "cancelled", 0, by="admin")
+        return events, logs
+    start = row.started_at or row.created_at
+    gap = (start - row.created_at) / max(row.attempts, 1)
+    for attempt in range(1, row.attempts + 1):
+        claimed = start if attempt == row.attempts else row.created_at + gap * (attempt - 1)
+        add(claimed, "claimed", attempt, worker)
+        ends_in_retry = attempt < row.attempts or row.status == "queued"
+        if ends_in_retry:
+            failed_at = claimed + min(gap / 2, timedelta(seconds=30))
+            fail_log(failed_at, attempt)
+            add(failed_at, "retry_scheduled", attempt, worker, error=error.splitlines()[0],
+                run_after=(claimed + gap).isoformat() + "+00:00")
+    if row.attempts == 0:
+        return events, logs
+    for offset, stage in enumerate(stages):
+        add(start + timedelta(seconds=1 + offset * 20), "stage", row.attempts, worker, stage=stage)
+    if cancel_requested:
+        add(start + timedelta(minutes=5), "cancel_requested", row.attempts, worker)
+    if row.status == "succeeded":
+        add(row.finished_at, "succeeded", row.attempts, worker)
+    elif row.status == "failed":
+        fail_log(row.finished_at, row.attempts)
+        add(row.finished_at, "failed", row.attempts, worker, error=error.splitlines()[0])
+    return events, logs
+
+
 def plant_seed_background_tasks() -> None:
     """Insert the example background tasks directly into the database."""
     from datetime import timedelta
 
-    from kohakuhub.db import BackgroundTask, Repository, utcnow
+    from kohakuhub.db import (
+        BackgroundTask,
+        BackgroundTaskEvent,
+        BackgroundTaskLog,
+        BackgroundWorker,
+        Repository,
+        utcnow,
+    )
 
     if BackgroundTask.select().where(BackgroundTask.kind.startswith("demo.")).exists():
         return  # idempotent, like plant_seed_tokens
@@ -4723,16 +4849,24 @@ def plant_seed_background_tasks() -> None:
     repos = list(Repository.select().order_by(Repository.id).limit(3))
     if len(repos) < 3:
         raise SeedError("plant background tasks needs at least three seeded repositories")
-    for row in seed_task_history(now, [repo.id for repo in repos]):
-        BackgroundTask.create(**row)
+    events: list[dict] = []
+    logs: list[dict] = []
 
-    def at(minutes: int | None):
+    def plan(row, **options) -> None:
+        row_events, row_logs = seed_task_events(row, **options)
+        events.extend(row_events)
+        logs.extend(row_logs)
+
+    for fields in seed_task_history(now, [repo.id for repo in repos]):
+        plan(BackgroundTask.create(stall_seconds=600, **fields))
+
+    def at(minutes: float | None):
         return None if minutes is None else now + timedelta(minutes=minutes)
 
     for spec in SEED_BACKGROUND_TASKS:
         repo = repos[spec["repo"]] if "repo" in spec else None
         payload = spec.get("payload") or {"repo_id": repo.id}
-        BackgroundTask.create(
+        row = BackgroundTask.create(
             kind=spec["kind"],
             queue=spec.get("queue", "default"),
             payload=json.dumps(payload),
@@ -4752,7 +4886,41 @@ def plant_seed_background_tasks() -> None:
             created_at=at(spec["created"]),
             started_at=at(spec.get("started")),
             finished_at=at(spec.get("finished")),
+            stall_seconds=600,
+            cancel_requested=spec.get("cancel_requested", False),
+            checkpoint=json.dumps(spec["checkpoint"]) if "checkpoint" in spec else None,
         )
+        progress = spec.get("progress")
+        if progress or spec.get("stages"):
+            progress = progress or {}
+            row.progress_done = progress.get("done")
+            row.progress_total = progress.get("total")
+            row.progress_stage = spec["stages"][-1] if spec.get("stages") else None
+            row.progress_at = at(progress.get("at", spec.get("started")))
+            row.progress_base_done = progress.get("base_done")
+            row.progress_base_at = at(progress.get("base_at"))
+            row.save()
+        plan(row, stages=spec.get("stages", ()), cancel_requested=spec.get("cancel_requested", False))
+        for offset, level, message in spec.get("logs", ()):
+            logs.append({
+                "task": row.id, "attempt": row.attempts, "level": level, "message": message,
+                "at": row.started_at + timedelta(seconds=offset),
+            })
+
+    for spec in SEED_WORKERS:
+        heartbeat = at(spec["heartbeat"])
+        BackgroundWorker.create(
+            id=spec["id"], name=spec["name"], hostname=spec["name"],
+            pid=int(spec["id"].split(":")[1]), queues="[]", concurrency=4,
+            state=spec["state"], succeeded=spec["succeeded"],
+            failed=spec["failed"], started_at=at(spec["started"]), last_heartbeat_at=heartbeat,
+            stopped_at=heartbeat if spec["state"] == "stopped" else None,
+        )
+
+    for batch in range(0, len(events), 500):
+        BackgroundTaskEvent.insert_many(events[batch:batch + 500]).execute()
+    for batch in range(0, len(logs), 500):
+        BackgroundTaskLog.insert_many(logs[batch:batch + 500]).execute()
 
 
 async def plant_seed_ssh_keys(

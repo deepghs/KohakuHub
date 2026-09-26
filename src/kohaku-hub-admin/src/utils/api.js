@@ -1567,7 +1567,7 @@ export async function deleteS3Prefix(token, prefix, confirmToken) {
  * List background tasks with per-status counts
  * @param {string} token - Admin token
  * @param {Object} params - Query parameters
- * @param {string} [params.status] - Filter by status (queued/running/succeeded/failed)
+ * @param {string} [params.status] - Filter by status (queued/running/succeeded/failed/cancelled)
  * @param {string} [params.kind] - Filter by task kind
  * @param {number} params.limit - Max tasks to return
  * @param {number} params.offset - Offset for pagination
@@ -1585,10 +1585,10 @@ export async function listTasks(
 }
 
 /**
- * Get one background task including payload and last error
+ * Get one background task with its timeline, attempts and log sizes
  * @param {string} token - Admin token
  * @param {number} taskId - Task ID
- * @returns {Promise<Object>} Task
+ * @returns {Promise<Object>} Task with events, attempts, checkpoint, log_lines
  */
 export async function getTask(token, taskId) {
   const client = createAdminClient(token);
@@ -1597,7 +1597,7 @@ export async function getTask(token, taskId) {
 }
 
 /**
- * Requeue a failed background task
+ * Requeue a failed or cancelled background task
  * @param {string} token - Admin token
  * @param {number} taskId - Task ID
  * @returns {Promise<Object>} Updated task
@@ -1609,7 +1609,7 @@ export async function retryTask(token, taskId) {
 }
 
 /**
- * Discard a queued or failed background task
+ * Discard a failed or cancelled background task with its timeline and logs
  * @param {string} token - Admin token
  * @param {number} taskId - Task ID
  * @returns {Promise<Object>} Deletion result
@@ -1617,6 +1617,71 @@ export async function retryTask(token, taskId) {
 export async function deleteTask(token, taskId) {
   const client = createAdminClient(token);
   const response = await client.delete(`/tasks/${taskId}`);
+  return response.data;
+}
+
+/**
+ * Cancel a queued task, or ask the worker running a task to stop it
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @returns {Promise<Object>} Updated task
+ */
+export async function cancelTask(token, taskId) {
+  const client = createAdminClient(token);
+  const response = await client.post(`/tasks/${taskId}/cancel`);
+  return response.data;
+}
+
+/**
+ * Page through a task's captured log, oldest first
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @param {Object} params - Query parameters
+ * @param {number} [params.attempt] - Only this attempt's records
+ * @param {number} [params.afterId] - Only records after this id (for tailing)
+ * @param {number} [params.limit] - Max records to return
+ * @returns {Promise<Object>} { lines, next_after_id, has_more, status }
+ */
+export async function getTaskLogs(
+  token,
+  taskId,
+  { attempt, afterId = 0, limit = 500 } = {},
+) {
+  const client = createAdminClient(token);
+  const response = await client.get(`/tasks/${taskId}/logs`, {
+    params: { attempt, after_id: afterId, limit },
+  });
+  return response.data;
+}
+
+/**
+ * Download a task's log (or one attempt's) as plain text
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @param {number} [attempt] - Only this attempt's records
+ * @returns {Promise<Blob>} The log file
+ */
+export async function downloadTaskLogs(token, taskId, attempt) {
+  const client = createAdminClient(token);
+  const response = await client.get(`/tasks/${taskId}/logs/download`, {
+    params: { attempt },
+    responseType: "blob",
+  });
+  return response.data;
+}
+
+/**
+ * The background worker roster: every worker process and whether it is alive
+ * @param {string} token - Admin token
+ * @param {Object} params - Query parameters
+ * @param {boolean} [params.includeInactive] - Also list workers silent for over a day
+ * @returns {Promise<Object>} { workers, counts, hidden, lost_after_seconds, inactive_after_seconds }
+ */
+export async function listWorkers(token, { includeInactive = false } = {}) {
+  const client = createAdminClient(token);
+  const response = await client.get("/tasks/workers", {
+    params: { include_inactive: includeInactive },
+  });
   return response.data;
 }
 

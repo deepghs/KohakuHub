@@ -549,6 +549,18 @@ class BackgroundTask(BaseModel):
     created_at = DateTimeField(default=utcnow)
     started_at = DateTimeField(null=True)
     finished_at = DateTimeField(null=True)
+    # Copied from the kind at enqueue, like max_attempts; NULL disables stall detection.
+    stall_seconds = IntegerField(null=True)
+    cancel_requested = BooleanField(default=False)
+    # Progress reported through TaskContext; the base is the attempt's first
+    # report, so the ETA of a resumed attempt only counts its own work.
+    progress_done = BigIntegerField(null=True)
+    progress_total = BigIntegerField(null=True)
+    progress_stage = CharField(max_length=255, null=True)
+    progress_at = DateTimeField(null=True)
+    progress_base_done = BigIntegerField(null=True)
+    progress_base_at = DateTimeField(null=True)
+    checkpoint = TextField(null=True)  # JSON cursor from TaskContext.checkpoint()
 
     class Meta:
         table_name = "background_task"
@@ -557,6 +569,59 @@ class BackgroundTask(BaseModel):
             (("status", "locked_until"), False),
             (("status", "finished_at"), False),
         )
+
+
+class BackgroundTaskEvent(BaseModel):
+    """One lifecycle event of a task, written with the state change it records."""
+
+    id = BigAutoField()
+    task = ForeignKeyField(BackgroundTask, backref="events", on_delete="CASCADE", index=True)
+    at = DateTimeField(default=utcnow)
+    type = CharField(max_length=32)
+    attempt = IntegerField(default=0)
+    worker = CharField(max_length=255, null=True)
+    detail = TextField(null=True)  # JSON
+
+    class Meta:
+        table_name = "background_task_event"
+
+
+class BackgroundWorker(BaseModel):
+    """A worker process, registered at startup and kept fresh by heartbeats.
+
+    Online, draining, lost and stopped are derived from ``state`` and
+    ``last_heartbeat_at`` when read; see ``kohakuhub.tasks.worker_status``.
+    """
+
+    id = CharField(max_length=255, primary_key=True)  # the worker id tasks record in locked_by
+    name = CharField(max_length=255)  # display name: optional prefix plus hostname
+    hostname = CharField(max_length=255)
+    pid = IntegerField()
+    queues = TextField(default="[]")  # JSON list; empty means every queue
+    concurrency = IntegerField()
+    state = CharField(max_length=16)  # running, draining or stopped
+    succeeded = BigIntegerField(default=0)  # attempts since this process started
+    failed = BigIntegerField(default=0)
+    started_at = DateTimeField()
+    last_heartbeat_at = DateTimeField()
+    stopped_at = DateTimeField(null=True)
+
+    class Meta:
+        table_name = "background_worker"
+
+
+class BackgroundTaskLog(BaseModel):
+    """A log record emitted while a task attempt ran."""
+
+    id = BigAutoField()
+    task = ForeignKeyField(BackgroundTask, backref="logs", on_delete="CASCADE", index=True)
+    attempt = IntegerField()
+    at = DateTimeField()
+    level = CharField(max_length=16)
+    message = TextField()
+
+    class Meta:
+        table_name = "background_task_log"
 
 
 def init_db():
@@ -582,6 +647,9 @@ def init_db():
             FallbackSource,
             ConfirmationToken,
             BackgroundTask,
+            BackgroundTaskEvent,
+            BackgroundTaskLog,
+            BackgroundWorker,
         ],
         safe=True,
     )

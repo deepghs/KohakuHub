@@ -52,6 +52,18 @@ const backlogTone = computed(() => {
   return "ok";
 });
 
+// Most urgent first: a lost worker, then tasks alive but not moving.
+const runningHint = computed(() => {
+  const { stuck, stalled, cancel_requested: cancelling } = backlog.value;
+  const parts = [];
+  if (stuck) parts.push(`${stuck} stuck (lease expired)`);
+  if (stalled) parts.push(`${stalled} stalled`);
+  if (cancelling) parts.push(`${cancelling} cancelling`);
+  return parts.length
+    ? parts.join(" · ")
+    : `${backlog.value.active_workers} active worker(s)`;
+});
+
 const tiles = computed(() => [
   {
     key: "finished",
@@ -64,7 +76,11 @@ const tiles = computed(() => [
     key: "success",
     label: "Success rate",
     value: successRate.value === null ? "—" : formatPercent(successRate.value),
-    hint: `${summary.value.failed} failed · ${summary.value.succeeded_after_retry} recovered by retry`,
+    hint:
+      `${summary.value.failed} failed · ${summary.value.succeeded_after_retry} recovered by retry` +
+      (summary.value.cancelled
+        ? ` · ${summary.value.cancelled} cancelled`
+        : ""),
     tone: rateTone(summary.value.failure_rate),
   },
   {
@@ -88,10 +104,12 @@ const tiles = computed(() => [
     key: "running",
     label: "Running",
     value: backlog.value.running,
-    hint: backlog.value.stuck
-      ? `${backlog.value.stuck} stuck (lease expired)`
-      : `${backlog.value.active_workers} active worker(s)`,
-    tone: backlog.value.stuck ? "bad" : "muted",
+    hint: runningHint.value,
+    tone: backlog.value.stuck
+      ? "bad"
+      : backlog.value.stalled
+        ? "warn"
+        : "muted",
     status: "running",
   },
   {
