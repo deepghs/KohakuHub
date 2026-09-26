@@ -14,7 +14,7 @@ import uuid
 
 from kohakuhub import tasks
 from kohakuhub.config import cfg
-from kohakuhub.db import BackgroundTask, BackgroundTaskLog, db
+from kohakuhub.db import BackgroundTask, BackgroundWorker, db
 from kohakuhub.lakefs_rest_client import close_lakefs_rest_client
 from kohakuhub.logger import get_logger
 
@@ -51,9 +51,15 @@ class Worker:
         queues: list[str] | None = None,
         flush_interval: float | None = None,
         log_limit_bytes: int | None = None,
+        name: str | None = None,
     ):
         options = cfg.worker
-        self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self.hostname = socket.gethostname()
+        self.pid = os.getpid()
+        self.worker_id = worker_id or f"{self.hostname}:{self.pid}:{uuid.uuid4().hex[:8]}"
+        prefix = options.name if name is None else name
+        # In Docker the hostname is the container id, which `docker ps` shows.
+        self.name = f"{prefix}-{self.hostname}" if prefix else self.hostname
         self.concurrency = concurrency or options.concurrency
         self.lease_seconds = lease_seconds or options.lease_seconds
         self.poll_interval = poll_interval or options.poll_interval_seconds
@@ -64,14 +70,16 @@ class Worker:
         # cancellation, so it must also come often enough for the lease.
         self.tick = min(flush_interval, self.lease_seconds / 3)
         self.log_limit_bytes = log_limit_bytes or options.log_max_bytes_per_attempt
+        self.succeeded = 0
+        self.failed = 0
         self._running: set[asyncio.Task] = set()
 
     async def wait_for_schema(self, stop: asyncio.Event) -> bool:
         """Block until the task tables exist; ``False`` if stopped first."""
         while not stop.is_set():
             try:
-                # background_task_log is the last table the task migrations create.
-                if BackgroundTaskLog.table_exists():
+                # background_worker is the last table the task migrations create.
+                if BackgroundWorker.table_exists():
                     return True
                 logger.info("Waiting for the background task tables (migrations run on hub-api)")
             except Exception as e:
@@ -88,17 +96,42 @@ class Worker:
         )
         tasks.install_log_capture()
         loop = asyncio.get_running_loop()
-        next_resync = loop.time()
-        while not stop.is_set():
-            if loop.time() >= next_resync:
-                self._resync_periodic()
-                next_resync = loop.time() + PERIODIC_RESYNC_SECONDS
-            if len(self._running) < self.concurrency and (row := self._claim()) is not None:
-                self._start(row)
-                continue
-            await self._wait(stop)
-        await self._drain()
+        next_resync = next_heartbeat = loop.time()
+        try:
+            while not stop.is_set():
+                if loop.time() >= next_heartbeat:
+                    self._report("running")
+                    next_heartbeat = loop.time() + tasks.WORKER_HEARTBEAT_SECONDS
+                if loop.time() >= next_resync:
+                    self._resync_periodic()
+                    next_resync = loop.time() + PERIODIC_RESYNC_SECONDS
+                if len(self._running) < self.concurrency and (row := self._claim()) is not None:
+                    self._start(row)
+                    continue
+                await self._wait(stop)
+            self._report("draining")
+            await self._drain()
+        finally:
+            self._report("stopped")
         logger.info(f"Worker {self.worker_id} stopped")
+
+    def _report(self, state: str) -> None:
+        """Refresh this worker's roster row; the next heartbeat retries on failure."""
+        try:
+            tasks.record_worker(
+                self.worker_id,
+                name=self.name,
+                hostname=self.hostname,
+                pid=self.pid,
+                queues=self.queues,
+                concurrency=self.concurrency,
+                state=state,
+                succeeded=self.succeeded,
+                failed=self.failed,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update the worker roster: {e}")
+            _reset_connection()
 
     def _resync_periodic(self) -> None:
         try:
@@ -138,7 +171,15 @@ class Worker:
         if not self._running:
             return
         logger.info(f"Waiting up to {self.shutdown_grace}s for {len(self._running)} task(s)")
-        _, pending = await asyncio.wait(set(self._running), timeout=self.shutdown_grace)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.shutdown_grace
+        pending = set(self._running)
+        # Keep heartbeating, so a long drain shows as draining rather than lost.
+        while pending and (remaining := deadline - loop.time()) > 0:
+            _, pending = await asyncio.wait(
+                pending, timeout=min(remaining, tasks.WORKER_HEARTBEAT_SECONDS)
+            )
+            self._report("draining")
         # Cancelled tasks are released back to the queue (see _execute).
         for running in pending:
             running.cancel()
@@ -189,7 +230,8 @@ class Worker:
             self._record_failure(row, f"{type(e).__name__}: {e}")
         else:
             self._flush(row, ctx)
-            self._record(lambda: tasks.complete_task(row))
+            if self._record(lambda: tasks.complete_task(row)):
+                self.succeeded += 1
         finally:
             heartbeat.cancel()
             run.cancel()
@@ -252,6 +294,8 @@ class Worker:
 
     def _record_failure(self, row: BackgroundTask, error: str, *, permanent: bool = False) -> None:
         status = self._record(lambda: tasks.fail_task(row, error, permanent=permanent))
+        if status is not None:
+            self.failed += 1
         logger.warning(
             f"Task {row.id} ({row.kind}) attempt {row.attempts} failed -> {status}: {error}"
         )

@@ -586,6 +586,30 @@ class BackgroundTaskEvent(BaseModel):
         table_name = "background_task_event"
 
 
+class BackgroundWorker(BaseModel):
+    """A worker process, registered at startup and kept fresh by heartbeats.
+
+    Online, draining, lost and stopped are derived from ``state`` and
+    ``last_heartbeat_at`` when read; see ``kohakuhub.tasks.worker_status``.
+    """
+
+    id = CharField(max_length=255, primary_key=True)  # the worker id tasks record in locked_by
+    name = CharField(max_length=255)  # display name: optional prefix plus hostname
+    hostname = CharField(max_length=255)
+    pid = IntegerField()
+    queues = TextField(default="[]")  # JSON list; empty means every queue
+    concurrency = IntegerField()
+    state = CharField(max_length=16)  # running, draining or stopped
+    succeeded = BigIntegerField(default=0)  # attempts since this process started
+    failed = BigIntegerField(default=0)
+    started_at = DateTimeField()
+    last_heartbeat_at = DateTimeField()
+    stopped_at = DateTimeField(null=True)
+
+    class Meta:
+        table_name = "background_worker"
+
+
 class BackgroundTaskLog(BaseModel):
     """A log record emitted while a task attempt ran."""
 
@@ -625,6 +649,7 @@ def init_db():
             BackgroundTask,
             BackgroundTaskEvent,
             BackgroundTaskLog,
+            BackgroundWorker,
         ],
         safe=True,
     )

@@ -1059,5 +1059,15 @@ describe("admin API client", () => {
       params: { attempt: 3 },
       responseType: "blob",
     });
+    client.get.mockResolvedValueOnce({ data: { workers: [] } });
+    expect(await api.listWorkers("admin-token")).toEqual({ workers: [] });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/workers", {
+      params: { include_inactive: false },
+    });
+    client.get.mockResolvedValueOnce({ data: { workers: [] } });
+    await api.listWorkers("admin-token", { includeInactive: true });
+    expect(client.get).toHaveBeenLastCalledWith("/tasks/workers", {
+      params: { include_inactive: true },
+    });
   });
 });

@@ -61,6 +61,7 @@ export default defineConfig({
         "src/components/tasks/TaskDetail.vue",
         "src/components/tasks/TaskLogViewer.vue",
         "src/components/tasks/TaskProgress.vue",
+        "src/components/tasks/TaskWorkers.vue",
         "src/components/tasks/taskFormat.js",
         "src/stores/admin.js",
         "src/stores/theme.js",

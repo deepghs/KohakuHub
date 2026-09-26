@@ -186,6 +186,7 @@ changes between runs from the same state.
 | Dedupe | `dedupe_key` is unique while the task is pending. Claiming the task releases the key, so work arriving while it runs can enqueue a fresh task. |
 | Delay | `enqueue(..., run_after=datetime)`. Timestamps are naive UTC (`kohakuhub.db.utcnow()`). |
 | Periodic | `@task(..., every=timedelta(...))`. Claiming an occurrence inserts the next one in the same transaction, so exactly one is pending at any time. Workers re-create a missing occurrence (for example, one cancelled from the admin panel) within a minute. |
+| Worker roster | Each worker registers itself in `background_worker` at startup (no configuration needed; replicas register themselves) and refreshes its row every 10 s. Each row records the worker's queues and concurrency, and the attempts it has succeeded or failed since it started. Its current load is read live from the tasks it holds, so a lost worker whose tasks were reclaimed shows none. It reports `draining` while it drains on SIGTERM and `stopped` when it exits. A worker silent for 30 s is shown as **lost**: it was killed or its host went away. Rows are never deleted. |
 | Retention | The built-in periodic `tasks.cleanup` task deletes finished rows in batches after the configured retention. Cancelled tasks share the failed retention. Events and logs go with their task (`ON DELETE CASCADE`). |
 | Shutdown | SIGTERM stops claiming and drains running tasks for `shutdown_grace_seconds`. It then cancels the rest and hands them back to the queue without spending an attempt. The compose service sets `stop_grace_period: 45s` so Docker does not kill the worker mid-drain. |
 
@@ -215,6 +216,13 @@ changes between runs from the same state.
     - **Logs**: follows new records while the task runs, filters by attempt,
       and downloads the whole log or one attempt's as a `.log` file.
 
+- **Workers** lists the worker roster, backed by `GET /admin/api/tasks/workers`:
+  - each worker shows its name, id, pid, status (online, draining, lost, stopped) and last heartbeat, queues, load (running out of its concurrency), attempts succeeded and failed since it started, and the tasks it is running, each linking to its details;
+  - lost and stopped workers silent for over 24 hours are hidden unless **Show workers inactive for over 24h** is ticked (`?include_inactive=true`);
+  - the page header shows how many workers are online, and a task's **Worker** field jumps to its row.
+
+  A worker's name is its hostname, which in Docker is the container id that `docker ps` shows. Set `KOHAKU_HUB_WORKER_NAME` to prefix it, for example `gpu-box-3f9a1c2e7b10`.
+
   The endpoints behind these are:
   - `POST /admin/api/tasks/{id}/cancel`;
   - `GET /admin/api/tasks/{id}/logs?attempt=&after_id=&limit=`, which pages
@@ -230,6 +238,7 @@ The health verdict uses these rules:
 | Failures with fewer than 5 finished | any | — |
 | Tasks waiting to retry | any | — |
 | Running tasks flagged stalled | any | — |
+| Due tasks but no worker online | — | any |
 | Running tasks with an expired lease | — | any (no worker reclaimed them) |
 
 A queued task whose kind no running worker registers never drains, so the backlog rule flags it too.

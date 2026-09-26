@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
     getTaskLogs: vi.fn(),
     downloadTaskLogs: vi.fn(),
     getTaskStats: vi.fn(),
+    listWorkers: vi.fn(),
   },
 }));
 
@@ -36,6 +37,7 @@ vi.mock("@/utils/api", () => ({
   getTaskLogs: (...args) => mocks.api.getTaskLogs(...args),
   downloadTaskLogs: (...args) => mocks.api.downloadTaskLogs(...args),
   getTaskStats: (...args) => mocks.api.getTaskStats(...args),
+  listWorkers: (...args) => mocks.api.listWorkers(...args),
 }));
 
 vi.mock("@/components/AdminLayout.vue", () => ({
@@ -206,6 +208,35 @@ function mountPage() {
   });
 }
 
+function rosterResponse(overrides = {}) {
+  return {
+    workers: [
+      {
+        id: "host-a:7:aaaa1111",
+        name: "host-a",
+        hostname: "host-a",
+        pid: 7,
+        queues: [],
+        concurrency: 4,
+        status: "online",
+        running: 1,
+        succeeded: 10,
+        failed: 0,
+        started_at: "2026-09-25T09:00:00+00:00",
+        last_heartbeat_at: "2026-09-25T10:00:00+00:00",
+        heartbeat_age_seconds: 3,
+        stopped_at: null,
+        tasks: [{ id: 2, kind: "repo.recalc", progress: null }],
+      },
+    ],
+    counts: { online: 1, draining: 1, lost: 0, stopped: 0 },
+    hidden: 0,
+    lost_after_seconds: 30,
+    inactive_after_seconds: 86400,
+    ...overrides,
+  };
+}
+
 function httpError(status, detail) {
   const error = new Error(`HTTP ${status}`);
   error.response = { status, data: { detail } };
@@ -220,6 +251,7 @@ describe("admin background tasks page", () => {
     mocks.adminStore.token = "admin-token";
     Object.values(mocks.api).forEach((fn) => fn.mockReset());
     mocks.api.getTaskStats.mockResolvedValue(statsResponse());
+    mocks.api.listWorkers.mockResolvedValue(rosterResponse());
     mocks.api.getTaskLogs.mockResolvedValue({
       lines: [],
       next_after_id: 0,
@@ -303,7 +335,7 @@ describe("admin background tasks page", () => {
     await flushPromises();
 
     expect(wrapper.find('[data-testid="tasks-empty"]').exists()).toBe(true);
-    expect(wrapper.find('[data-el-table="true"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="tasks-table"]').exists()).toBe(false);
   });
 
   it("filters by status card toggle, status select, and kind select", async () => {
@@ -889,6 +921,92 @@ describe("admin background tasks page", () => {
 
     expect(wrapper.find('[data-testid="task-overview"]').exists()).toBe(true);
     expect(wrapper.find('[data-testid="tasks-stats-retry"]').exists()).toBe(
+      false,
+    );
+  });
+
+  it("shows how many workers are alive and opens the roster", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(mocks.api.listWorkers).toHaveBeenCalledWith("admin-token", {
+      includeInactive: false,
+    });
+    const chip = wrapper.get('[data-testid="tasks-workers-chip"]');
+    expect(chip.text()).toBe("2 worker(s) online"); // online + draining
+    expect(chip.classes()).toContain("success");
+    await chip.trigger("click");
+    expect(wrapper.get('[data-el-tabs="true"]').attributes("data-active")).toBe(
+      "workers",
+    );
+    expect(wrapper.find('[data-testid="task-workers"]').exists()).toBe(true);
+  });
+
+  it("flags when no worker is online", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    mocks.api.listWorkers.mockResolvedValue(
+      rosterResponse({
+        workers: [],
+        counts: { online: 0, draining: 0, lost: 1, stopped: 0 },
+      }),
+    );
+    const wrapper = mountPage();
+    await flushPromises();
+
+    const chip = wrapper.get('[data-testid="tasks-workers-chip"]');
+    expect(chip.text()).toBe("0 worker(s) online");
+    expect(chip.classes()).toContain("danger");
+  });
+
+  it("reloads the roster with inactive workers and opens a worker's task", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    mocks.api.getTask.mockResolvedValue(detailOf(RUNNING));
+    const wrapper = mountPage();
+    await flushPromises();
+
+    wrapper
+      .getComponent({ name: "TaskWorkers" })
+      .vm.$emit("update:includeInactive", true);
+    await flushPromises();
+    expect(mocks.api.listWorkers).toHaveBeenLastCalledWith("admin-token", {
+      includeInactive: true,
+    });
+
+    await wrapper.get('[data-testid="worker-task-2"]').trigger("click");
+    await flushPromises();
+    expect(mocks.api.getTask).toHaveBeenCalledWith("admin-token", 2);
+    expect(wrapper.find('[data-testid="tasks-detail"]').exists()).toBe(true);
+  });
+
+  it("jumps from a task to the worker running it", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    mocks.api.getTask.mockResolvedValue(detailOf(RUNNING));
+    const wrapper = mountPage();
+    await flushPromises();
+    await wrapper.get('[data-testid="tasks-detail-2"]').trigger("click");
+    await flushPromises();
+
+    await wrapper.get('[data-testid="tasks-detail-worker"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="tasks-detail"]').exists()).toBe(false);
+    expect(wrapper.get('[data-el-tabs="true"]').attributes("data-active")).toBe(
+      "workers",
+    );
+    expect(
+      wrapper.getComponent({ name: "TaskWorkers" }).props("highlight"),
+    ).toBe("host:1:abcd");
+  });
+
+  it("reports a roster that fails to load", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    mocks.api.listWorkers.mockRejectedValue(new Error("offline"));
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(messageErrorSpy).toHaveBeenCalledWith("Failed to load workers");
+    expect(wrapper.find('[data-testid="tasks-workers-chip"]').exists()).toBe(
       false,
     );
   });

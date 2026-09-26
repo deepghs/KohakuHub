@@ -65,6 +65,7 @@ log_max_bytes_per_attempt = 10485760  # Task log cap per attempt; later records 
 succeeded_retention_days = 7     # Finished tasks are deleted after these retention windows
 failed_retention_days = 30
 queues = []                      # Empty = consume every queue
+name = ""                        # Optional prefix for the name shown in the admin panel
 
 [app]
 base_url = "http://127.0.0.1:28080"  # Use nginx port (28080), not direct backend (48888)

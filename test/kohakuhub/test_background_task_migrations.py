@@ -1,4 +1,5 @@
-"""Tests for migrations 017 (background_task) and 018 (timeline, progress, logs)."""
+"""Tests for migrations 017 (background_task), 018 (timeline, progress, logs)
+and 019 (worker roster)."""
 
 import importlib.util
 from pathlib import Path
@@ -7,11 +8,26 @@ from types import SimpleNamespace
 import pytest
 from peewee import SqliteDatabase
 
-from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, db
+from kohakuhub.db import (
+    BackgroundTask,
+    BackgroundTaskEvent,
+    BackgroundTaskLog,
+    BackgroundWorker,
+    db,
+)
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "scripts" / "db_migrations"
-TABLES = ("background_task", "background_task_event", "background_task_log")
-MODELS = [BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog]
+TABLES = ("background_task", "background_task_event", "background_task_log", "background_worker")
+MODELS = [BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, BackgroundWorker]
+DROP_ALL = (
+    'DROP TABLE IF EXISTS "background_worker", "background_task_log", '
+    '"background_task_event", "background_task"'
+)
+OLD_ROW = (
+    'INSERT INTO "background_task" (kind, queue, payload, status, priority, run_after,'
+    " attempts, max_attempts, created_at) VALUES ('old.kind', 'default', '{{}}',"
+    " 'failed', 0, {now}, 1, 5, {now})"
+)
 
 
 def _load(filename):
@@ -27,6 +43,14 @@ def _load_017():
 
 def _load_018():
     return _load("018_background_task_observability.py")
+
+
+def _load_019():
+    return _load("019_background_workers.py")
+
+
+def _chain():
+    return _load_017(), _load_018(), _load_019()
 
 
 def _schema(database):
@@ -65,55 +89,44 @@ def _sqlite_reference(path):
     return _schema(reference)
 
 
-def test_migrations_017_and_018_match_init_db_on_postgres(prepared_backend_test_state):
+def test_migrations_017_to_019_match_init_db_on_postgres(prepared_backend_test_state):
     expected = _schema(db)  # created by init_db()
-    db.execute_sql('DROP TABLE "background_task_log", "background_task_event", "background_task"')
+    db.execute_sql(DROP_ALL)
     try:
-        m017, m018 = _load_017(), _load_018()
-        assert m017.is_applied(db, m017.cfg) is False
-        assert m017.run() is True
-        assert m018.is_applied(db, m018.cfg) is False
-        assert m018.run() is True
+        migrations = _chain()
+        for migration in migrations:
+            assert migration.is_applied(db, migration.cfg) is False
+            assert migration.run() is True
         assert _schema(db) == expected
-        assert m017.run() is True  # re-running is a no-op
-        assert m018.run() is True
+        for migration in migrations:
+            assert migration.run() is True  # re-running is a no-op
     finally:
         db.create_tables(MODELS, safe=True)
 
 
 def test_migration_018_upgrades_existing_rows_on_postgres(prepared_backend_test_state):
-    db.execute_sql('DROP TABLE "background_task_log", "background_task_event", "background_task"')
+    db.execute_sql(DROP_ALL)
     try:
         assert _load_017().run() is True
-        db.execute_sql(
-            'INSERT INTO "background_task" (kind, queue, payload, status, priority, run_after,'
-            " attempts, max_attempts, created_at) VALUES ('old.kind', 'default', '{}',"
-            " 'failed', 0, now(), 1, 5, now())"
-        )
+        db.execute_sql(OLD_ROW.format(now="now()"))
         assert _load_018().run() is True
         row = BackgroundTask.get(BackgroundTask.kind == "old.kind")
         assert row.cancel_requested is False
         assert (row.progress_done, row.checkpoint, row.stall_seconds) == (None, None, None)
     finally:
-        db.execute_sql(
-            'DROP TABLE IF EXISTS "background_task_log", "background_task_event",'
-            ' "background_task"'
-        )
+        db.execute_sql(DROP_ALL)
         db.create_tables(MODELS, safe=True)
 
 
-def test_migrations_017_and_018_match_init_db_on_sqlite(tmp_path, monkeypatch):
-    m017, m018 = _load_017(), _load_018()
-    migrated = _sqlite(monkeypatch, m017, m018, path=tmp_path / "migrated.db")
+def test_migrations_017_to_019_match_init_db_on_sqlite(tmp_path, monkeypatch):
+    m017, m018, m019 = _chain()
+    migrated = _sqlite(monkeypatch, m017, m018, m019, path=tmp_path / "migrated.db")
 
     assert m017.run() is True
-    migrated.execute_sql(
-        'INSERT INTO "background_task" (kind, queue, payload, status, priority, run_after,'
-        " attempts, max_attempts, created_at) VALUES ('old.kind', 'default', '{}',"
-        " 'failed', 0, '2026-01-01', 1, 5, '2026-01-01')"
-    )
-    assert m018.run() is True
-    assert m018.run() is True
+    migrated.execute_sql(OLD_ROW.format(now="'2026-01-01'"))
+    for migration in (m018, m019):
+        assert migration.run() is True
+        assert migration.run() is True
 
     assert _schema(migrated) == _sqlite_reference(tmp_path / "reference.db")
     assert migrated.execute_sql('SELECT cancel_requested FROM "background_task"').fetchall() == [
@@ -122,16 +135,17 @@ def test_migrations_017_and_018_match_init_db_on_sqlite(tmp_path, monkeypatch):
 
 
 def test_migration_018_resumes_a_partially_added_column_set(tmp_path, monkeypatch):
-    m017, m018 = _load_017(), _load_018()
-    migrated = _sqlite(monkeypatch, m017, m018, path=tmp_path / "partial.db")
+    m017, m018, m019 = _chain()
+    migrated = _sqlite(monkeypatch, m017, m018, m019, path=tmp_path / "partial.db")
     assert m017.run() is True
     migrated.execute_sql('ALTER TABLE "background_task" ADD COLUMN "stall_seconds" INTEGER')
 
     assert m018.run() is True
+    assert m019.run() is True
     assert _schema(migrated) == _sqlite_reference(tmp_path / "reference.db")
 
 
-@pytest.mark.parametrize("loader", [_load_017, _load_018])
+@pytest.mark.parametrize("loader", [_load_017, _load_018, _load_019])
 def test_background_task_migrations_report_failure(tmp_path, monkeypatch, loader):
     migration = loader()
     _sqlite(monkeypatch, migration, path=tmp_path / "broken.db")
@@ -144,8 +158,9 @@ def test_background_task_migrations_report_failure(tmp_path, monkeypatch, loader
     assert migration.run() is False
 
 
-def test_migration_018_skips_when_a_later_migration_is_applied(tmp_path, monkeypatch):
-    migration = _load_018()
+@pytest.mark.parametrize("loader", [_load_018, _load_019])
+def test_migrations_skip_when_a_later_migration_is_applied(tmp_path, monkeypatch, loader):
+    migration = loader()
     _sqlite(monkeypatch, migration, path=tmp_path / "later.db")
     monkeypatch.setattr(migration, "should_skip_due_to_future_migrations", lambda *a: True)
 

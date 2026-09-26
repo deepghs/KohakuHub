@@ -1668,6 +1668,21 @@ export async function downloadTaskLogs(token, taskId, attempt) {
 }
 
 /**
+ * The background worker roster: every worker process and whether it is alive
+ * @param {string} token - Admin token
+ * @param {Object} params - Query parameters
+ * @param {boolean} [params.includeInactive] - Also list workers silent for over a day
+ * @returns {Promise<Object>} { workers, counts, hidden, lost_after_seconds, inactive_after_seconds }
+ */
+export async function listWorkers(token, { includeInactive = false } = {}) {
+  const client = createAdminClient(token);
+  const response = await client.get("/tasks/workers", {
+    params: { include_inactive: includeInactive },
+  });
+  return response.data;
+}
+
+/**
  * Background task queue health for the dashboard
  * @param {string} token - Admin token
  * @param {string} window - One of 15m, 1h, 6h, 24h, 7d

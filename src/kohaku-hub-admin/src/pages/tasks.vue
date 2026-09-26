@@ -5,6 +5,7 @@ import AdminLayout from "@/components/AdminLayout.vue";
 import TaskDetail from "@/components/tasks/TaskDetail.vue";
 import TaskOverview from "@/components/tasks/TaskOverview.vue";
 import TaskProgress from "@/components/tasks/TaskProgress.vue";
+import TaskWorkers from "@/components/tasks/TaskWorkers.vue";
 import { useAdminStore } from "@/stores/admin";
 import {
   cancelTask,
@@ -12,6 +13,7 @@ import {
   getTask,
   getTaskStats,
   listTasks,
+  listWorkers,
   retryTask,
 } from "@/utils/api";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -57,7 +59,17 @@ const activeTab = ref("overview");
 const statsWindow = ref("1h");
 const stats = ref(null);
 const statsFailed = ref(false);
+const roster = ref(null);
+const includeInactiveWorkers = ref(false);
+const highlightedWorker = ref(null);
 let refreshTimer = null;
+
+// Online and draining workers are the ones alive right now.
+const activeWorkers = computed(() =>
+  roster.value
+    ? roster.value.counts.online + roster.value.counts.draining
+    : null,
+);
 
 const health = computed(() =>
   stats.value ? HEALTH_TAG[stats.value.health.status] : null,
@@ -121,9 +133,27 @@ async function loadStats() {
   }
 }
 
+async function loadWorkers() {
+  if (!adminStore.token) return; // loadTasks handles the redirect
+  try {
+    roster.value = await listWorkers(adminStore.token, {
+      includeInactive: includeInactiveWorkers.value,
+    });
+  } catch (error) {
+    handleError(error, "Failed to load workers");
+  }
+}
+
+function showWorker(workerId) {
+  highlightedWorker.value = workerId;
+  detailVisible.value = false;
+  activeTab.value = "workers";
+}
+
 function refreshAll() {
   loadTasks();
   loadStats();
+  loadWorkers();
   if (detailVisible.value && detail.value) reloadDetail(detail.value.id);
 }
 
@@ -298,6 +328,7 @@ watch(refreshIntervalSeconds, (seconds) => {
 });
 
 watch(statsWindow, loadStats);
+watch(includeInactiveWorkers, loadWorkers);
 
 onMounted(refreshAll);
 onBeforeUnmount(stopTimer);
@@ -320,6 +351,16 @@ onBeforeUnmount(stopTimer);
             >
               <span class="health-dot" />{{ health.label }}
             </span>
+            <button
+              v-if="activeWorkers !== null"
+              type="button"
+              class="health-chip workers-chip"
+              :class="activeWorkers ? 'success' : 'danger'"
+              data-testid="tasks-workers-chip"
+              @click="activeTab = 'workers'"
+            >
+              {{ activeWorkers }} worker(s) online
+            </button>
           </h1>
           <p class="text-gray-500 dark:text-gray-400 text-sm mt-1">
             Durable tasks executed by <code>khub-worker</code>. Tasks run at
@@ -559,6 +600,17 @@ onBeforeUnmount(stopTimer);
             </div>
           </el-card>
         </el-tab-pane>
+        <el-tab-pane label="Workers" name="workers">
+          <el-card shadow="never">
+            <TaskWorkers
+              v-if="roster"
+              v-model:include-inactive="includeInactiveWorkers"
+              :roster="roster"
+              :highlight="highlightedWorker"
+              @select-task="openDetail({ id: $event })"
+            />
+          </el-card>
+        </el-tab-pane>
       </el-tabs>
 
       <el-dialog
@@ -572,6 +624,7 @@ onBeforeUnmount(stopTimer);
           :task="detail"
           :token="adminStore.token"
           @error="handleError($event, 'Failed to load task logs')"
+          @show-worker="showWorker"
         />
         <template #footer>
           <el-button
@@ -709,6 +762,13 @@ onBeforeUnmount(stopTimer);
 
 .health-chip.danger {
   --chip-color: var(--el-color-danger);
+}
+
+.workers-chip {
+  border: none;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .health-dot {

@@ -133,6 +133,9 @@ Things to keep in mind:
 - **Container names.** Replicas are named `<project>-khub-worker-1`, `-2`, and
   so on, so the service sets no `container_name`. Read their logs together
   with `docker compose logs -f khub-worker`.
+- **Seeing them.** Every replica registers itself. **Background Tasks →
+  Workers** in the admin panel lists them by hostname (the container id) with
+  their status and load, and the page header shows how many are online.
 - **Total parallelism.** Tasks running at once add up to replicas ×
   `KOHAKU_HUB_WORKER_CONCURRENCY` (4 by default).
 - **Database connections.** Each replica holds its own PostgreSQL connection,

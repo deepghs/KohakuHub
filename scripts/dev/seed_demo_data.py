@@ -4752,6 +4752,19 @@ def seed_task_history(now, repo_ids: list[int]) -> list[dict]:
 
 SEED_TASK_WORKER = "seed-worker:4242:3f9a1c2e"
 
+# Worker roster examples; live workers register themselves when they start.
+# Offsets are minutes relative to seeding time. The lost one is the worker
+# that held the expired-lease demo.mirror_sync task.
+SEED_WORKERS: tuple[dict, ...] = (
+    {"id": "seed-worker:4111:0dd1ba5e", "name": "seed-worker", "state": "running",
+     "started": -180, "heartbeat": -10, "succeeded": 57, "failed": 4},
+    {"id": "old-box:2210:5c1e9a07", "name": "old-box", "state": "stopped",
+     "started": -600, "heartbeat": -190, "succeeded": 812, "failed": 3},
+    # Silent for days: kept, but hidden in the admin panel by default.
+    {"id": "old-box:1987:0b77d2c4", "name": "old-box", "state": "stopped",
+     "started": -5000, "heartbeat": -4300, "succeeded": 4409, "failed": 21},
+)
+
 
 def _seed_traceback(error: str) -> str:
     return (
@@ -4824,6 +4837,7 @@ def plant_seed_background_tasks() -> None:
         BackgroundTask,
         BackgroundTaskEvent,
         BackgroundTaskLog,
+        BackgroundWorker,
         Repository,
         utcnow,
     )
@@ -4892,6 +4906,16 @@ def plant_seed_background_tasks() -> None:
                 "task": row.id, "attempt": row.attempts, "level": level, "message": message,
                 "at": row.started_at + timedelta(seconds=offset),
             })
+
+    for spec in SEED_WORKERS:
+        heartbeat = at(spec["heartbeat"])
+        BackgroundWorker.create(
+            id=spec["id"], name=spec["name"], hostname=spec["name"],
+            pid=int(spec["id"].split(":")[1]), queues="[]", concurrency=4,
+            state=spec["state"], succeeded=spec["succeeded"],
+            failed=spec["failed"], started_at=at(spec["started"]), last_heartbeat_at=heartbeat,
+            stopped_at=heartbeat if spec["state"] == "stopped" else None,
+        )
 
     for batch in range(0, len(events), 500):
         BackgroundTaskEvent.insert_many(events[batch:batch + 500]).execute()

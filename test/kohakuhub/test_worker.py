@@ -1,6 +1,7 @@
 """Tests for the background task worker runtime."""
 
 import asyncio
+import json
 import os
 import signal
 from datetime import timedelta
@@ -8,15 +9,17 @@ from datetime import timedelta
 import pytest
 
 from kohakuhub import tasks, worker as worker_module
-from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog
+from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, BackgroundWorker
 from kohakuhub.worker import Worker
 
 
 @pytest.fixture(autouse=True)
 def clean_tasks(prepared_backend_test_state):
     BackgroundTask.delete().execute()
+    BackgroundWorker.delete().execute()
     yield
     BackgroundTask.delete().execute()
+    BackgroundWorker.delete().execute()
 
 
 @pytest.fixture(autouse=True)
@@ -280,13 +283,13 @@ async def test_wait_for_schema_retries_until_table_exists(monkeypatch):
             raise answer
         return answer
 
-    monkeypatch.setattr(BackgroundTaskLog, "table_exists", table_exists)
+    monkeypatch.setattr(BackgroundWorker, "table_exists", table_exists)
 
     assert await _worker(poll_interval=0.01).wait_for_schema(asyncio.Event()) is True
 
 
 async def test_wait_for_schema_returns_false_when_stopped(monkeypatch):
-    monkeypatch.setattr(BackgroundTaskLog, "table_exists", lambda: False)
+    monkeypatch.setattr(BackgroundWorker, "table_exists", lambda: False)
     stop = asyncio.Event()
     asyncio.get_running_loop().call_later(0.05, stop.set)
 
@@ -638,3 +641,127 @@ async def test_worker_keeps_logs_and_progress_when_a_flush_fails(monkeypatch):
     assert _logs(task_id) == [(1, "INFO", "first line")]
     row = BackgroundTask.get_by_id(task_id)
     assert (row.progress_done, row.progress_base_done) == (10, 5)
+
+
+def _roster(worker_id="w-test"):
+    return BackgroundWorker.get_or_none(BackgroundWorker.id == worker_id)
+
+
+def test_worker_name_is_the_hostname_with_an_optional_prefix(monkeypatch):
+    monkeypatch.setattr(worker_module.socket, "gethostname", lambda: "3f9a1c2e7b10")
+    monkeypatch.setattr(worker_module.cfg.worker, "name", "")
+    assert Worker().name == "3f9a1c2e7b10"
+    monkeypatch.setattr(worker_module.cfg.worker, "name", "gpu-box")
+    assert Worker().name == "gpu-box-3f9a1c2e7b10"
+    assert Worker(name="").name == "3f9a1c2e7b10"
+
+
+async def test_worker_registers_heartbeats_and_signs_off(monkeypatch):
+    monkeypatch.setattr(tasks, "WORKER_HEARTBEAT_SECONDS", 0.1)
+    release = asyncio.Event()
+    started = asyncio.Event()
+    seen = {}
+
+    @tasks.task("test.roster")
+    async def handler(payload):
+        started.set()
+        await release.wait()
+
+    @tasks.task("test.roster-fail", max_attempts=1)
+    async def broken(payload):
+        raise RuntimeError("boom")
+
+    tasks.enqueue("test.roster")
+    failing = tasks.enqueue("test.roster-fail")
+    worker = _worker(queues=["default"], name="demo")
+
+    def observe():
+        row = _roster()
+        if row is None or _status(failing) != tasks.FAILED:
+            return False
+        if "busy" not in seen and started.is_set():
+            seen["busy"] = row.last_heartbeat_at
+            return False
+        if "busy" in seen and row.last_heartbeat_at > seen["busy"] and not release.is_set():
+            seen["row"] = row
+            release.set()
+        return release.is_set() and row.succeeded == 1
+
+    await _run_until(worker, observe)
+
+    live = seen["row"]
+    assert (live.state, live.failed) == ("running", 1)
+    assert (live.name, live.pid, live.concurrency) == (worker.name, worker.pid, 2)
+    assert json.loads(live.queues) == ["default"]
+    assert tasks.worker_status(live, tasks.utcnow()) == "online"
+    final = _roster()
+    assert final.state == "stopped" and final.stopped_at is not None
+    assert (final.succeeded, final.failed) == (1, 1)
+    assert final.started_at == live.started_at  # heartbeats never reset it
+
+
+async def test_worker_reports_draining_while_it_drains(monkeypatch):
+    monkeypatch.setattr(tasks, "WORKER_HEARTBEAT_SECONDS", 0.05)
+    started = asyncio.Event()
+    states = []
+    real_record = tasks.record_worker
+
+    def record(worker_id, **fields):
+        states.append(fields["state"])
+        real_record(worker_id, **fields)
+
+    monkeypatch.setattr(tasks, "record_worker", record)
+
+    @tasks.task("test.slow-drain")
+    async def slow(payload):
+        started.set()
+        await asyncio.sleep(0.3)
+
+    tasks.enqueue("test.slow-drain")
+    stop = asyncio.Event()
+    runner = asyncio.create_task(_worker(shutdown_grace=2).run(stop))
+    await started.wait()
+    stop.set()
+    await runner
+
+    assert states[0] == "running" and states[-1] == "stopped"
+    # Heartbeats continued during the drain, so the worker never looked lost.
+    assert states.count("draining") >= 3
+
+
+async def test_worker_keeps_running_when_the_roster_write_fails(monkeypatch):
+    calls = {"n": 0}
+
+    def broken(worker_id, **fields):
+        calls["n"] += 1
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(tasks, "record_worker", broken)
+
+    @tasks.task("test.roster-down")
+    async def handler(payload):
+        return None
+
+    task_id = tasks.enqueue("test.roster-down")
+    await _run_until(_worker(), lambda: _status(task_id) == tasks.SUCCEEDED)
+
+    assert calls["n"] >= 2  # registered (failed), then signed off (failed)
+
+
+async def test_worker_counts_only_failures_it_managed_to_record(monkeypatch):
+    def unrecorded(row, error, **kwargs):
+        raise RuntimeError("db down while recording the failure")
+
+    monkeypatch.setattr(tasks, "fail_task", unrecorded)
+    attempted = asyncio.Event()
+
+    @tasks.task("test.unrecorded", max_attempts=1)
+    async def broken(payload):
+        attempted.set()
+        raise KeyError("x")
+
+    tasks.enqueue("test.unrecorded")
+    worker = _worker()
+    await _run_until(worker, attempted.is_set)
+
+    assert worker.failed == 0

@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from kohakuhub import tasks
-from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog
+from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, BackgroundWorker
 
 
 @pytest.fixture(autouse=True)
@@ -21,8 +21,10 @@ def task_rows(prepared_backend_test_state, monkeypatch):
         return None
 
     BackgroundTask.delete().execute()
+    BackgroundWorker.delete().execute()
     yield
     BackgroundTask.delete().execute()
+    BackgroundWorker.delete().execute()
 
 
 def _failed_task(kind="admin.demo"):
@@ -483,13 +485,17 @@ async def test_stats_reports_backlog_stuck_tasks_and_workers(admin_client):
     _row(status="running", created_ago=2, lease_in=60, worker="w-1")
     _row(status="running", created_ago=2, lease_in=60, worker="w-1")
     _row(status="running", created_ago=30, lease_in=-120, worker="w-dead")  # stuck
+    _worker_row("w-1")  # online
+    _worker_row("w-draining", state="draining")  # online, but draining
+    _worker_row("w-dead", heartbeat_ago=120)  # lost
+    _worker_row("w-gone", state="stopped")
 
     body = (await admin_client.get("/admin/api/tasks/stats", params={"window": "15m"})).json()
 
     backlog = body["backlog"]
     assert (backlog["due"], backlog["scheduled"], backlog["retrying"]) == (1, 2, 1)
     assert backlog["oldest_due_seconds"] == pytest.approx(480, abs=5)
-    assert (backlog["running"], backlog["stuck"], backlog["active_workers"]) == (3, 1, 1)
+    assert (backlog["running"], backlog["stuck"], backlog["active_workers"]) == (3, 1, 2)
     assert body["errors"][0] == {
         "error": "ConnectError",
         "failed": 0,
@@ -594,3 +600,127 @@ async def test_stats_counts_cancellations_and_stalls_without_calling_them_failur
     assert demo["cancelled"] == 1
     assert body["health"]["status"] == "degraded"
     assert "no progress" in body["health"]["reasons"][0]["message"]
+
+
+def _worker_row(worker_id, *, state="running", heartbeat_ago=2, started_ago=600, **fields):
+    now = tasks.utcnow()
+    heartbeat = now - timedelta(seconds=heartbeat_ago)
+    BackgroundWorker.insert(
+        id=worker_id,
+        name=fields.pop("name", f"{worker_id}-host"),
+        hostname="host",
+        pid=fields.pop("pid", 7),
+        queues=fields.pop("queues", "[]"),
+        concurrency=4,
+        state=state,
+        started_at=now - timedelta(seconds=started_ago),
+        last_heartbeat_at=heartbeat,
+        stopped_at=heartbeat if state == "stopped" else None,
+        **fields,
+    ).execute()
+
+
+async def test_workers_lists_the_roster_with_status_and_running_tasks(admin_client):
+    _worker_row("w-old-online", started_ago=900, succeeded=12, failed=2)
+    _worker_row("w-new-online", started_ago=60, queues='["bulk"]')
+    _worker_row("w-draining", state="draining")
+    _worker_row("w-lost", heartbeat_ago=300)
+    _worker_row("w-stopped", state="stopped", heartbeat_ago=3600)
+    # No heartbeat for more than a day: kept, but hidden by default.
+    _worker_row("w-ancient-stop", state="stopped", heartbeat_ago=3 * 86400, started_ago=4 * 86400)
+    _worker_row("w-ancient-lost", heartbeat_ago=2 * 86400, started_ago=3 * 86400)
+    task_id = tasks.enqueue("admin.demo")
+    tasks.claim_next("w-old-online", lease_seconds=60)
+    tasks.enqueue("admin.other")
+    tasks.claim_next("w-unregistered", lease_seconds=60)  # a worker without a roster row
+
+    body = (await admin_client.get("/admin/api/tasks/workers")).json()
+
+    assert [w["id"] for w in body["workers"]] == [
+        "w-new-online",
+        "w-old-online",
+        "w-draining",
+        "w-lost",
+        "w-stopped",
+    ]
+    assert body["counts"] == {"online": 2, "draining": 1, "lost": 1, "stopped": 1}
+    assert body["hidden"] == 2
+    assert (body["lost_after_seconds"], body["inactive_after_seconds"]) == (30, 86400)
+    busy = body["workers"][1]
+    assert (busy["status"], busy["running"], busy["succeeded"], busy["failed"]) == (
+        "online",
+        1,
+        12,
+        2,
+    )
+    assert busy["tasks"] == [{"id": task_id, "kind": "admin.demo", "progress": None}]
+    assert busy["started_at"].endswith("+00:00")
+    assert busy["heartbeat_age_seconds"] == pytest.approx(2, abs=2)
+    assert body["workers"][0]["queues"] == ["bulk"]
+    assert body["workers"][0]["tasks"] == []
+    assert body["workers"][4]["stopped_at"] is not None
+
+    everything = (
+        await admin_client.get("/admin/api/tasks/workers", params={"include_inactive": True})
+    ).json()
+    assert everything["hidden"] == 0
+    # Grouped by status, newest start first within each group.
+    assert [w["id"] for w in everything["workers"]] == [
+        "w-new-online",
+        "w-old-online",
+        "w-draining",
+        "w-lost",
+        "w-ancient-lost",
+        "w-stopped",
+        "w-ancient-stop",
+    ]
+    assert everything["counts"] == {"online": 2, "draining": 1, "lost": 2, "stopped": 2}
+
+
+async def test_workers_is_empty_without_a_roster(admin_client):
+    body = (await admin_client.get("/admin/api/tasks/workers")).json()
+    assert body["workers"] == [] and body["hidden"] == 0
+    assert (
+        await admin_client.get("/admin/api/tasks/workers?include_inactive=x")
+    ).status_code == 422
+
+
+async def test_stats_is_unhealthy_when_due_work_has_no_worker(admin_client):
+    _row(status="queued", created_ago=1, run_after_ago=0.5)  # due, not yet old
+    _worker_row("w-lost", heartbeat_ago=300)
+    _worker_row("w-stopped", state="stopped")
+
+    body = (await admin_client.get("/admin/api/tasks/stats", params={"window": "15m"})).json()
+
+    assert body["backlog"]["active_workers"] == 0
+    assert body["health"]["status"] == "unhealthy"
+    assert body["health"]["reasons"][0] == {
+        "level": "unhealthy",
+        "message": "No worker is online; 1 due task(s) are waiting",
+    }
+
+
+def test_health_needs_both_due_work_and_no_worker_to_flag_it():
+    health = tasks_router._health
+    base = dict(finished=0, failed=0, stuck=0, oldest_due=None, retrying=0, busy=True)
+
+    assert health(**base, due=0, workers_online=0)[0] == "healthy"
+    assert health(**base, due=2, workers_online=1)[0] == "healthy"
+    assert health(**base, due=2)[0] == "healthy"  # roster unknown
+    assert health(**base, due=2, workers_online=0)[0] == "unhealthy"
+
+
+async def test_worker_load_comes_from_the_tasks_it_holds_now(admin_client):
+    _worker_row("w-lost", heartbeat_ago=300)
+    _worker_row("w-new")
+    task_id = tasks.enqueue("admin.demo")
+    tasks.claim_next("w-lost", lease_seconds=60)
+    BackgroundTask.update(locked_until=tasks.utcnow() - timedelta(seconds=1)).where(
+        BackgroundTask.id == task_id
+    ).execute()
+    tasks.claim_next("w-new", lease_seconds=60)  # reclaimed from the lost worker
+
+    body = (await admin_client.get("/admin/api/tasks/workers")).json()
+
+    load = {w["id"]: (w["running"], [t["id"] for t in w["tasks"]]) for w in body["workers"]}
+    assert load == {"w-new": (1, [task_id]), "w-lost": (0, [])}

@@ -260,6 +260,7 @@ def test_load_config_worker_env_vars(monkeypatch):
     monkeypatch.setenv("KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS", "10")
     monkeypatch.setenv("KOHAKU_HUB_WORKER_FLUSH_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("KOHAKU_HUB_WORKER_LOG_MAX_BYTES_PER_ATTEMPT", "4096")
+    monkeypatch.setenv("KOHAKU_HUB_WORKER_NAME", " gpu-box ")
     monkeypatch.setenv("KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS", "3")
     monkeypatch.setenv("KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS", "90")
     monkeypatch.setenv("KOHAKU_HUB_WORKER_QUEUES", " default, bulk ,,")
@@ -271,6 +272,7 @@ def test_load_config_worker_env_vars(monkeypatch):
     assert cfg.worker.shutdown_grace_seconds == pytest.approx(10)
     assert cfg.worker.flush_interval_seconds == pytest.approx(2.5)
     assert cfg.worker.log_max_bytes_per_attempt == 4096
+    assert cfg.worker.name == "gpu-box"
     assert cfg.worker.succeeded_retention_days == 3
     assert cfg.worker.failed_retention_days == 90
     assert cfg.worker.queues == ["default", "bulk"]

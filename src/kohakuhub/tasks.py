@@ -33,7 +33,13 @@ from loguru import logger as loguru_logger
 from peewee import PostgresqlDatabase
 
 from kohakuhub.config import cfg
-from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, utcnow
+from kohakuhub.db import (
+    BackgroundTask,
+    BackgroundTaskEvent,
+    BackgroundTaskLog,
+    BackgroundWorker,
+    utcnow,
+)
 from kohakuhub.logger import get_logger
 
 logger = get_logger("TASKS")
@@ -59,6 +65,12 @@ DEFAULT_STALL_AFTER = timedelta(minutes=10)
 CLEANUP_KIND = "tasks.cleanup"
 CLEANUP_BATCH = 1000
 ON_FAILURE_SUFFIX = ".on_failure"
+# Worker roster: a live worker refreshes its row this often; one silent for
+# LOST_AFTER is reported lost. Rows are kept; the admin panel hides workers
+# with no heartbeat for INACTIVE_AFTER unless asked.
+WORKER_HEARTBEAT_SECONDS = 10.0
+WORKER_LOST_AFTER = timedelta(seconds=30)
+WORKER_INACTIVE_AFTER = timedelta(hours=24)
 SCRATCH_PREFIX = "tmp/tasks/{task_id}/"
 
 TaskHandler = Callable[..., Awaitable[None]]
@@ -596,6 +608,53 @@ def is_stalled(task_row: BackgroundTask, now: datetime) -> bool:
         return False  # not live: the lease-expired signal covers it
     moved = max(task_row.started_at, task_row.progress_at or task_row.started_at)
     return (now - moved).total_seconds() >= task_row.stall_seconds
+
+
+def record_worker(
+    worker_id: str,
+    *,
+    name: str,
+    hostname: str,
+    pid: int,
+    queues: list[str],
+    concurrency: int,
+    state: str,
+    succeeded: int,
+    failed: int,
+) -> None:
+    """Register a worker or refresh its roster row (one upsert per heartbeat).
+
+    Upserting rather than updating means a worker whose row went missing
+    simply registers again.
+    """
+    now = utcnow()
+    W = BackgroundWorker
+    live = {
+        "state": state,
+        "succeeded": succeeded,
+        "failed": failed,
+        "last_heartbeat_at": now,
+        "stopped_at": now if state == "stopped" else None,
+    }
+    W.insert(
+        id=worker_id,
+        name=name,
+        hostname=hostname,
+        pid=pid,
+        queues=json.dumps(queues),
+        concurrency=concurrency,
+        started_at=now,
+        **live,
+    ).on_conflict(conflict_target=[W.id], update=live).execute()
+
+
+def worker_status(worker: BackgroundWorker, now: datetime) -> str:
+    """``online``, ``draining``, ``lost`` (no heartbeat for LOST_AFTER) or ``stopped``."""
+    if worker.state == "stopped":
+        return "stopped"
+    if now - worker.last_heartbeat_at > WORKER_LOST_AFTER:
+        return "lost"
+    return "draining" if worker.state == "draining" else "online"
 
 
 class TaskContext:

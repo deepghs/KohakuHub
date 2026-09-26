@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from kohakuhub import tasks
-from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog
+from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, BackgroundWorker
 from kohakuhub.logger import get_logger
+from kohakuhub.task_testing import RecordingContext
 
 WORKER = "worker-a"
 LEASE = 60
@@ -596,3 +597,62 @@ def test_on_failure_passes_a_corrupt_payload_through_as_text():
 
     follow_up = BackgroundTask.get(BackgroundTask.kind == "test.hooked.on_failure")
     assert json.loads(follow_up.payload)["payload"] == "{not json"
+
+
+# ----- worker roster -----
+
+
+def _record(worker_id="w-1", **fields):
+    defaults = dict(
+        name="w-1-host",
+        hostname="host",
+        pid=7,
+        queues=[],
+        concurrency=4,
+        state="running",
+        succeeded=0,
+        failed=0,
+    )
+    tasks.record_worker(worker_id, **(defaults | fields))
+    return BackgroundWorker.get_by_id(worker_id)
+
+
+def test_record_worker_registers_then_refreshes_without_resetting_the_start():
+    BackgroundWorker.delete().execute()
+    first = _record(queues=["bulk"])
+    assert (first.state, first.stopped_at, json.loads(first.queues)) == ("running", None, ["bulk"])
+
+    later = _record(state="draining", succeeded=5, failed=1)
+    assert later.started_at == first.started_at
+    assert later.last_heartbeat_at >= first.last_heartbeat_at
+    assert (later.state, later.succeeded, later.failed) == ("draining", 5, 1)
+
+    stopped = _record(state="stopped")
+    assert stopped.stopped_at is not None
+    assert BackgroundWorker.select().count() == 1
+    BackgroundWorker.delete().execute()
+
+
+def test_worker_status_derives_liveness_from_the_last_heartbeat():
+    now = tasks.utcnow()
+
+    def status(state, seconds_ago):
+        row = SimpleNamespace(state=state, last_heartbeat_at=now - timedelta(seconds=seconds_ago))
+        return tasks.worker_status(row, now)
+
+    assert status("running", 5) == "online"
+    assert status("draining", 5) == "draining"
+    assert status("running", 31) == "lost"
+    assert status("draining", 31) == "lost"
+    assert status("stopped", 5) == "stopped"
+    assert status("stopped", 3600) == "stopped"
+
+
+async def test_cleanup_keeps_worker_history():
+    BackgroundWorker.delete().execute()
+    old = _record(state="stopped")
+    BackgroundWorker.update(last_heartbeat_at=tasks.utcnow() - timedelta(days=90)).execute()
+
+    await tasks.cleanup_finished_tasks({}, RecordingContext())
+    assert BackgroundWorker.get_or_none(BackgroundWorker.id == old.id) is not None
+    BackgroundWorker.delete().execute()

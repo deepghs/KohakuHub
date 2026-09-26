@@ -124,6 +124,9 @@ class WorkerConfig(BaseModel):
     succeeded_retention_days: int = 7
     failed_retention_days: int = 30
     queues: list[str] = []  # Empty = consume every queue
+    # Optional prefix for the name shown in the admin panel ("<name>-<hostname>");
+    # the hostname alone tells replicas apart, so leaving it empty is fine.
+    name: str = ""
 
 
 class AppConfig(BaseModel):
@@ -159,7 +162,9 @@ class AppConfig(BaseModel):
     lfs_auto_gc: bool = False  # Auto-delete old LFS objects on commit
     # Download tracking settings
     download_time_bucket_seconds: int = 900  # 15 minutes - session deduplication window
-    download_session_cleanup_threshold: int = 100  # Trigger cleanup when sessions > this
+    download_session_cleanup_threshold: int = (
+        100  # Trigger cleanup when sessions > this
+    )
     download_keep_sessions_days: int = 30  # Keep sessions from last N days
     # LFS Suffix Rules - File extensions that should ALWAYS use LFS
     # These are server-wide defaults that apply to ALL repositories
@@ -207,7 +212,9 @@ class AppConfig(BaseModel):
     site_name: str = "KohakuHub"  # Configurable site name (e.g., "MyCompany Hub")
     # Log settings
     log_level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-    log_format: str = "file"  # Output logs to "file" or "terminal" (maybe sql in future)
+    log_format: str = (
+        "file"  # Output logs to "file" or "terminal" (maybe sql in future)
+    )
     log_dir: str = "logs/"  # Path to log file (if log_format is "file")
 
 
@@ -249,7 +256,9 @@ class Config(BaseModel):
         if self.auth.session_secret == "change-me-in-production":
             warnings.append("Session secret is using default value - SECURITY RISK!")
         if self.admin.secret_token == "change-me-in-production":
-            warnings.append("Admin secret token is using default value - SECURITY RISK!")
+            warnings.append(
+                "Admin secret token is using default value - SECURITY RISK!"
+            )
 
         # LFS GC settings validation
         if self.app.lfs_keep_versions < 2:
@@ -374,11 +383,15 @@ def load_config(path: str = None) -> Config:
             os.environ["KOHAKU_HUB_REQUIRE_EMAIL_VERIFICATION"].lower() == "true"
         )
     if "KOHAKU_HUB_INVITATION_ONLY" in os.environ:
-        auth_env["invitation_only"] = os.environ["KOHAKU_HUB_INVITATION_ONLY"].lower() == "true"
+        auth_env["invitation_only"] = (
+            os.environ["KOHAKU_HUB_INVITATION_ONLY"].lower() == "true"
+        )
     if "KOHAKU_HUB_SESSION_SECRET" in os.environ:
         auth_env["session_secret"] = os.environ["KOHAKU_HUB_SESSION_SECRET"]
     if "KOHAKU_HUB_SESSION_EXPIRE_HOURS" in os.environ:
-        auth_env["session_expire_hours"] = int(os.environ["KOHAKU_HUB_SESSION_EXPIRE_HOURS"])
+        auth_env["session_expire_hours"] = int(
+            os.environ["KOHAKU_HUB_SESSION_EXPIRE_HOURS"]
+        )
     if "KOHAKU_HUB_TOKEN_EXPIRE_DAYS" in os.environ:
         auth_env["token_expire_days"] = int(os.environ["KOHAKU_HUB_TOKEN_EXPIRE_DAYS"])
     if auth_env:
@@ -417,7 +430,9 @@ def load_config(path: str = None) -> Config:
     # Cache (L2 / Valkey)
     cache_env = {}
     if "KOHAKU_HUB_CACHE_ENABLED" in os.environ:
-        cache_env["enabled"] = os.environ["KOHAKU_HUB_CACHE_ENABLED"].lower() == "true"
+        cache_env["enabled"] = (
+            os.environ["KOHAKU_HUB_CACHE_ENABLED"].lower() == "true"
+        )
     if "KOHAKU_HUB_CACHE_URL" in os.environ:
         cache_env["url"] = os.environ["KOHAKU_HUB_CACHE_URL"]
         # Implicit-enable: if the operator set a CACHE_URL but did not
@@ -432,13 +447,21 @@ def load_config(path: str = None) -> Config:
     if "KOHAKU_HUB_CACHE_NAMESPACE" in os.environ:
         cache_env["namespace"] = os.environ["KOHAKU_HUB_CACHE_NAMESPACE"]
     if "KOHAKU_HUB_CACHE_DEFAULT_TTL" in os.environ:
-        cache_env["default_ttl_seconds"] = int(os.environ["KOHAKU_HUB_CACHE_DEFAULT_TTL"])
+        cache_env["default_ttl_seconds"] = int(
+            os.environ["KOHAKU_HUB_CACHE_DEFAULT_TTL"]
+        )
     if "KOHAKU_HUB_CACHE_JITTER_FRACTION" in os.environ:
-        cache_env["jitter_fraction"] = float(os.environ["KOHAKU_HUB_CACHE_JITTER_FRACTION"])
+        cache_env["jitter_fraction"] = float(
+            os.environ["KOHAKU_HUB_CACHE_JITTER_FRACTION"]
+        )
     if "KOHAKU_HUB_CACHE_MAX_CONNECTIONS" in os.environ:
-        cache_env["max_connections"] = int(os.environ["KOHAKU_HUB_CACHE_MAX_CONNECTIONS"])
+        cache_env["max_connections"] = int(
+            os.environ["KOHAKU_HUB_CACHE_MAX_CONNECTIONS"]
+        )
     if "KOHAKU_HUB_CACHE_SOCKET_TIMEOUT" in os.environ:
-        cache_env["socket_timeout_seconds"] = float(os.environ["KOHAKU_HUB_CACHE_SOCKET_TIMEOUT"])
+        cache_env["socket_timeout_seconds"] = float(
+            os.environ["KOHAKU_HUB_CACHE_SOCKET_TIMEOUT"]
+        )
     if "KOHAKU_HUB_CACHE_SOCKET_CONNECT_TIMEOUT" in os.environ:
         cache_env["socket_connect_timeout_seconds"] = float(
             os.environ["KOHAKU_HUB_CACHE_SOCKET_CONNECT_TIMEOUT"]
@@ -460,6 +483,8 @@ def load_config(path: str = None) -> Config:
     ):
         if env_name in os.environ:
             worker_env[key] = parse(os.environ[env_name])
+    if "KOHAKU_HUB_WORKER_NAME" in os.environ:
+        worker_env["name"] = os.environ["KOHAKU_HUB_WORKER_NAME"].strip()
     if "KOHAKU_HUB_WORKER_QUEUES" in os.environ:
         worker_env["queues"] = [
             queue.strip()
@@ -472,9 +497,13 @@ def load_config(path: str = None) -> Config:
     # Fallback
     fallback_env = {}
     if "KOHAKU_HUB_FALLBACK_ENABLED" in os.environ:
-        fallback_env["enabled"] = os.environ["KOHAKU_HUB_FALLBACK_ENABLED"].lower() == "true"
+        fallback_env["enabled"] = (
+            os.environ["KOHAKU_HUB_FALLBACK_ENABLED"].lower() == "true"
+        )
     if "KOHAKU_HUB_FALLBACK_CACHE_TTL" in os.environ:
-        fallback_env["cache_ttl_seconds"] = int(os.environ["KOHAKU_HUB_FALLBACK_CACHE_TTL"])
+        fallback_env["cache_ttl_seconds"] = int(
+            os.environ["KOHAKU_HUB_FALLBACK_CACHE_TTL"]
+        )
     if "KOHAKU_HUB_FALLBACK_TIMEOUT" in os.environ:
         fallback_env["timeout_seconds"] = int(os.environ["KOHAKU_HUB_FALLBACK_TIMEOUT"])
     if "KOHAKU_HUB_FALLBACK_MAX_CONCURRENT" in os.environ:
@@ -523,7 +552,9 @@ def load_config(path: str = None) -> Config:
     if "KOHAKU_HUB_DATABASE_KEY" in os.environ:
         app_env["database_key"] = os.environ["KOHAKU_HUB_DATABASE_KEY"]
     if "KOHAKU_HUB_LFS_THRESHOLD_BYTES" in os.environ:
-        app_env["lfs_threshold_bytes"] = int(os.environ["KOHAKU_HUB_LFS_THRESHOLD_BYTES"])
+        app_env["lfs_threshold_bytes"] = int(
+            os.environ["KOHAKU_HUB_LFS_THRESHOLD_BYTES"]
+        )
     if "KOHAKU_HUB_LFS_MULTIPART_THRESHOLD_BYTES" in os.environ:
         app_env["lfs_multipart_threshold_bytes"] = int(
             os.environ["KOHAKU_HUB_LFS_MULTIPART_THRESHOLD_BYTES"]

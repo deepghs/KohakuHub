@@ -10,7 +10,7 @@ const props = defineProps({
   task: { type: Object, required: true },
   token: { type: String, required: true },
 });
-const emit = defineEmits(["error"]);
+const emit = defineEmits(["error", "show-worker"]);
 
 const tab = ref("overview");
 
@@ -142,7 +142,18 @@ const OUTCOME_TAG = {
           <dt>Dedupe key</dt>
           <dd>{{ task.dedupe_key || "—" }}</dd>
           <dt>Worker</dt>
-          <dd>{{ task.locked_by || "—" }}</dd>
+          <dd>
+            <el-button
+              v-if="task.locked_by"
+              link
+              type="primary"
+              data-testid="tasks-detail-worker"
+              @click="emit('show-worker', task.locked_by)"
+            >
+              {{ task.locked_by }}
+            </el-button>
+            <span v-else>—</span>
+          </dd>
           <dt>Lease until</dt>
           <dd>{{ formatDate(task.locked_until) }}</dd>
           <dt>Stall after</dt>

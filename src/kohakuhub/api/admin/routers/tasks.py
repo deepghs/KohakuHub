@@ -10,7 +10,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from peewee import fn
 
-from kohakuhub.db import BackgroundTask, BackgroundTaskEvent, BackgroundTaskLog, utcnow
+from kohakuhub.db import (
+    BackgroundTask,
+    BackgroundTaskEvent,
+    BackgroundTaskLog,
+    BackgroundWorker,
+    utcnow,
+)
 from kohakuhub.logger import get_logger
 from kohakuhub.tasks import (
     CANCELLED,
@@ -19,11 +25,14 @@ from kohakuhub.tasks import (
     RUNNING,
     STATUSES,
     SUCCEEDED,
+    WORKER_INACTIVE_AFTER,
+    WORKER_LOST_AFTER,
     discard_task,
     estimate_eta_seconds,
     is_stalled,
     request_cancel,
     retry_failed_task,
+    worker_status,
 )
 from kohakuhub.api.admin.utils import verify_admin_token
 
@@ -208,6 +217,8 @@ def _health(
     retrying: int,
     busy: bool,
     stalled: int = 0,
+    due: int = 0,
+    workers_online: int | None = None,
 ) -> tuple[str, list[dict]]:
     """Classify queue health and explain why, most severe signals first."""
     reasons: list[dict] = []
@@ -215,6 +226,8 @@ def _health(
     def add(level: str, message: str) -> None:
         reasons.append({"level": level, "message": message})
 
+    if due and workers_online == 0:
+        add("unhealthy", f"No worker is online; {due} due task(s) are waiting")
     if stuck:
         add(
             "unhealthy",
@@ -291,7 +304,6 @@ def build_task_stats(window: str, now: datetime) -> dict:
     succeeded = failed = cancelled = after_retry = enqueued = 0
     due = scheduled = retrying = running = stuck = stalled = cancelling = 0
     oldest_due: datetime | None = None
-    workers: set[str] = set()
 
     def kind_stats(kind: str) -> dict:
         return kinds.setdefault(
@@ -368,11 +380,17 @@ def build_task_stats(window: str, now: datetime) -> dict:
                     stuck += 1
                     stats["stuck"] += 1
                 else:
-                    workers.add(row["locked_by"])
                     stalled += is_stalled(SimpleNamespace(**row), now)
                 cancelling += row["cancel_requested"]
 
     finished = succeeded + failed
+    W = BackgroundWorker
+    # Online or draining: not signed off and heard from recently.
+    active_workers = (
+        W.select()
+        .where((W.state != "stopped") & (W.last_heartbeat_at >= now - WORKER_LOST_AFTER))
+        .count()
+    )
     oldest_due_seconds = (now - oldest_due).total_seconds() if oldest_due else None
     for kind in kinds.values():
         kind["last_failed_at"], kind["last_error"] = max(
@@ -389,6 +407,8 @@ def build_task_stats(window: str, now: datetime) -> dict:
         retrying=retrying,
         busy=bool(due or scheduled or running),
         stalled=stalled,
+        due=due,
+        workers_online=active_workers,
     )
 
     return {
@@ -424,7 +444,7 @@ def build_task_stats(window: str, now: datetime) -> dict:
             "stuck": stuck,
             "stalled": stalled,
             "cancel_requested": cancelling,
-            "active_workers": len(workers),
+            "active_workers": active_workers,
         },
         "series": [
             {"start": _iso(since + timedelta(seconds=i * bucket_seconds)), **bucket}
@@ -523,6 +543,75 @@ def build_runs(events: list[dict]) -> list[dict]:
             run["outcome"] = ATTEMPT_OUTCOMES[event["type"]]
             run["error"] = event["detail"].get("error")
     return runs
+
+
+WORKER_STATUS_ORDER = {"online": 0, "draining": 1, "lost": 2, "stopped": 3}
+
+
+@router.get("/tasks/workers")
+def list_workers(include_inactive: bool = False, _admin: bool = Depends(verify_admin_token)):
+    """The worker roster: every worker process and whether it is alive.
+
+    Workers are never deleted. Lost or stopped workers with no heartbeat for
+    ``inactive_after_seconds`` are left out unless ``include_inactive``.
+
+    Args:
+        include_inactive: Also list long-inactive lost and stopped workers
+    """
+    now = utcnow()
+    inactive_before = now - WORKER_INACTIVE_AFTER
+    shown: list[tuple[BackgroundWorker, str]] = []
+    hidden = 0
+    for worker in BackgroundWorker.select().order_by(BackgroundWorker.started_at.desc()):
+        status = worker_status(worker, now)
+        inactive = status in ("lost", "stopped") and worker.last_heartbeat_at < inactive_before
+        if inactive and not include_inactive:
+            hidden += 1
+            continue
+        shown.append((worker, status))
+    shown.sort(key=lambda item: WORKER_STATUS_ORDER[item[1]])  # stable: newest first within
+
+    T = BackgroundTask
+    running: dict[str, list[dict]] = {}
+    ids = [worker.id for worker, _ in shown]
+    for task in (
+        T.select().where((T.status == RUNNING) & T.locked_by.in_(ids)).order_by(T.id) if ids else []
+    ):
+        running.setdefault(task.locked_by, []).append(
+            {"id": task.id, "kind": task.kind, "progress": _progress(task, now)}
+        )
+
+    counts = dict.fromkeys(WORKER_STATUS_ORDER, 0)
+    for _, status in shown:
+        counts[status] += 1
+    return {
+        "workers": [
+            {
+                "id": worker.id,
+                "name": worker.name,
+                "hostname": worker.hostname,
+                "pid": worker.pid,
+                "queues": json.loads(worker.queues),
+                "concurrency": worker.concurrency,
+                "status": status,
+                # Live from the task table, not the worker's last report, so a
+                # lost worker whose tasks were reclaimed shows none.
+                "running": len(running.get(worker.id, [])),
+                "succeeded": worker.succeeded,
+                "failed": worker.failed,
+                "started_at": _iso(worker.started_at),
+                "last_heartbeat_at": _iso(worker.last_heartbeat_at),
+                "heartbeat_age_seconds": (now - worker.last_heartbeat_at).total_seconds(),
+                "stopped_at": _iso(worker.stopped_at),
+                "tasks": running.get(worker.id, []),
+            }
+            for worker, status in shown
+        ],
+        "counts": counts,
+        "hidden": hidden,
+        "lost_after_seconds": int(WORKER_LOST_AFTER.total_seconds()),
+        "inactive_after_seconds": int(WORKER_INACTIVE_AFTER.total_seconds()),
+    }
 
 
 @router.get("/tasks/{task_id}")
