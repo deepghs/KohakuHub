@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+import secrets
 
 import numpy as np
 
@@ -136,7 +137,7 @@ def _sanitize_repo_id(repo_id: str) -> str:
     return safe
 
 
-def lakefs_repo_name(repo_type: str, repo_id: str, generation: int = 0) -> str:
+def lakefs_repo_name(repo_type: str, repo_id: str, generation: int | str = 0) -> str:
     """Generate LakeFS repository name from HuggingFace repo ID.
 
     LakeFS naming requirements: ^[a-z0-9][a-z0-9-]{2,62}$
@@ -217,10 +218,14 @@ def lakefs_repo_name(repo_type: str, repo_id: str, generation: int = 0) -> str:
     return basename
 
 
-# How many generations to probe before giving up. Each generation costs one
-# LakeFS HEAD-style lookup, and reaching even generation 2 requires a repo id to
-# have been recycled twice while a deletion was still pending.
+# How many sequential generations to probe. Each costs one LakeFS lookup. A
+# rename keeps the repository's LakeFS id (#107), so each time an id is renamed
+# away and created again, one more of its generations stays taken for good.
 MAX_LAKEFS_REPO_GENERATIONS = 16
+# Past the sequential generations, allocation draws random generation tokens.
+# The name carries a 112-bit hash of the token, so a draw colliding is not a
+# realistic event; the bound only keeps a misbehaving LakeFS from looping us.
+MAX_LAKEFS_REPO_RANDOM_DRAWS = 8
 
 
 def resolve_lakefs_repo(repo) -> str:
@@ -256,14 +261,17 @@ async def allocate_lakefs_repo_name(
     repo_type: str,
     repo_id: str,
     max_generations: int = MAX_LAKEFS_REPO_GENERATIONS,
+    exclude: set[str] | frozenset[str] = frozenset(),
 ) -> str:
     """Pick a LakeFS repository id for `repo_id` that LakeFS does not already hold.
 
     Generation 0 is the legacy derived name and is used whenever it is free, so
     the common case is unchanged. It is *not* free while a previous incarnation
     of the same repo id is still being deleted (LakeFS deletes asynchronously,
-    see issue #93); allocation then steps to the next generation instead of
-    colliding with `409 not unique`.
+    see issue #93), or after the repository that held it was renamed away (a
+    rename keeps its LakeFS id, #107); allocation then steps to the next
+    generation. Once the sequential generations are exhausted it draws random
+    generation tokens, so a much-recycled id still gets a fresh repository.
 
     The caller must persist the result on `Repository.lakefs_repo`, otherwise a
     generation > 0 repository becomes unreachable.
@@ -272,22 +280,33 @@ async def allocate_lakefs_repo_name(
         client: LakeFS client exposing `repository_exists`.
         repo_type: Repository type (model/dataset/space).
         repo_id: Full repository ID (e.g., "org/repo-name").
-        max_generations: How many generations to probe before giving up.
+        max_generations: How many sequential generations to probe.
+        exclude: Ids to skip even if LakeFS reports them free - e.g. an id whose
+            create just failed because LakeFS is still deleting it.
 
     Returns:
         A LakeFS repository id that was free at probe time.
 
     Raises:
-        RuntimeError: If every probed generation is taken.
+        RuntimeError: If every probed id is taken.
     """
-    for generation in range(max_generations):
-        candidate = lakefs_repo_name(repo_type, repo_id, generation=generation)
+    candidates = [
+        lakefs_repo_name(repo_type, repo_id, generation=generation)
+        for generation in range(max_generations)
+    ]
+    candidates += [
+        # The "r" prefix keeps random tokens apart from sequential generations.
+        lakefs_repo_name(repo_type, repo_id, generation=f"r{secrets.token_hex(8)}")
+        for _ in range(MAX_LAKEFS_REPO_RANDOM_DRAWS)
+    ]
+    for candidate in candidates:
+        if candidate in exclude:
+            continue
         if not await client.repository_exists(candidate):
             return candidate
-
     raise RuntimeError(
-        f"No free LakeFS repository id for {repo_type}:{repo_id} "
-        f"after {max_generations} generations"
+        f"No free LakeFS repository id for {repo_type}:{repo_id} after "
+        f"{max_generations} generations and {MAX_LAKEFS_REPO_RANDOM_DRAWS} random draws"
     )
 
 

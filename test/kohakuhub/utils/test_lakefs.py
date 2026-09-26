@@ -1,11 +1,13 @@
 """Tests for LakeFS utility helpers."""
 
+import re
 from types import SimpleNamespace
 
 import pytest
 
 from kohakuhub.utils.lakefs import (
     _sanitize_repo_id,
+    MAX_LAKEFS_REPO_GENERATIONS,
     allocate_lakefs_repo_name,
     lakefs_repo_name,
     resolve_lakefs_repo,
@@ -126,6 +128,51 @@ async def test_allocate_lakefs_repo_name_raises_when_every_generation_is_taken()
 
     with pytest.raises(RuntimeError):
         await allocate_lakefs_repo_name(_AllTaken(), "model", "owner/demo")
+
+
+@pytest.mark.asyncio
+async def test_allocate_lakefs_repo_name_skips_excluded_ids_even_when_lakefs_reports_them_free():
+    """LakeFS reports an id that is still being deleted as absent, yet creating
+    it fails. The caller excludes such an id so allocation cannot hand it back."""
+
+    class _NothingExists:
+        async def repository_exists(self, repo_name):
+            return False
+
+    gen0 = lakefs_repo_name("dataset", "owner/demo")
+
+    allocated = await allocate_lakefs_repo_name(
+        _NothingExists(), "dataset", "owner/demo", exclude={gen0}
+    )
+
+    assert allocated == lakefs_repo_name("dataset", "owner/demo", generation=1)
+
+
+@pytest.mark.asyncio
+async def test_allocate_lakefs_repo_name_falls_back_to_random_ids_after_sequential_generations():
+    """A rename keeps the repository's LakeFS id (#107), so every time an id is
+    renamed away and created again, one more of its generations stays taken for
+    good. A much-recycled id must still get a fresh LakeFS repository instead of
+    failing the create with an opaque allocation error."""
+    sequential = {
+        lakefs_repo_name("model", "owner/demo", generation=generation)
+        for generation in range(MAX_LAKEFS_REPO_GENERATIONS)
+    }
+    probed = []
+
+    class _SequentialTaken:
+        async def repository_exists(self, repo_name):
+            probed.append(repo_name)
+            return repo_name in sequential
+
+    allocated = await allocate_lakefs_repo_name(_SequentialTaken(), "model", "owner/demo")
+
+    assert allocated not in sequential
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{2,62}", allocated)
+    assert allocated.startswith("m-owner-demo-")
+    assert len(probed) == MAX_LAKEFS_REPO_GENERATIONS + 1
+    # Two fallbacks for the same id are independent draws.
+    assert allocated != await allocate_lakefs_repo_name(_SequentialTaken(), "model", "owner/demo")
 
 
 @pytest.mark.asyncio

@@ -543,3 +543,123 @@ async def test_hf_move_repo_frees_the_old_name_for_immediate_reuse(
         lambda: api.repo_info(repo_id=renamed_id, repo_type="dataset")
     )
     assert "NEW.md" not in {s.rfilename for s in (renamed_after.siblings or [])}
+
+
+async def test_hf_move_repo_keeps_history_branches_and_tags(
+    live_server_url,
+    hf_api_token,
+):
+    """End-to-end reproduction of issue #107.
+
+    A move used to recreate the LakeFS repository from the main head only, so a
+    rename silently dropped the commit history, every other branch, and every
+    tag. A move is now a rename of the KHub row: everything must survive, and
+    the old name must still be free to reuse - repeatedly, since each rename
+    keeps one more LakeFS id of that name taken for good.
+    """
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+    source_id = "owner/issue107-history"
+
+    await asyncio.to_thread(
+        lambda: api.create_repo(repo_id=source_id, repo_type="dataset", private=True)
+    )
+    # File-like payloads keep huggingface_hub >= 1.0 off the Xet upload path;
+    # see test_hf_move_repo_frees_the_old_name_for_immediate_reuse.
+    for path, payload, message in (
+        ("README.md", b"# issue 107\n", "Add README"),
+        ("data.bin", b"y" * 4096, "Add data"),
+    ):
+        await asyncio.to_thread(
+            lambda: api.upload_file(
+                path_or_fileobj=io.BytesIO(payload),
+                path_in_repo=path,
+                repo_id=source_id,
+                repo_type="dataset",
+                commit_message=message,
+            )
+        )
+    await asyncio.to_thread(
+        lambda: api.create_branch(repo_id=source_id, branch="qa-pass", repo_type="dataset")
+    )
+    await asyncio.to_thread(
+        lambda: api.create_tag(repo_id=source_id, tag="v1", repo_type="dataset")
+    )
+    commits_before = await asyncio.to_thread(
+        lambda: [c.title for c in api.list_repo_commits(repo_id=source_id, repo_type="dataset")]
+    )
+
+    moved_ids = []
+    for cycle in range(3):
+        moved_id = f"owner/issue107-history-moved-{cycle}"
+        await asyncio.to_thread(
+            lambda: api.move_repo(from_id=source_id, to_id=moved_id, repo_type="dataset")
+        )
+        moved_ids.append(moved_id)
+        # The freed name is reusable straight away, every time.
+        await asyncio.to_thread(
+            lambda: api.create_repo(repo_id=source_id, repo_type="dataset", private=True)
+        )
+
+    first = moved_ids[0]
+    refs = await asyncio.to_thread(lambda: api.list_repo_refs(repo_id=first, repo_type="dataset"))
+    assert {branch.name for branch in refs.branches} == {"main", "qa-pass"}
+    assert {tag.name for tag in refs.tags} == {"v1"}
+    commits_after = await asyncio.to_thread(
+        lambda: [c.title for c in api.list_repo_commits(repo_id=first, repo_type="dataset")]
+    )
+    assert commits_after == commits_before, "the move must not rewrite or drop history"
+    readme = await asyncio.to_thread(
+        lambda: Path(
+            api.hf_hub_download(repo_id=first, filename="README.md", repo_type="dataset", revision="v1")
+        ).read_bytes()
+    )
+    assert readme == b"# issue 107\n"
+
+    # The later incarnations are independent, empty repositories...
+    for moved_id in moved_ids[1:]:
+        info = await asyncio.to_thread(lambda: api.repo_info(repo_id=moved_id, repo_type="dataset"))
+        assert not {s.rfilename for s in (info.siblings or [])} & {"README.md", "data.bin"}
+
+    # ...backed by their own LakeFS repositories: deleting the current holder
+    # of the name leaves the moved repository untouched.
+    await asyncio.to_thread(lambda: api.delete_repo(repo_id=source_id, repo_type="dataset"))
+    data = await asyncio.to_thread(
+        lambda: Path(
+            api.hf_hub_download(repo_id=first, filename="data.bin", repo_type="dataset")
+        ).read_bytes()
+    )
+    assert data == b"y" * 4096
+
+
+
+async def test_hf_move_repo_refuses_a_name_that_normalizes_to_another_repo(
+    live_server_url,
+    hf_api_token,
+):
+    """Create refuses `My_Repo` next to `my-repo`; a move must refuse it too,
+    while still allowing a repository to change the case of its own name."""
+    api = HfApi(endpoint=live_server_url, token=hf_api_token)
+    for repo_id in ("owner/issue108-norm", "owner/issue108-other"):
+        await asyncio.to_thread(
+            lambda: api.create_repo(repo_id=repo_id, repo_type="model", private=True)
+        )
+
+    # Status is read off the response so this holds across huggingface_hub
+    # versions whose HTTP error classes live in different modules.
+    with pytest.raises(Exception) as conflict:
+        await asyncio.to_thread(
+            lambda: api.move_repo(
+                from_id="owner/issue108-other", to_id="owner/Issue108_Norm", repo_type="model"
+            )
+        )
+    assert getattr(getattr(conflict.value, "response", None), "status_code", None) == 409
+
+    await asyncio.to_thread(
+        lambda: api.move_repo(
+            from_id="owner/issue108-norm", to_id="owner/Issue108-Norm", repo_type="model"
+        )
+    )
+    renamed = await asyncio.to_thread(
+        lambda: api.repo_info(repo_id="owner/Issue108-Norm", repo_type="model")
+    )
+    assert renamed.id == "owner/Issue108-Norm"
