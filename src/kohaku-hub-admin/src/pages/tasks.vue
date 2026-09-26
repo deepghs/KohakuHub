@@ -2,9 +2,12 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import AdminLayout from "@/components/AdminLayout.vue";
+import TaskDetail from "@/components/tasks/TaskDetail.vue";
 import TaskOverview from "@/components/tasks/TaskOverview.vue";
+import TaskProgress from "@/components/tasks/TaskProgress.vue";
 import { useAdminStore } from "@/stores/admin";
 import {
+  cancelTask,
   deleteTask,
   getTask,
   getTaskStats,
@@ -12,17 +15,18 @@ import {
   retryTask,
 } from "@/utils/api";
 import { ElMessage, ElMessageBox } from "element-plus";
-import dayjs from "dayjs";
+import { formatDate } from "@/components/tasks/taskFormat.js";
 
 const router = useRouter();
 const adminStore = useAdminStore();
 
-const STATUSES = ["queued", "running", "succeeded", "failed"];
+const STATUSES = ["queued", "running", "succeeded", "failed", "cancelled"];
 const STATUS_TAG = {
   queued: "info",
   running: "primary",
   succeeded: "success",
   failed: "danger",
+  cancelled: "warning",
 };
 const HEALTH_TAG = {
   healthy: { type: "success", label: "Healthy" },
@@ -120,6 +124,19 @@ async function loadStats() {
 function refreshAll() {
   loadTasks();
   loadStats();
+  if (detailVisible.value && detail.value) reloadDetail(detail.value.id);
+}
+
+// Keeps an open detail live (progress, timeline) on refresh; stays quiet
+// if the task was discarded meanwhile.
+async function reloadDetail(taskId) {
+  try {
+    const fresh = await getTask(adminStore.token, taskId);
+    if (detailVisible.value && detail.value?.id === taskId)
+      detail.value = fresh;
+  } catch {
+    // The next manual action reports errors.
+  }
 }
 
 function applyFilters() {
@@ -193,10 +210,32 @@ async function handleRetry(task) {
   }
 }
 
+async function handleCancel(task) {
+  const message =
+    task.status === "running"
+      ? `Ask the worker to stop task #${task.id} (${task.kind})? It gets ` +
+        "a grace period to stop cleanly, then it is interrupted."
+      : `Cancel task #${task.id} (${task.kind}) before it starts?`;
+  if (!(await confirmAction(message, "Cancel task"))) {
+    return;
+  }
+  try {
+    const updated = await cancelTask(adminStore.token, task.id);
+    ElMessage.success(
+      updated.status === "cancelled"
+        ? `Task #${task.id} cancelled`
+        : `Cancellation of task #${task.id} requested`,
+    );
+    refreshAll();
+  } catch (error) {
+    handleError(error, "Failed to cancel task");
+  }
+}
+
 async function handleDiscard(task) {
   if (
     !(await confirmAction(
-      `Discard task #${task.id} (${task.kind})? This cannot be undone.`,
+      `Discard task #${task.id} (${task.kind}) with its timeline and logs? This cannot be undone.`,
       "Discard task",
     ))
   ) {
@@ -213,15 +252,18 @@ async function handleDiscard(task) {
 }
 
 function canRetry(task) {
-  return task.status === "failed";
+  return task.status === "failed" || task.status === "cancelled";
+}
+
+function canCancel(task) {
+  return (
+    task.status === "queued" ||
+    (task.status === "running" && !task.cancel_requested)
+  );
 }
 
 function canDiscard(task) {
-  return task.status === "queued" || task.status === "failed";
-}
-
-function formatDate(value) {
-  return value ? dayjs(value).format("YYYY-MM-DD HH:mm:ss") : "—";
+  return task.status === "failed" || task.status === "cancelled";
 }
 
 // The one timestamp that matters for the row's current state.
@@ -281,7 +323,8 @@ onBeforeUnmount(stopTimer);
           </h1>
           <p class="text-gray-500 dark:text-gray-400 text-sm mt-1">
             Durable tasks executed by <code>khub-worker</code>. Tasks run at
-            least once; failed tasks can be retried or discarded here.
+            least once. Follow progress and logs, cancel queued or running
+            tasks, and retry or discard failed ones here.
           </p>
         </div>
         <div class="flex items-center gap-3">
@@ -407,7 +450,7 @@ onBeforeUnmount(stopTimer);
                 min-width="180"
                 show-overflow-tooltip
               />
-              <el-table-column label="Status" width="150">
+              <el-table-column label="Status" width="170">
                 <template #default="{ row }">
                   <el-tag :type="STATUS_TAG[row.status]" size="small">
                     {{ row.status }}
@@ -421,6 +464,29 @@ onBeforeUnmount(stopTimer);
                   >
                     lease expired
                   </el-tag>
+                  <el-tag
+                    v-if="row.stalled"
+                    type="danger"
+                    size="small"
+                    class="ml-1"
+                    :data-testid="`tasks-stalled-${row.id}`"
+                  >
+                    stalled
+                  </el-tag>
+                  <el-tag
+                    v-if="row.cancel_requested && row.status === 'running'"
+                    type="warning"
+                    size="small"
+                    class="ml-1"
+                    :data-testid="`tasks-cancelling-${row.id}`"
+                  >
+                    cancelling
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="Progress" min-width="200">
+                <template #default="{ row }">
+                  <TaskProgress :task="row" compact />
                 </template>
               </el-table-column>
               <el-table-column label="Attempts" width="90">
@@ -440,7 +506,7 @@ onBeforeUnmount(stopTimer);
                   <span class="error-text">{{ truncate(row.last_error) }}</span>
                 </template>
               </el-table-column>
-              <el-table-column label="Actions" width="200">
+              <el-table-column label="Actions" width="230" fixed="right">
                 <template #default="{ row }">
                   <el-button
                     link
@@ -449,6 +515,15 @@ onBeforeUnmount(stopTimer);
                     @click="openDetail(row)"
                   >
                     Details
+                  </el-button>
+                  <el-button
+                    v-if="canCancel(row)"
+                    link
+                    type="warning"
+                    :data-testid="`tasks-cancel-${row.id}`"
+                    @click="handleCancel(row)"
+                  >
+                    Cancel
                   </el-button>
                   <el-button
                     v-if="canRetry(row)"
@@ -489,56 +564,24 @@ onBeforeUnmount(stopTimer);
       <el-dialog
         v-model="detailVisible"
         :title="detail ? `Task #${detail.id}` : 'Task'"
-        width="720px"
+        width="920px"
       >
-        <div v-if="detail" data-testid="tasks-detail">
-          <dl class="detail-grid">
-            <dt>Kind</dt>
-            <dd>{{ detail.kind }}</dd>
-            <dt>Status</dt>
-            <dd>
-              {{ detail.status }}
-              <el-tag
-                v-if="detail.lease_expired"
-                type="warning"
-                size="small"
-                class="ml-1"
-                data-testid="tasks-detail-lease-expired"
-              >
-                lease expired
-              </el-tag>
-            </dd>
-            <dt>Queue</dt>
-            <dd>{{ detail.queue }}</dd>
-            <dt>Priority</dt>
-            <dd>{{ detail.priority }}</dd>
-            <dt>Attempts</dt>
-            <dd>{{ detail.attempts }} / {{ detail.max_attempts }}</dd>
-            <dt>Dedupe key</dt>
-            <dd>{{ detail.dedupe_key || "—" }}</dd>
-            <dt>Worker</dt>
-            <dd>{{ detail.locked_by || "—" }}</dd>
-            <dt>Lease until</dt>
-            <dd>{{ formatDate(detail.locked_until) }}</dd>
-            <dt>Created</dt>
-            <dd>{{ formatDate(detail.created_at) }}</dd>
-            <dt>Run after</dt>
-            <dd>{{ formatDate(detail.run_after) }}</dd>
-            <dt>Started</dt>
-            <dd>{{ formatDate(detail.started_at) }}</dd>
-            <dt>Finished</dt>
-            <dd>{{ formatDate(detail.finished_at) }}</dd>
-          </dl>
-          <h3 class="section-title">Payload</h3>
-          <pre class="code-block">{{
-            JSON.stringify(detail.payload, null, 2)
-          }}</pre>
-          <template v-if="detail.last_error">
-            <h3 class="section-title">Last error</h3>
-            <pre class="code-block error-text">{{ detail.last_error }}</pre>
-          </template>
-        </div>
+        <TaskDetail
+          v-if="detail"
+          :key="detail.id"
+          :task="detail"
+          :token="adminStore.token"
+          @error="handleError($event, 'Failed to load task logs')"
+        />
         <template #footer>
+          <el-button
+            v-if="detail && canCancel(detail)"
+            type="warning"
+            data-testid="tasks-detail-cancel"
+            @click="handleCancel(detail)"
+          >
+            Cancel task
+          </el-button>
           <el-button
             v-if="detail && canRetry(detail)"
             type="warning"
@@ -590,7 +633,7 @@ onBeforeUnmount(stopTimer);
   text-align: left;
 }
 
-/* Each card borrows its status badge colour (info/primary/success/danger)
+/* Each card borrows its status badge colour (info/primary/success/danger/warning)
    as an accent, so cards and table badges read as one legend. */
 .status-card {
   --status-color: var(--el-color-info);
@@ -611,6 +654,11 @@ onBeforeUnmount(stopTimer);
 .status-card.status-failed {
   --status-color: var(--el-color-danger);
   --status-tint: var(--el-color-danger-light-9);
+}
+
+.status-card.status-cancelled {
+  --status-color: var(--el-color-warning);
+  --status-tint: var(--el-color-warning-light-9);
 }
 
 .status-card:hover {
@@ -685,37 +733,5 @@ onBeforeUnmount(stopTimer);
 
 .error-text {
   color: var(--el-color-danger);
-}
-
-.detail-grid {
-  display: grid;
-  grid-template-columns: 140px 1fr;
-  gap: 6px 12px;
-  margin: 0 0 16px;
-}
-
-.detail-grid dt {
-  color: var(--el-text-color-secondary);
-}
-
-.detail-grid dd {
-  margin: 0;
-  word-break: break-all;
-}
-
-.section-title {
-  font-weight: 600;
-  margin: 12px 0 6px;
-}
-
-.code-block {
-  background: var(--el-fill-color-light);
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 260px;
-  overflow: auto;
 }
 </style>

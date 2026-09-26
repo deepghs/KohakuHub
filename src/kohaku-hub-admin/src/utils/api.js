@@ -885,10 +885,9 @@ export async function invalidateFallbackUserCacheByUsername(token, username) {
  */
 export async function bulkReplaceFallbackSources(token, sources) {
   const client = createAdminClient(token);
-  const response = await client.put(
-    "/fallback/sources-bulk-replace",
-    { sources },
-  );
+  const response = await client.put("/fallback/sources-bulk-replace", {
+    sources,
+  });
   return response.data;
 }
 
@@ -1147,9 +1146,7 @@ function _generateProbeId() {
  */
 function _readProbeCookie(probeId) {
   const name = `${TRACE_COOKIE_PREFIX}${probeId}`;
-  const match = document.cookie.match(
-    new RegExp(`(?:^|;\\s*)${name}=([^;]+)`),
-  );
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
   if (!match) return null;
   let value = match[1];
   // Defensive: if some upstream (Python ``http.cookies.SimpleCookie``,
@@ -1171,8 +1168,7 @@ function _readProbeCookie(probeId) {
  */
 function _clearProbeCookie(probeId) {
   document.cookie =
-    `${TRACE_COOKIE_PREFIX}${probeId}=; ` +
-    `Max-Age=0; Path=/; SameSite=Lax`;
+    `${TRACE_COOKIE_PREFIX}${probeId}=; ` + `Max-Age=0; Path=/; SameSite=Lax`;
 }
 
 /**
@@ -1370,16 +1366,17 @@ export async function runFallbackProbe(req) {
   let final_response;
   if (isOpaqueRedirect) {
     const boundHop = hops.find(
-      (h) => h.decision === "BIND_AND_RESPOND"
-              || h.decision === "BIND_AND_PROPAGATE"
-              || h.decision === "LOCAL_HIT"
-              || h.decision === "LOCAL_FILTERED"
-              || h.decision === "LOCAL_OTHER_ERROR",
+      (h) =>
+        h.decision === "BIND_AND_RESPOND" ||
+        h.decision === "BIND_AND_PROPAGATE" ||
+        h.decision === "LOCAL_HIT" ||
+        h.decision === "LOCAL_FILTERED" ||
+        h.decision === "LOCAL_OTHER_ERROR",
     );
     final_response = boundHop
       ? {
           status_code: boundHop.status_code,
-          headers: {},  // opaqueredirect: real headers unreadable
+          headers: {}, // opaqueredirect: real headers unreadable
           body_preview:
             "[redirect — body served by upstream after redirect-follow]",
         }
@@ -1567,7 +1564,7 @@ export async function deleteS3Prefix(token, prefix, confirmToken) {
  * List background tasks with per-status counts
  * @param {string} token - Admin token
  * @param {Object} params - Query parameters
- * @param {string} [params.status] - Filter by status (queued/running/succeeded/failed)
+ * @param {string} [params.status] - Filter by status (queued/running/succeeded/failed/cancelled)
  * @param {string} [params.kind] - Filter by task kind
  * @param {number} params.limit - Max tasks to return
  * @param {number} params.offset - Offset for pagination
@@ -1585,10 +1582,10 @@ export async function listTasks(
 }
 
 /**
- * Get one background task including payload and last error
+ * Get one background task with its timeline, attempts and log sizes
  * @param {string} token - Admin token
  * @param {number} taskId - Task ID
- * @returns {Promise<Object>} Task
+ * @returns {Promise<Object>} Task with events, attempts, checkpoint, log_lines
  */
 export async function getTask(token, taskId) {
   const client = createAdminClient(token);
@@ -1597,7 +1594,7 @@ export async function getTask(token, taskId) {
 }
 
 /**
- * Requeue a failed background task
+ * Requeue a failed or cancelled background task
  * @param {string} token - Admin token
  * @param {number} taskId - Task ID
  * @returns {Promise<Object>} Updated task
@@ -1609,7 +1606,7 @@ export async function retryTask(token, taskId) {
 }
 
 /**
- * Discard a queued or failed background task
+ * Discard a failed or cancelled background task with its timeline and logs
  * @param {string} token - Admin token
  * @param {number} taskId - Task ID
  * @returns {Promise<Object>} Deletion result
@@ -1617,6 +1614,56 @@ export async function retryTask(token, taskId) {
 export async function deleteTask(token, taskId) {
   const client = createAdminClient(token);
   const response = await client.delete(`/tasks/${taskId}`);
+  return response.data;
+}
+
+/**
+ * Cancel a queued task, or ask the worker running a task to stop it
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @returns {Promise<Object>} Updated task
+ */
+export async function cancelTask(token, taskId) {
+  const client = createAdminClient(token);
+  const response = await client.post(`/tasks/${taskId}/cancel`);
+  return response.data;
+}
+
+/**
+ * Page through a task's captured log, oldest first
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @param {Object} params - Query parameters
+ * @param {number} [params.attempt] - Only this attempt's records
+ * @param {number} [params.afterId] - Only records after this id (for tailing)
+ * @param {number} [params.limit] - Max records to return
+ * @returns {Promise<Object>} { lines, next_after_id, has_more, status }
+ */
+export async function getTaskLogs(
+  token,
+  taskId,
+  { attempt, afterId = 0, limit = 500 } = {},
+) {
+  const client = createAdminClient(token);
+  const response = await client.get(`/tasks/${taskId}/logs`, {
+    params: { attempt, after_id: afterId, limit },
+  });
+  return response.data;
+}
+
+/**
+ * Download a task's log (or one attempt's) as plain text
+ * @param {string} token - Admin token
+ * @param {number} taskId - Task ID
+ * @param {number} [attempt] - Only this attempt's records
+ * @returns {Promise<Blob>} The log file
+ */
+export async function downloadTaskLogs(token, taskId, attempt) {
+  const client = createAdminClient(token);
+  const response = await client.get(`/tasks/${taskId}/logs/download`, {
+    params: { attempt },
+    responseType: "blob",
+  });
   return response.data;
 }
 
