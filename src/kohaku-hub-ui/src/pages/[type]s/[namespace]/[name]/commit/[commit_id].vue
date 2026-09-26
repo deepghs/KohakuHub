@@ -108,12 +108,22 @@
         </div>
 
         <!-- Action Buttons -->
-        <div class="flex gap-3 mb-4">
-          <el-button size="small" @click="showRevertDialog" class="btn-revert">
+        <div v-if="revertEnabled || resetEnabled" class="flex gap-3 mb-4">
+          <el-button
+            v-if="revertEnabled"
+            size="small"
+            @click="showRevertDialog"
+            class="btn-revert"
+          >
             <div class="i-carbon-undo inline-block mr-1" />
             Revert Commit
           </el-button>
-          <el-button type="primary" size="small" @click="showResetDialog">
+          <el-button
+            v-if="resetEnabled"
+            type="primary"
+            size="small"
+            @click="showResetDialog"
+          >
             <div class="i-carbon-reset inline-block mr-1" />
             Reset to This State
           </el-button>
@@ -137,6 +147,7 @@
 
       <!-- Revert Dialog -->
       <el-dialog
+        v-if="revertEnabled"
         v-model="revertDialogVisible"
         title="Revert Commit"
         width="500px"
@@ -188,6 +199,7 @@
 
       <!-- Reset Dialog -->
       <el-dialog
+        v-if="resetEnabled"
         v-model="resetDialogVisible"
         title="Reset Branch to This Commit"
         width="500px"
@@ -559,6 +571,8 @@ import axios from "axios";
 import dayjs from "dayjs";
 import relativeTime from "dayjs/plugin/relativeTime";
 import { ElMessage } from "element-plus";
+import { settingsAPI } from "@/utils/api";
+import { getRepositoryOperationCapabilities } from "@/utils/repositoryOperationCapabilities";
 
 dayjs.extend(relativeTime);
 
@@ -574,6 +588,8 @@ const repoId = computed(() => `${namespace.value}/${name.value}`);
 const loading = ref(true);
 const error = ref(null);
 const commitData = ref(null);
+const revertEnabled = ref(false);
+const resetEnabled = ref(false);
 
 // Revert state
 const revertDialogVisible = ref(false);
@@ -617,13 +633,27 @@ async function loadCommitDetails() {
   }
 }
 
+async function loadOperationCapabilities() {
+  try {
+    const { data } = await settingsAPI.getSiteConfig();
+    const operations = getRepositoryOperationCapabilities(data);
+    revertEnabled.value = operations.revert;
+    resetEnabled.value = operations.reset;
+  } catch (err) {
+    // Keep both actions hidden when capabilities cannot be established.
+    console.warn("Failed to load repository operation capabilities:", err);
+  }
+}
+
 function showRevertDialog() {
+  if (!revertEnabled.value) return;
   selectedBranch.value = "main";
   revertForce.value = false;
   revertDialogVisible.value = true;
 }
 
 function showResetDialog() {
+  if (!resetEnabled.value) return;
   selectedBranch.value = "main";
   resetForce.value = false;
   resetMessage.value = "";
@@ -631,11 +661,15 @@ function showResetDialog() {
 }
 
 async function doRevert() {
+  if (!revertEnabled.value) return;
   reverting.value = true;
 
   try {
-    await axios.post(
-      `/api/${type.value}s/${repoId.value}/branch/${selectedBranch.value}/revert`,
+    await settingsAPI.revertBranch(
+      type.value,
+      namespace.value,
+      name.value,
+      selectedBranch.value,
       {
         ref: commitId.value,
         parent_number: 1,
@@ -667,6 +701,7 @@ async function doRevert() {
 }
 
 async function doReset() {
+  if (!resetEnabled.value) return;
   resetting.value = true;
 
   try {
@@ -680,8 +715,11 @@ async function doReset() {
       payload.message = resetMessage.value.trim();
     }
 
-    await axios.post(
-      `/api/${type.value}s/${repoId.value}/branch/${selectedBranch.value}/reset`,
+    await settingsAPI.resetBranch(
+      type.value,
+      namespace.value,
+      name.value,
+      selectedBranch.value,
       payload,
     );
 
@@ -893,6 +931,7 @@ function renderDiff(diff) {
 
 onMounted(() => {
   loadCommitDetails();
+  loadOperationCapabilities();
 });
 </script>
 

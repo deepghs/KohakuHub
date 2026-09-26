@@ -6,6 +6,15 @@
 import axios from "axios";
 
 /**
+ * Get public site configuration and repository operation capabilities.
+ * @returns {Promise<Object>} public site configuration
+ */
+export async function getSiteConfig() {
+  const response = await axios.get("/api/site-config");
+  return response.data;
+}
+
+/**
  * Create axios instance with admin token
  * @param {string} token - Admin token
  * @returns {import('axios').AxiosInstance} Axios instance

@@ -110,12 +110,14 @@ async def test_worker_times_out_slow_handlers():
 
 
 async def test_worker_heartbeat_keeps_long_task_owned():
+    # The handler outlives the lease, so only heartbeats keep it owned. The
+    # lease leaves ~0.6s of slack for slow CI runners between renewals.
     @tasks.task("test.long")
     async def long_task(payload):
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2.0)
 
     task_id = tasks.enqueue("test.long")
-    await _run_until(_worker(lease_seconds=0.15), lambda: _status(task_id) == tasks.SUCCEEDED)
+    await _run_until(_worker(lease_seconds=0.9), lambda: _status(task_id) == tasks.SUCCEEDED)
 
     assert BackgroundTask.get_by_id(task_id).attempts == 1
 
@@ -163,10 +165,12 @@ async def test_worker_survives_heartbeat_errors(monkeypatch):
 
     @tasks.task("test.hiccup")
     async def hiccup(payload):
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(1.5)
 
+    # First renewal (0.3s) fails, the second (0.6s) must land before the
+    # 0.9s lease expires; the handler outlives the lease.
     task_id = tasks.enqueue("test.hiccup")
-    await _run_until(_worker(lease_seconds=0.15), lambda: _status(task_id) == tasks.SUCCEEDED)
+    await _run_until(_worker(lease_seconds=0.9), lambda: _status(task_id) == tasks.SUCCEEDED)
 
     assert calls["renew"] >= 2
 

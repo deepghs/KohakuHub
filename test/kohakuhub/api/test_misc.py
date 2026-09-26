@@ -1,6 +1,11 @@
 """API tests for utility routes."""
 
+from types import SimpleNamespace
+
 import httpx
+import pytest
+
+import kohakuhub.api.operation_capabilities as operation_capabilities
 
 
 async def test_version_site_config_and_yaml_validation(client):
@@ -11,6 +16,11 @@ async def test_version_site_config_and_yaml_validation(client):
     site_config_response = await client.get("/api/site-config")
     assert site_config_response.status_code == 200
     assert "site_name" in site_config_response.json()
+    assert site_config_response.json()["capabilities"]["repository_operations"] == {
+        "revert": False,
+        "reset": False,
+        "squash": False,
+    }
 
     valid_yaml_response = await client.post(
         "/api/validate-yaml",
@@ -25,6 +35,145 @@ async def test_version_site_config_and_yaml_validation(client):
     )
     assert invalid_yaml_response.status_code == 200
     assert invalid_yaml_response.json()["valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_disabled_operations_reject_before_auth_and_repository_lookup(
+    app, backend_test_state, client, monkeypatch
+):
+    active_cfg = backend_test_state.modules.config_module.cfg
+    active_branches = backend_test_state.modules.branches_module
+    active_repo_crud = backend_test_state.modules.repo_crud_module
+
+    for field in (
+        "repository_revert_enabled",
+        "repository_reset_enabled",
+        "repository_squash_enabled",
+    ):
+        monkeypatch.setattr(active_cfg.app, field, False)
+
+    auth_calls = []
+    repository_lookups = []
+
+    def unexpected_user_dependency():
+        auth_calls.append("user")
+        return SimpleNamespace(username="owner")
+
+    def unexpected_admin_dependency():
+        auth_calls.append("admin")
+        return (SimpleNamespace(username="owner"), False)
+
+    def unexpected_repository_lookup(*_args):
+        repository_lookups.append(True)
+        return SimpleNamespace()
+
+    app.dependency_overrides[active_branches.get_current_user] = unexpected_user_dependency
+    app.dependency_overrides[active_repo_crud.get_current_user_or_admin] = (
+        unexpected_admin_dependency
+    )
+    monkeypatch.setattr(active_branches, "get_repository", unexpected_repository_lookup)
+    monkeypatch.setattr(active_repo_crud, "get_repository", unexpected_repository_lookup)
+
+    try:
+        requests = [
+            (
+                "/api/models/owner/demo-model/branch/main/revert",
+                {"ref": "commit-ref"},
+            ),
+            (
+                "/api/models/owner/demo-model/branch/main/reset",
+                {"ref": "commit-ref", "force": True},
+            ),
+            ("/api/repos/squash", {"repo": "owner/demo-model", "type": "model"}),
+        ]
+        responses = [await client.post(path, json=payload) for path, payload in requests]
+    finally:
+        app.dependency_overrides.clear()
+
+    assert [response.status_code for response in responses] == [503, 503, 503]
+    assert [response.json()["detail"]["code"] for response in responses] == [
+        "operation_disabled",
+        "operation_disabled",
+        "operation_disabled",
+    ]
+    assert auth_calls == []
+    assert repository_lookups == []
+
+
+@pytest.mark.asyncio
+async def test_enabled_operations_still_require_authentication(
+    app, backend_test_state, client, monkeypatch
+):
+    active_cfg = backend_test_state.modules.config_module.cfg
+    active_branches = backend_test_state.modules.branches_module
+    active_repo_crud = backend_test_state.modules.repo_crud_module
+
+    monkeypatch.setattr(active_cfg.app, "db_backend", "postgres")
+    for field in (
+        "repository_revert_enabled",
+        "repository_reset_enabled",
+        "repository_squash_enabled",
+    ):
+        monkeypatch.setattr(active_cfg.app, field, True)
+    mutation_calls = []
+
+    def unexpected_repository_lookup(*_args):
+        mutation_calls.append("repository")
+        raise AssertionError("anonymous request reached repository logic")
+
+    monkeypatch.setattr(active_branches, "get_repository", unexpected_repository_lookup)
+    monkeypatch.setattr(active_repo_crud, "get_repository", unexpected_repository_lookup)
+    app.dependency_overrides[active_branches.require_repository_revert_enabled] = (
+        lambda: None
+    )
+    app.dependency_overrides[active_branches.require_repository_reset_enabled] = (
+        lambda: None
+    )
+    app.dependency_overrides[active_repo_crud.require_repository_squash_enabled] = (
+        lambda: None
+    )
+
+    requests = [
+        (
+            "/api/models/owner/demo-model/branch/main/revert",
+            {"ref": "commit-ref"},
+        ),
+        (
+            "/api/models/owner/demo-model/branch/main/reset",
+            {"ref": "commit-ref", "force": True},
+        ),
+        ("/api/repos/squash", {"repo": "owner/demo-model", "type": "model"}),
+    ]
+
+    try:
+        responses = [
+            await client.post(path, json=payload) for path, payload in requests
+        ]
+    finally:
+        app.dependency_overrides.clear()
+
+    assert [response.status_code for response in responses] == [401, 401, 401]
+    assert mutation_calls == []
+
+
+def test_repository_operations_stay_disabled_on_sqlite(monkeypatch):
+    for backend in ("sqlite", "POSTGRES"):
+        monkeypatch.setattr(operation_capabilities.cfg.app, "db_backend", backend)
+        monkeypatch.setattr(
+            operation_capabilities.cfg.app, "repository_revert_enabled", True
+        )
+        monkeypatch.setattr(
+            operation_capabilities.cfg.app, "repository_reset_enabled", True
+        )
+        monkeypatch.setattr(
+            operation_capabilities.cfg.app, "repository_squash_enabled", True
+        )
+
+        assert operation_capabilities.get_repository_operation_capabilities() == {
+            "revert": False,
+            "reset": False,
+            "squash": False,
+        }
 
 
 async def test_whoami_v2_requires_auth_and_returns_orgs(app, owner_client):

@@ -177,7 +177,7 @@
           <div class="card border-2 border-red-500">
             <h2 class="text-xl font-semibold mb-4 text-red-600">Danger Zone</h2>
             <div class="space-y-4">
-              <div>
+              <div v-if="squashEnabled">
                 <h3 class="font-medium text-orange-600 mb-2">
                   Squash repository history
                 </h3>
@@ -593,6 +593,7 @@ import { useRoute, useRouter } from "vue-router";
 import { repoAPI, settingsAPI, validationAPI, quotaAPI } from "@/utils/api";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useAuthStore } from "@/stores/auth";
+import { getRepositoryOperationCapabilities } from "@/utils/repositoryOperationCapabilities";
 
 const route = useRoute();
 const router = useRouter();
@@ -626,6 +627,7 @@ const recalculating = ref(false);
 const savingQuota = ref(false);
 const lfsSettings = ref(null);
 const savingLfs = ref(false);
+const squashEnabled = ref(false);
 
 const repoId = computed(() => `${route.params.namespace}/${route.params.name}`);
 const repoType = computed(() => route.params.type);
@@ -660,6 +662,16 @@ async function loadRepoInfo() {
   } catch (err) {
     console.error("Failed to load repo info:", err);
     ElMessage.error("Failed to load repository information");
+  }
+}
+
+async function loadOperationCapabilities() {
+  try {
+    const { data } = await settingsAPI.getSiteConfig();
+    squashEnabled.value = getRepositoryOperationCapabilities(data).squash;
+  } catch (err) {
+    // Keep Squash hidden when capabilities cannot be established.
+    console.warn("Failed to load repository operation capabilities:", err);
   }
 }
 
@@ -799,6 +811,7 @@ async function handleMoveRepo() {
 }
 
 async function handleSquashRepo() {
+  if (!squashEnabled.value) return;
   try {
     await ElMessageBox.confirm(
       `This will clear all commit history for ${repoId.value} and optimize storage. Only the current state will be preserved. This action cannot be undone!`,
@@ -1150,6 +1163,7 @@ onMounted(() => {
     return;
   }
   loadRepoInfo();
+  loadOperationCapabilities();
   // Load quota info if starting on quota tab
   if (activeTab.value === "quota") {
     loadQuotaInfo();

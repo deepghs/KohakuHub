@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 import kohakuhub.api.branches as branches_api
+import kohakuhub.api.operation_capabilities as operation_capabilities
 
 
 class _FakeClient:
@@ -281,6 +282,9 @@ async def test_reference_helpers_and_list_repo_refs_cover_pagination_and_fallbac
 
 @pytest.mark.asyncio
 async def test_revert_branch_covers_not_found_conflict_success_and_tracking_failure(monkeypatch):
+    monkeypatch.setattr(
+        operation_capabilities.cfg.app, "repository_revert_enabled", True
+    )
     repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
@@ -440,6 +444,9 @@ async def test_merge_branches_covers_not_found_conflict_success_and_tracking_pat
 
 @pytest.mark.asyncio
 async def test_reset_branch_covers_guardrails_recoverability_success_and_failures(monkeypatch):
+    monkeypatch.setattr(
+        operation_capabilities.cfg.app, "repository_reset_enabled", True
+    )
     repo = SimpleNamespace(repo_type="model", full_id="owner/repo")
     user = SimpleNamespace(username="owner")
     client = _FakeClient()
@@ -527,3 +534,45 @@ async def test_reset_branch_covers_guardrails_recoverability_success_and_failure
             "model", "owner", "repo", "feature", branches_api.ResetPayload(ref="abc", force=True), user=user
         )
     assert generic_error.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_disabled_revert_and_reset_reject_before_repository_lookup(monkeypatch):
+    monkeypatch.setattr(
+        operation_capabilities.cfg.app, "repository_revert_enabled", False
+    )
+    monkeypatch.setattr(
+        operation_capabilities.cfg.app, "repository_reset_enabled", False
+    )
+
+    def unexpected_repository_lookup(*_args):
+        raise AssertionError("disabled operation reached repository lookup")
+
+    monkeypatch.setattr(branches_api, "get_repository", unexpected_repository_lookup)
+    user = SimpleNamespace(username="owner")
+
+    with pytest.raises(HTTPException) as revert_error:
+        await branches_api.revert_branch(
+            "model",
+            "owner",
+            "repo",
+            "main",
+            branches_api.RevertPayload(ref="abc"),
+            user=user,
+        )
+    assert revert_error.value.status_code == 503
+    assert revert_error.value.detail["code"] == "operation_disabled"
+    assert revert_error.value.detail["operation"] == "revert"
+
+    with pytest.raises(HTTPException) as reset_error:
+        await branches_api.reset_branch(
+            "model",
+            "owner",
+            "repo",
+            "main",
+            branches_api.ResetPayload(ref="abc", force=True),
+            user=user,
+        )
+    assert reset_error.value.status_code == 503
+    assert reset_error.value.detail["code"] == "operation_disabled"
+    assert reset_error.value.detail["operation"] == "reset"

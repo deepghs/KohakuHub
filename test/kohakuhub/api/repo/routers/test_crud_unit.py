@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 import kohakuhub.api.repo.routers.crud as repo_crud
+import kohakuhub.api.operation_capabilities as operation_capabilities
 
 
 class _Expr:
@@ -460,6 +461,9 @@ async def test_move_repo_covers_validation_quota_success_and_nonfatal_cleanup(mo
 
 @pytest.mark.asyncio
 async def test_squash_repo_covers_validation_success_and_recovery(monkeypatch):
+    monkeypatch.setattr(
+        operation_capabilities.cfg.app, "repository_squash_enabled", True
+    )
     repo_row = SimpleNamespace(
         private=False,
         repo_type="model",
@@ -525,6 +529,28 @@ async def test_squash_repo_covers_validation_success_and_recovery(monkeypatch):
             auth=(SimpleNamespace(username="owner"), False),
         )
     assert squash_error.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_disabled_squash_rejects_before_repository_lookup(monkeypatch):
+    monkeypatch.setattr(
+        operation_capabilities.cfg.app, "repository_squash_enabled", False
+    )
+
+    def unexpected_repository_lookup(*_args):
+        raise AssertionError("disabled operation reached repository lookup")
+
+    monkeypatch.setattr(repo_crud, "get_repository", unexpected_repository_lookup)
+
+    with pytest.raises(HTTPException) as error:
+        await repo_crud.squash_repo(
+            repo_crud.SquashRepoPayload(repo="owner/demo", type="model"),
+            auth=(SimpleNamespace(username="owner"), False),
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.detail["code"] == "operation_disabled"
+    assert error.value.detail["operation"] == "squash"
 
 
 # ---------------------------------------------------------------------------

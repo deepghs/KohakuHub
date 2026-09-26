@@ -10,6 +10,75 @@ Manage branches, tags, and advanced Git operations (merge, revert, reset).
 
 ---
 
+## Repository Operation Gate
+
+The history-mutating operations below are independently controlled by server-side
+capabilities: `revert`, `reset`, and `squash`. The public capability state is
+available without authentication from `GET /api/site-config`:
+
+```json
+{
+  "capabilities": {
+    "repository_operations": {
+      "revert": false,
+      "reset": false,
+      "squash": false
+    }
+  }
+}
+```
+
+Clients must treat an operation as enabled only when its value is the boolean
+`true`. If the request fails, the field is missing, or the value has any other
+type, clients must fail closed and hide the corresponding action.
+
+When an operation is disabled, its API gate runs before authentication and
+repository lookup. The server returns `503 Service Unavailable` with this
+stable response shape:
+
+```json
+{
+  "detail": {
+    "code": "operation_disabled",
+    "operation": "reset",
+    "error": "Repository reset is temporarily disabled",
+    "message": "Repository Reset is temporarily disabled"
+  }
+}
+```
+
+The `operation` value is one of `revert`, `reset`, or `squash`. Once enabled,
+the normal authentication, permission, and repository validation requirements
+still apply.
+
+### Defaults and reopening plan
+
+Revert, Reset, and Super Squash are **disabled by default for now**. Real
+deployments showed silent data corruption, long hangs, and outages in them
+(#99), and #107 records further integrity gaps. The flags exist so these
+operations can be reopened safely, one at a time. The plan:
+
+1. Each operation gets its integrity and recovery fixes from the #99 work
+   plan, plus a canary run in a real deployment.
+2. Operations then become available one by one. An operator can opt in to an
+   individual operation with its flag before the defaults change.
+3. Once all three have passed, the defaults switch to **enabled**. The flags
+   stay as emergency off switches.
+
+To opt in before then, set `KOHAKU_HUB_REPOSITORY_REVERT_ENABLED`,
+`KOHAKU_HUB_REPOSITORY_RESET_ENABLED`, or
+`KOHAKU_HUB_REPOSITORY_SQUASH_ENABLED` to `true`. Alternatively, set
+`repository_revert_enabled`, `repository_reset_enabled`, or
+`repository_squash_enabled` under `[app]` in `config.toml`. Opting in means
+accepting the open issues in #99 and #107, and requires:
+
+- `db_backend = "postgres"`. Any other backend keeps every operation
+  disabled.
+- Draining backend instances that predate the gates, and deploying the
+  frontend with this change, before enabling a flag.
+- A backup of the repositories and object storage these operations may
+  touch.
+
 ## Branches
 
 ### Create Branch
@@ -173,6 +242,7 @@ Manage branches, tags, and advanced Git operations (merge, revert, reset).
 
 **Status Codes:**
 - `200 OK` - Reverted successfully
+- `503 Service Unavailable` - Revert operation is disabled by server policy
 - `404 Not Found` - Commit not found
 - `409 Conflict` - Revert caused conflicts
 
@@ -233,6 +303,7 @@ Manage branches, tags, and advanced Git operations (merge, revert, reset).
 
 **Status Codes:**
 - `200 OK` - Reset successful
+- `503 Service Unavailable` - Reset operation is disabled by server policy
 - `400 Bad Request` - LFS files not recoverable or main branch without force
 - `404 Not Found` - Commit not found
 
