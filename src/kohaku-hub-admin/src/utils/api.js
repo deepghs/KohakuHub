@@ -885,9 +885,10 @@ export async function invalidateFallbackUserCacheByUsername(token, username) {
  */
 export async function bulkReplaceFallbackSources(token, sources) {
   const client = createAdminClient(token);
-  const response = await client.put("/fallback/sources-bulk-replace", {
-    sources,
-  });
+  const response = await client.put(
+    "/fallback/sources-bulk-replace",
+    { sources },
+  );
   return response.data;
 }
 
@@ -1146,7 +1147,9 @@ function _generateProbeId() {
  */
 function _readProbeCookie(probeId) {
   const name = `${TRACE_COOKIE_PREFIX}${probeId}`;
-  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+  const match = document.cookie.match(
+    new RegExp(`(?:^|;\\s*)${name}=([^;]+)`),
+  );
   if (!match) return null;
   let value = match[1];
   // Defensive: if some upstream (Python ``http.cookies.SimpleCookie``,
@@ -1168,7 +1171,8 @@ function _readProbeCookie(probeId) {
  */
 function _clearProbeCookie(probeId) {
   document.cookie =
-    `${TRACE_COOKIE_PREFIX}${probeId}=; ` + `Max-Age=0; Path=/; SameSite=Lax`;
+    `${TRACE_COOKIE_PREFIX}${probeId}=; ` +
+    `Max-Age=0; Path=/; SameSite=Lax`;
 }
 
 /**
@@ -1366,17 +1370,16 @@ export async function runFallbackProbe(req) {
   let final_response;
   if (isOpaqueRedirect) {
     const boundHop = hops.find(
-      (h) =>
-        h.decision === "BIND_AND_RESPOND" ||
-        h.decision === "BIND_AND_PROPAGATE" ||
-        h.decision === "LOCAL_HIT" ||
-        h.decision === "LOCAL_FILTERED" ||
-        h.decision === "LOCAL_OTHER_ERROR",
+      (h) => h.decision === "BIND_AND_RESPOND"
+              || h.decision === "BIND_AND_PROPAGATE"
+              || h.decision === "LOCAL_HIT"
+              || h.decision === "LOCAL_FILTERED"
+              || h.decision === "LOCAL_OTHER_ERROR",
     );
     final_response = boundHop
       ? {
           status_code: boundHop.status_code,
-          headers: {}, // opaqueredirect: real headers unreadable
+          headers: {},  // opaqueredirect: real headers unreadable
           body_preview:
             "[redirect — body served by upstream after redirect-follow]",
         }

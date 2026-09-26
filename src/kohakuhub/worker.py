@@ -248,19 +248,23 @@ class Worker:
     def _flush(self, row: BackgroundTask, ctx: tasks.TaskContext) -> str | None:
         """Store captured logs and pending progress, renewing the lease.
 
-        Returns the heartbeat outcome, or ``None`` if the database failed; the
-        logs and progress are then kept for the next flush to store.
+        Returns the heartbeat outcome, or ``None`` if the database failed; what
+        could not be stored is kept for the next flush. Logs and the heartbeat
+        are written separately, so failing logs never cost the lease.
         """
         logs = ctx.take_logs()
-        progress = ctx.pending_progress()
         try:
             tasks.write_logs(row, logs)
-            logs = []
+        except Exception as e:
+            logger.warning(f"Failed to store logs of task {row.id}: {e}")
+            _reset_connection()
+            ctx.requeue_logs(logs)
+        progress = ctx.pending_progress()
+        try:
             state = tasks.heartbeat(row, lease_seconds=self.lease_seconds, progress=progress)
         except Exception as e:
             logger.warning(f"Failed to store progress of task {row.id}: {e}")
             _reset_connection()
-            ctx.requeue_logs(logs)
             return None
         ctx.clear_progress(progress)
         return state

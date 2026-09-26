@@ -765,3 +765,28 @@ async def test_worker_counts_only_failures_it_managed_to_record(monkeypatch):
     await _run_until(worker, attempted.is_set)
 
     assert worker.failed == 0
+
+
+async def test_failing_log_writes_never_cost_the_lease(monkeypatch):
+    def broken(row, entries):
+        raise RuntimeError("log table unavailable")
+
+    monkeypatch.setattr(tasks, "write_logs", broken)
+
+    @tasks.task("test.chatty")
+    async def chatty(payload, ctx):
+        for step in range(20):
+            worker_module.get_logger("DEMO").info(f"step {step}")
+            ctx.progress(step + 1, 20)
+            await asyncio.sleep(0.1)
+
+    # The handler outlives the 0.9 s lease; only heartbeats keep it owned.
+    task_id = tasks.enqueue("test.chatty")
+    await _run_until(
+        _worker(lease_seconds=0.9, flush_interval=0.1),
+        lambda: _status(task_id) == tasks.SUCCEEDED,
+    )
+
+    row = BackgroundTask.get_by_id(task_id)
+    assert row.attempts == 1
+    assert row.progress_done == 20  # progress still reached the row

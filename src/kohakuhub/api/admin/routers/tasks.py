@@ -559,16 +559,16 @@ def list_workers(include_inactive: bool = False, _admin: bool = Depends(verify_a
         include_inactive: Also list long-inactive lost and stopped workers
     """
     now = utcnow()
-    inactive_before = now - WORKER_INACTIVE_AFTER
-    shown: list[tuple[BackgroundWorker, str]] = []
+    W = BackgroundWorker
+    # Silent that long means lost or stopped, whatever the row's state says.
+    # Filtering in SQL keeps this cheap as the never-deleted history grows.
+    inactive = W.last_heartbeat_at < now - WORKER_INACTIVE_AFTER
+    query = W.select().order_by(W.started_at.desc())
     hidden = 0
-    for worker in BackgroundWorker.select().order_by(BackgroundWorker.started_at.desc()):
-        status = worker_status(worker, now)
-        inactive = status in ("lost", "stopped") and worker.last_heartbeat_at < inactive_before
-        if inactive and not include_inactive:
-            hidden += 1
-            continue
-        shown.append((worker, status))
+    if not include_inactive:
+        query = query.where(~inactive)
+        hidden = W.select().where(inactive).count()
+    shown = [(worker, worker_status(worker, now)) for worker in query]
     shown.sort(key=lambda item: WORKER_STATUS_ORDER[item[1]])  # stable: newest first within
 
     T = BackgroundTask

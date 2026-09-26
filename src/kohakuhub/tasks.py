@@ -72,6 +72,7 @@ WORKER_HEARTBEAT_SECONDS = 10.0
 WORKER_LOST_AFTER = timedelta(seconds=30)
 WORKER_INACTIVE_AFTER = timedelta(hours=24)
 SCRATCH_PREFIX = "tmp/tasks/{task_id}/"
+LOG_INSERT_BATCH = 500  # rows per INSERT, well under PostgreSQL's bind-parameter limit
 
 TaskHandler = Callable[..., Awaitable[None]]
 
@@ -440,10 +441,9 @@ def assert_owned(task_row: BackgroundTask) -> None:
 def write_logs(task_row: BackgroundTask, entries: list[dict[str, Any]]) -> None:
     """Store captured log records. Not fenced: a worker that lost its lease
     still documents what it did, under its own attempt number."""
-    if entries:
-        BackgroundTaskLog.insert_many(
-            [{"task": task_row.id, "attempt": task_row.attempts, **entry} for entry in entries]
-        ).execute()
+    rows = [{"task": task_row.id, "attempt": task_row.attempts, **entry} for entry in entries]
+    for start in range(0, len(rows), LOG_INSERT_BATCH):
+        BackgroundTaskLog.insert_many(rows[start : start + LOG_INSERT_BATCH]).execute()
 
 
 def complete_task(task_row: BackgroundTask) -> bool:
@@ -709,6 +709,8 @@ class TaskContext:
     def log(self, level: str, message: str, at: datetime | None = None) -> None:
         if self._log_truncated:
             return
+        # PostgreSQL text cannot hold NUL; one such record must not block the rest.
+        message = message.replace("\x00", "\\x00")
         size = len(message.encode())
         if self._log_bytes + size > self._log_limit:
             self._log_truncated = True

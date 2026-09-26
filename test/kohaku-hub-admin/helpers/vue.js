@@ -163,14 +163,18 @@ export const ElementPlusStubs = {
     },
     setup(props, { slots }) {
       return () =>
-        h("section", { "data-el-card": "true", "data-shadow": props.shadow }, [
-          slots.header
-            ? h("header", { "data-el-card-header": "true" }, slots.header())
-            : null,
-          slots.default
-            ? h("div", { "data-el-card-body": "true" }, slots.default())
-            : null,
-        ]);
+        h(
+          "section",
+          { "data-el-card": "true", "data-shadow": props.shadow },
+          [
+            slots.header
+              ? h("header", { "data-el-card-header": "true" }, slots.header())
+              : null,
+            slots.default
+              ? h("div", { "data-el-card-body": "true" }, slots.default())
+              : null,
+          ],
+        );
     },
   }),
   ElEmpty: defineComponent({
@@ -207,8 +211,7 @@ export const ElementPlusStubs = {
             placeholder: props.placeholder,
             onChange: (event) => {
               const raw = event.target.value;
-              const parsed =
-                raw === "" ? "" : Number.isNaN(Number(raw)) ? raw : Number(raw);
+              const parsed = raw === "" ? "" : Number.isNaN(Number(raw)) ? raw : Number(raw);
               emit("update:modelValue", parsed);
               emit("change", parsed);
             },
@@ -224,7 +227,8 @@ export const ElementPlusStubs = {
       value: { type: [String, Number, Boolean], default: "" },
     },
     setup(props) {
-      return () => h("option", { value: props.value }, props.label);
+      return () =>
+        h("option", { value: props.value }, props.label);
     },
   }),
   ElTabs: defineComponent({
@@ -292,10 +296,7 @@ export const ElementPlusStubs = {
         );
         return h(
           "table",
-          {
-            "data-el-table": "true",
-            "data-row-count": props.data?.length ?? 0,
-          },
+          { "data-el-table": "true", "data-row-count": props.data?.length ?? 0 },
           rendered,
         );
       };

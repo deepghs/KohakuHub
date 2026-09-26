@@ -193,11 +193,8 @@ describe("admin API client", () => {
       revision: "main",
       sources: [
         {
-          name: "HF",
-          url: "https://hf.example",
-          source_type: "huggingface",
-          token: null,
-          priority: 10,
+          name: "HF", url: "https://hf.example",
+          source_type: "huggingface", token: null, priority: 10,
         },
       ],
       as_username: "mai_lin",
@@ -423,12 +420,7 @@ describe("admin API client", () => {
       method: "get",
     });
     expect(
-      api.buildProbeRequestTarget({
-        op: "tree",
-        revision: "main",
-        file_path: "",
-        ...base,
-      }),
+      api.buildProbeRequestTarget({ op: "tree", revision: "main", file_path: "", ...base }),
     ).toEqual({
       url: "/api/models/owner/demo/tree/main",
       method: "get",
@@ -456,11 +448,7 @@ describe("admin API client", () => {
       method: "head",
     });
     expect(
-      api.buildProbeRequestTarget({
-        op: "paths_info",
-        revision: "main",
-        ...base,
-      }),
+      api.buildProbeRequestTarget({ op: "paths_info", revision: "main", ...base }),
     ).toEqual({
       url: "/api/models/owner/demo/paths-info/main",
       method: "post",
@@ -515,16 +503,18 @@ describe("admin API client", () => {
     ];
     const encoded = btoa(JSON.stringify({ version: 1, hops }));
 
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      _makeFetchResponse({
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          "x-chain-trace": encoded,
-        },
-        bodyText: '{"id": "owner/demo", "private": false}',
-      }),
-    );
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        _makeFetchResponse({
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-chain-trace": encoded,
+          },
+          bodyText: '{"id": "owner/demo", "private": false}',
+        }),
+      );
 
     const report = await api.runFallbackProbe({
       op: "info",
@@ -625,21 +615,12 @@ describe("admin API client", () => {
     _clearAllTraceCookies();
     const api = await loadModule();
     const hops = [
-      {
-        kind: "local",
-        source_name: "local",
-        decision: "LOCAL_MISS",
-        status_code: 404,
-        duration_ms: 1,
-      },
-      {
-        kind: "fallback",
-        source_name: "HF",
+      { kind: "local", source_name: "local", decision: "LOCAL_MISS",
+        status_code: 404, duration_ms: 1 },
+      { kind: "fallback", source_name: "HF",
         source_url: "https://huggingface.co",
         decision: "BIND_AND_RESPOND",
-        status_code: 307,
-        duration_ms: 800,
-      },
+        status_code: 307, duration_ms: 800 },
     ];
     const encoded = btoa(JSON.stringify({ version: 1, hops }));
 
@@ -660,12 +641,8 @@ describe("admin API client", () => {
     });
 
     const report = await api.runFallbackProbe({
-      op: "resolve",
-      repo_type: "model",
-      namespace: "openai-community",
-      name: "gpt2",
-      revision: "main",
-      file_path: "config.json",
+      op: "resolve", repo_type: "model", namespace: "openai-community",
+      name: "gpt2", revision: "main", file_path: "config.json",
     });
     expect(report.attempts).toHaveLength(2);
     expect(report.attempts[1].decision).toBe("BIND_AND_RESPOND");
@@ -729,10 +706,7 @@ describe("admin API client", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(_makeFetchResponse({ bodyText: "{}" }));
     await api.runFallbackProbe({
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     const [, init] = fetchSpy.mock.calls[0];
     expect(init.headers["X-Khub-Probe-Id"]).toMatch(/.+/);
@@ -744,16 +718,10 @@ describe("admin API client", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(_makeFetchResponse({ bodyText: "{}" }));
     await api.runFallbackProbe({
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     await api.runFallbackProbe({
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     const id1 = fetchSpy.mock.calls[0][1].headers["X-Khub-Probe-Id"];
     const id2 = fetchSpy.mock.calls[1][1].headers["X-Khub-Probe-Id"];
@@ -767,20 +735,10 @@ describe("admin API client", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       capturedProbeId = init.headers["X-Khub-Probe-Id"];
       const hops = [
-        {
-          kind: "local",
-          source_name: "local",
-          decision: "LOCAL_MISS",
-          status_code: 404,
-          duration_ms: 1,
-        },
-        {
-          kind: "fallback",
-          source_name: "HF",
-          decision: "BIND_AND_RESPOND",
-          status_code: 307,
-          duration_ms: 12,
-        },
+        { kind: "local", source_name: "local", decision: "LOCAL_MISS",
+          status_code: 404, duration_ms: 1 },
+        { kind: "fallback", source_name: "HF", decision: "BIND_AND_RESPOND",
+          status_code: 307, duration_ms: 12 },
       ];
       const traceValue = btoa(JSON.stringify({ version: 1, hops }));
       document.cookie =
@@ -791,10 +749,7 @@ describe("admin API client", () => {
     });
 
     const report = await api.runFallbackProbe({
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     expect(report.attempts).toHaveLength(2);
     expect(report.attempts[0].decision).toBe("LOCAL_MISS");
@@ -809,28 +764,16 @@ describe("admin API client", () => {
     _clearAllTraceCookies();
     const api = await loadModule();
     const headerHops = [
-      {
-        kind: "local",
-        source_name: "local",
-        decision: "LOCAL_HIT",
-        status_code: 200,
-        duration_ms: 7,
-      },
+      { kind: "local", source_name: "local", decision: "LOCAL_HIT",
+        status_code: 200, duration_ms: 7 },
     ];
-    const headerEncoded = btoa(
-      JSON.stringify({ version: 1, hops: headerHops }),
-    );
+    const headerEncoded = btoa(JSON.stringify({ version: 1, hops: headerHops }));
     let plantedProbeId = null;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       plantedProbeId = init.headers["X-Khub-Probe-Id"];
       const decoyHops = [
-        {
-          kind: "local",
-          source_name: "local",
-          decision: "LOCAL_MISS",
-          status_code: 404,
-          duration_ms: 1,
-        },
+        { kind: "local", source_name: "local", decision: "LOCAL_MISS",
+          status_code: 404, duration_ms: 1 },
       ];
       const decoy = btoa(JSON.stringify({ version: 1, hops: decoyHops }));
       document.cookie =
@@ -842,10 +785,7 @@ describe("admin API client", () => {
       });
     });
     const report = await api.runFallbackProbe({
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     expect(report.attempts).toHaveLength(1);
     expect(report.attempts[0].decision).toBe("LOCAL_HIT");
@@ -862,13 +802,8 @@ describe("admin API client", () => {
     _clearAllTraceCookies();
     const api = await loadModule();
     const hops = [
-      {
-        kind: "local",
-        source_name: "local",
-        decision: "LOCAL_HIT",
-        status_code: 200,
-        duration_ms: 1,
-      },
+      { kind: "local", source_name: "local", decision: "LOCAL_HIT",
+        status_code: 200, duration_ms: 1 },
     ];
     const encoded = btoa(JSON.stringify({ version: 1, hops }));
     let plantedProbeId = null;
@@ -880,10 +815,7 @@ describe("admin API client", () => {
       return _makeFetchResponse({ bodyText: "{}" });
     });
     const report = await api.runFallbackProbe({
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     expect(report.attempts).toHaveLength(1);
     expect(report.attempts[0].decision).toBe("LOCAL_HIT");
@@ -893,15 +825,8 @@ describe("admin API client", () => {
   it("runFallbackProbe doesn't read other probes' cookies (concurrent isolation)", async () => {
     _clearAllTraceCookies();
     const api = await loadModule();
-    const otherHops = [
-      {
-        kind: "local",
-        source_name: "local",
-        decision: "LOCAL_HIT",
-        status_code: 200,
-        duration_ms: 1,
-      },
-    ];
+    const otherHops = [{ kind: "local", source_name: "local",
+      decision: "LOCAL_HIT", status_code: 200, duration_ms: 1 }];
     const otherEncoded = btoa(JSON.stringify({ version: 1, hops: otherHops }));
     document.cookie =
       `_khub_chain_trace_other-probe=${otherEncoded}; ` +
@@ -911,10 +836,7 @@ describe("admin API client", () => {
       _makeFetchResponse({ bodyText: "{}" }),
     );
     const report = await api.runFallbackProbe({
-      op: "info",
-      repo_type: "model",
-      namespace: "owner",
-      name: "demo",
+      op: "info", repo_type: "model", namespace: "owner", name: "demo",
     });
     expect(report.attempts).toEqual([]);
     expect(report.final_outcome).toBe("CHAIN_EXHAUSTED");
@@ -990,12 +912,7 @@ describe("admin API client", () => {
       offset: 40,
     });
     expect(client.get).toHaveBeenLastCalledWith("/tasks", {
-      params: {
-        status: "failed",
-        kind: "tasks.cleanup",
-        limit: 20,
-        offset: 40,
-      },
+      params: { status: "failed", kind: "tasks.cleanup", limit: 20, offset: 40 },
     });
     expect(await api.getTask("admin-token", 7)).toEqual({ id: 7 });
     expect(client.get).toHaveBeenLastCalledWith("/tasks/7");

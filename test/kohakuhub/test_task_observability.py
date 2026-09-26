@@ -656,3 +656,24 @@ async def test_cleanup_keeps_worker_history():
     await tasks.cleanup_finished_tasks({}, RecordingContext())
     assert BackgroundWorker.get_or_none(BackgroundWorker.id == old.id) is not None
     BackgroundWorker.delete().execute()
+
+
+def test_write_logs_inserts_in_batches_and_keeps_nul_bytes_readable(monkeypatch):
+    monkeypatch.setattr(tasks, "LOG_INSERT_BATCH", 2)
+    _register("test.logs")
+    task_id = tasks.enqueue("test.logs")
+    claimed = _claim()
+    ctx = tasks.TaskContext(claimed, log_limit_bytes=10_000)
+    for i in range(4):
+        ctx.log("INFO", f"line {i}")
+    ctx.log("INFO", "binary\x00payload")
+
+    tasks.write_logs(claimed, ctx.take_logs())
+
+    messages = [
+        row.message
+        for row in BackgroundTaskLog.select()
+        .where(BackgroundTaskLog.task == task_id)
+        .order_by(BackgroundTaskLog.id)
+    ]
+    assert messages == ["line 0", "line 1", "line 2", "line 3", "binary\\x00payload"]
