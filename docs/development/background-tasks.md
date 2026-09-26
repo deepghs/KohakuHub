@@ -244,8 +244,10 @@ make worker
 ```
 
 Docker Compose runs it as the `khub-worker` service from the same image as
-`hub-api`. See `docker-compose.example.yml`. Tune it with the
-`KOHAKU_HUB_WORKER_*` variables in the
+`hub-api`. See `docker-compose.example.yml`. Run several replicas with
+`KOHAKU_HUB_WORKER_REPLICAS=3 docker compose up -d`; see
+[Running several workers](../deployment/docker.md#running-several-workers).
+Tune it with the `KOHAKU_HUB_WORKER_*` variables in the
 [configuration reference](../reference/config.md#background-task-worker-settings).
 If no worker is running, tasks accumulate as `queued`; the API does not depend
 on them.

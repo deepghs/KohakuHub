@@ -111,6 +111,39 @@ The Docker Compose setup includes the following services:
   in that release.
 - **minio**: MinIO for S3-compatible object storage (ports `29000` and `29001`).
 
+### Running several workers
+
+`khub-worker` can run several replicas against the same queue. PostgreSQL
+hands each task to exactly one of them (`FOR UPDATE SKIP LOCKED`), so you do
+not need to copy the service. Pick the number at startup:
+
+```bash
+KOHAKU_HUB_WORKER_REPLICAS=3 docker compose up -d
+# or
+docker compose up -d --scale khub-worker=3
+```
+
+`KOHAKU_HUB_WORKER_REPLICAS` can also go in the `.env` file next to
+`docker-compose.yml`. It defaults to 1. Run `up -d` again with another number
+to add or remove replicas. A replica that is stopped hands its running tasks
+back to the queue, and another replica continues them.
+
+Things to keep in mind:
+
+- **Container names.** Replicas are named `<project>-khub-worker-1`, `-2`, and
+  so on, so the service sets no `container_name`. Read their logs together
+  with `docker compose logs -f khub-worker`.
+- **Total parallelism.** Tasks running at once add up to replicas ×
+  `KOHAKU_HUB_WORKER_CONCURRENCY` (4 by default).
+- **Database connections.** Each replica holds its own PostgreSQL connection,
+  so check `max_connections` before running many.
+- **SQLite.** On a SQLite deployment, run one replica: SQLite writes are
+  serialized.
+- **Several hosts.** Docker Compose sets a fixed number of replicas on one
+  host; it does not scale automatically. To spread workers across machines,
+  run `khub-worker` on each host against the same PostgreSQL, LakeFS and
+  object storage.
+
 ## Managing the Application
 
 ### View Logs
