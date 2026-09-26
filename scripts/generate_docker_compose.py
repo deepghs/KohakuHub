@@ -401,9 +401,10 @@ def generate_hub_api_service(config: dict) -> str:
       # - KOHAKU_HUB_WORKER_CONCURRENCY=4 # Tasks run at once per worker
 
       ## ===== Dangerous Repository Operations (keep disabled) =====
-      # Revert, Reset and Super Squash are off until their integrity and
-      # recovery gates in #99 pass. They need db_backend=postgres. Before
-      # enabling any of them, drain backend instances that predate the gates.
+      # Revert, Reset and Super Squash are off by default until their #99
+      # integrity fixes land; they will default to enabled afterwards. Opting in
+      # early needs db_backend=postgres and draining pre-gate backends first.
+      # See docs/api/branches.md ("Defaults and reopening plan").
       # - KOHAKU_HUB_REPOSITORY_REVERT_ENABLED=false
       # - KOHAKU_HUB_REPOSITORY_RESET_ENABLED=false
       # - KOHAKU_HUB_REPOSITORY_SQUASH_ENABLED=false
