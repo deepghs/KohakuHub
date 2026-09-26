@@ -66,7 +66,6 @@ const tiles = computed(() => [
     value: successRate.value === null ? "—" : formatPercent(successRate.value),
     hint: `${summary.value.failed} failed · ${summary.value.succeeded_after_retry} recovered by retry`,
     tone: rateTone(summary.value.failure_rate),
-    status: "failed",
   },
   {
     key: "backlog",
@@ -77,7 +76,6 @@ const tiles = computed(() => [
         ? "nothing waiting"
         : `oldest waiting ${formatAge(backlog.value.oldest_due_seconds)}`,
     tone: backlogTone.value,
-    status: "queued",
   },
   {
     key: "retrying",
@@ -85,7 +83,6 @@ const tiles = computed(() => [
     value: backlog.value.retrying,
     hint: `${backlog.value.scheduled} scheduled for later`,
     tone: backlog.value.retrying ? "warn" : "muted",
-    status: "queued",
   },
   {
     key: "running",

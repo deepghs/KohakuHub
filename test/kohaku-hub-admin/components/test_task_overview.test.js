@@ -261,14 +261,25 @@ describe("TaskOverview", () => {
     expect(wrapper.emitted("select-kind")).toEqual([["repo.sync"]]);
   });
 
-  it("emits a status selection only from clickable tiles", async () => {
+  it("only the running tile opens a filtered list", async () => {
     const wrapper = mountOverview(makeStats());
 
-    await tile(wrapper, "finished").trigger("click");
-    await tile(wrapper, "success").trigger("click");
-    await tile(wrapper, "backlog").trigger("click");
+    // These tiles summarise the window or a subset of a status, so a status
+    // filter would show more than they claim; they are not clickable.
+    for (const key of [
+      "finished",
+      "success",
+      "backlog",
+      "retrying",
+      "duration",
+    ]) {
+      expect(tile(wrapper, key).element.tagName).toBe("DIV");
+      await tile(wrapper, key).trigger("click");
+    }
+    expect(tile(wrapper, "running").element.tagName).toBe("BUTTON");
+    await tile(wrapper, "running").trigger("click");
 
-    expect(wrapper.emitted("select-status")).toEqual([["failed"], ["queued"]]);
+    expect(wrapper.emitted("select-status")).toEqual([["running"]]);
   });
 
   it("shows error groups scaled to the largest and lets you jump to a kind", async () => {

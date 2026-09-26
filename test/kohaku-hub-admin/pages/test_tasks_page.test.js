@@ -596,7 +596,7 @@ describe("admin background tasks page", () => {
     expect(wrapper.find('[data-testid="tasks-health"]').exists()).toBe(false);
     expect(wrapper.find('[data-testid="task-overview"]').exists()).toBe(false);
     expect(
-      wrapper.find('[data-description="Loading task health…"]').exists(),
+      wrapper.find('[data-description="Could not load task health"]').exists(),
     ).toBe(true);
     expect(messageErrorSpy).toHaveBeenCalledWith("stats exploded");
   });
@@ -657,5 +657,74 @@ describe("admin background tasks page", () => {
       "tasks",
     );
     expect(card.classes()).toContain("active");
+  });
+
+  it("ignores a stats response for a window that is no longer selected", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    let resolveSlow;
+    mocks.api.getTaskStats.mockImplementation((_token, window) =>
+      window === "7d"
+        ? new Promise((resolve) => {
+            resolveSlow = resolve;
+          })
+        : Promise.resolve(statsResponse({ window })),
+    );
+    const wrapper = mountPage();
+    await flushPromises();
+
+    await wrapper.get('[data-testid="task-window-7d"]').trigger("click");
+    await wrapper.get('[data-testid="task-window-15m"]').trigger("click");
+    await flushPromises();
+    resolveSlow(
+      statsResponse({
+        window: "7d",
+        summary: { ...statsResponse().summary, finished: 999 },
+      }),
+    );
+    await flushPromises();
+
+    expect(
+      wrapper.get('[data-testid="task-kpi-finished"]').text(),
+    ).not.toContain("999");
+    expect(wrapper.get('[data-testid="task-window-15m"]').classes()).toContain(
+      "active",
+    );
+  });
+
+  it("refreshes queue health after a retry or discard", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    mocks.api.retryTask.mockResolvedValue({});
+    mocks.api.deleteTask.mockResolvedValue({ success: true, id: 3 });
+    messageBoxConfirmSpy.mockResolvedValue("confirm");
+    const wrapper = mountPage();
+    await flushPromises();
+    expect(mocks.api.getTaskStats).toHaveBeenCalledTimes(1);
+
+    await wrapper.get('[data-testid="tasks-retry-1"]').trigger("click");
+    await flushPromises();
+    expect(mocks.api.getTaskStats).toHaveBeenCalledTimes(2);
+
+    await wrapper.get('[data-testid="tasks-discard-3"]').trigger("click");
+    await flushPromises();
+    expect(mocks.api.getTaskStats).toHaveBeenCalledTimes(3);
+  });
+
+  it("offers a retry when queue health fails to load", async () => {
+    mocks.api.listTasks.mockResolvedValue(listResponse());
+    mocks.api.getTaskStats
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue(statsResponse());
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(messageErrorSpy).toHaveBeenCalledWith("Failed to load task health");
+    const retry = wrapper.get('[data-testid="tasks-stats-retry"]');
+    await retry.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="task-overview"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="tasks-stats-retry"]').exists()).toBe(
+      false,
+    );
   });
 });

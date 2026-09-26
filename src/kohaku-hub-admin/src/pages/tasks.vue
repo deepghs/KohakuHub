@@ -52,6 +52,7 @@ const detailVisible = ref(false);
 const activeTab = ref("overview");
 const statsWindow = ref("1h");
 const stats = ref(null);
+const statsFailed = ref(false);
 let refreshTimer = null;
 
 const health = computed(() =>
@@ -103,9 +104,15 @@ async function loadTasks() {
 
 async function loadStats() {
   if (!adminStore.token) return; // loadTasks handles the redirect
+  const requested = statsWindow.value;
   try {
-    stats.value = await getTaskStats(adminStore.token, statsWindow.value);
+    const data = await getTaskStats(adminStore.token, requested);
+    // A slower response for a window the user already left must not win.
+    if (requested !== statsWindow.value) return;
+    stats.value = data;
+    statsFailed.value = false;
   } catch (error) {
+    statsFailed.value = true;
     handleError(error, "Failed to load task health");
   }
 }
@@ -180,7 +187,7 @@ async function handleRetry(task) {
     await retryTask(adminStore.token, task.id);
     ElMessage.success(`Task #${task.id} requeued`);
     detailVisible.value = false;
-    await loadTasks();
+    refreshAll();
   } catch (error) {
     handleError(error, "Failed to retry task");
   }
@@ -199,7 +206,7 @@ async function handleDiscard(task) {
     await deleteTask(adminStore.token, task.id);
     ElMessage.success(`Task #${task.id} discarded`);
     detailVisible.value = false;
-    await loadTasks();
+    refreshAll();
   } catch (error) {
     handleError(error, "Failed to discard task");
   }
@@ -332,7 +339,22 @@ onBeforeUnmount(stopTimer);
             @select-kind="showKind"
             @select-status="showStatus"
           />
-          <el-empty v-else description="Loading task health…" />
+          <el-empty
+            v-else
+            :description="
+              statsFailed
+                ? 'Could not load task health'
+                : 'Loading task health…'
+            "
+          >
+            <el-button
+              v-if="statsFailed"
+              data-testid="tasks-stats-retry"
+              @click="loadStats()"
+            >
+              Retry
+            </el-button>
+          </el-empty>
         </el-tab-pane>
         <el-tab-pane label="Tasks" name="tasks">
           <el-card shadow="never">

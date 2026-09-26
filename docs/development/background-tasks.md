@@ -85,7 +85,7 @@ Rules:
   - health by kind, with a timeline strip per kind;
   - errors grouped by exception class, counting final failures and pending retries separately.
 
-  Clicking a kind, an error's kind chip, a status card or a KPI tile opens **Tasks** already filtered.
+  Clicking a kind, an error's kind chip, a status card or the **Running** tile opens **Tasks** already filtered by that kind or status. The other tiles summarise the window or part of a status, so they are not links.
 - **Tasks** is the filterable task list with details, retry and discard.
 
 The health verdict uses these rules:
