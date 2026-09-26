@@ -104,6 +104,14 @@ services:
       # - KOHAKU_HUB_WORKER_CONCURRENCY=4 # Tasks run at once per worker
       # - KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS=7
       # - KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS=30
+
+      ## ===== Dangerous Repository Operations (keep disabled) =====
+      # Revert, Reset and Super Squash are off until their integrity and
+      # recovery gates in #99 pass. They need db_backend=postgres. Before
+      # enabling any of them, drain backend instances that predate the gates.
+      # - KOHAKU_HUB_REPOSITORY_REVERT_ENABLED=false
+      # - KOHAKU_HUB_REPOSITORY_RESET_ENABLED=false
+      # - KOHAKU_HUB_REPOSITORY_SQUASH_ENABLED=false
     volumes:
       - ./hub-meta/hub-api:/hub-api-creds
 
