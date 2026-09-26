@@ -74,10 +74,15 @@ def _start_head_to_get_proxy(origin_url: str):
         {"origin_url": origin_url.rstrip("/")},
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    host, port = server.server_address
+    _host, port = server.server_address
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return server, thread, f"http://{host}:{port}"
+    # Address the proxy (the CDN in front of the hub) by a hostname that
+    # differs from the storage endpoint's 127.0.0.1. hf_hub >= 2.0 follows
+    # HEAD redirects to the same hostname (port ignored) and would carry the
+    # bearer token to the presigned S3 URL, which a real deployment avoids by
+    # serving storage from its own host.
+    return server, thread, f"http://localhost:{port}"
 
 
 async def test_preupload_respects_lfs_rules(owner_client):

@@ -53,6 +53,11 @@ const menuItems = [
     icon: "i-carbon-data-vis-1",
   },
   {
+    path: "/tasks",
+    label: "Background Tasks",
+    icon: "i-carbon-task",
+  },
+  {
     path: "/credentials",
     label: "Credentials",
     icon: "i-carbon-password",

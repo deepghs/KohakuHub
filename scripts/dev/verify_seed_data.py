@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import hashlib
 import json
 import sys
@@ -216,6 +217,41 @@ async def verify_seed_data() -> dict:
                     + ", ".join(sorted(f"{name} ({url})" for url, name in missing))
                 )
             summary["verified_checks"].append("fallback sources available")
+
+        expected_tasks = Counter(
+            (task["kind"], task["status"]) for task in manifest.get("background_tasks", [])
+        )
+        if expected_tasks:
+            admin = {"X-Admin-Token": cfg.admin.secret_token}
+
+            async def list_tasks(**params) -> dict:
+                response = await client.get(
+                    "/admin/api/tasks", params={"limit": 500, **params}, headers=admin
+                )
+                response.raise_for_status()
+                return response.json()
+
+            # Query per demo kind so the worker's own growing rows (e.g.
+            # tasks.cleanup) can never push demo rows off the page.
+            seeded_tasks: Counter = Counter()
+            for kind in (await list_tasks())["kinds"]:
+                if kind.startswith("demo."):
+                    seeded_tasks.update(
+                        (task["kind"], task["status"])
+                        for task in (await list_tasks(kind=kind))["tasks"]
+                    )
+            showcase = sum(expected_tasks.values())
+            most = showcase + manifest.get("background_task_history", 0)
+            found = sum(seeded_tasks.values())
+            # History ages out through the worker's retention cleanup, so it
+            # may shrink over time; the showcase rows never finish.
+            if expected_tasks - seeded_tasks or not showcase <= found <= most:
+                raise VerifyError(
+                    f"Seeded background tasks differ: expected the showcase rows "
+                    f"{sorted(expected_tasks.elements())} and {showcase}-{most} demo rows "
+                    f"in total, found {found}"
+                )
+            summary["verified_checks"].append("background task examples")
 
     return summary
 

@@ -110,6 +110,18 @@ class CacheConfig(BaseModel):
     socket_connect_timeout_seconds: float = 0.5
 
 
+class WorkerConfig(BaseModel):
+    """Background task worker (``python -m kohakuhub.worker``)."""
+
+    concurrency: int = 4  # Handlers running at once per worker process
+    lease_seconds: int = 60  # A task is reclaimed if its worker stops renewing
+    poll_interval_seconds: float = 1.0  # Idle wait between claim attempts
+    shutdown_grace_seconds: float = 30.0  # Drain time on SIGTERM before cancelling
+    succeeded_retention_days: int = 7
+    failed_retention_days: int = 30
+    queues: list[str] = []  # Empty = consume every queue
+
+
 class AppConfig(BaseModel):
     base_url: str = "http://localhost:48888"
     # Allows local dev to expose frontend-facing URLs while backend self-calls stay direct.
@@ -208,6 +220,7 @@ class Config(BaseModel):
     quota: QuotaConfig = QuotaConfig()
     fallback: FallbackConfig = FallbackConfig()
     cache: CacheConfig = CacheConfig()
+    worker: WorkerConfig = WorkerConfig()
     app: AppConfig
 
     def validate_production_safety(self) -> list[str]:
@@ -449,6 +462,27 @@ def load_config(path: str = None) -> Config:
     if cache_env:
         config_from_env["cache"] = cache_env
 
+    # Worker
+    worker_env = {}
+    for env_name, key, parse in (
+        ("KOHAKU_HUB_WORKER_CONCURRENCY", "concurrency", int),
+        ("KOHAKU_HUB_WORKER_LEASE_SECONDS", "lease_seconds", int),
+        ("KOHAKU_HUB_WORKER_POLL_INTERVAL_SECONDS", "poll_interval_seconds", float),
+        ("KOHAKU_HUB_WORKER_SHUTDOWN_GRACE_SECONDS", "shutdown_grace_seconds", float),
+        ("KOHAKU_HUB_WORKER_SUCCEEDED_RETENTION_DAYS", "succeeded_retention_days", int),
+        ("KOHAKU_HUB_WORKER_FAILED_RETENTION_DAYS", "failed_retention_days", int),
+    ):
+        if env_name in os.environ:
+            worker_env[key] = parse(os.environ[env_name])
+    if "KOHAKU_HUB_WORKER_QUEUES" in os.environ:
+        worker_env["queues"] = [
+            queue.strip()
+            for queue in os.environ["KOHAKU_HUB_WORKER_QUEUES"].split(",")
+            if queue.strip()
+        ]
+    if worker_env:
+        config_from_env["worker"] = worker_env
+
     # Fallback
     fallback_env = {}
     if "KOHAKU_HUB_FALLBACK_ENABLED" in os.environ:
@@ -549,6 +583,7 @@ def load_config(path: str = None) -> Config:
     quota_config = QuotaConfig(**merged_config.get("quota", {}))
     fallback_config = FallbackConfig(**merged_config.get("fallback", {}))
     cache_config = CacheConfig(**merged_config.get("cache", {}))
+    worker_config = WorkerConfig(**merged_config.get("worker", {}))
     app_config = AppConfig(**merged_config.get("app", {}))
 
     return Config(
@@ -560,6 +595,7 @@ def load_config(path: str = None) -> Config:
         quota=quota_config,
         fallback=fallback_config,
         cache=cache_config,
+        worker=worker_config,
         app=app_config,
     )
 

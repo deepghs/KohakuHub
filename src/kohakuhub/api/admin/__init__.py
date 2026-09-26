@@ -11,6 +11,7 @@ Organized router structure:
 - search: Global search across entities
 - health: Live probes for backing services (Postgres, MinIO, LakeFS, SMTP)
 - cache: L2 cache (Valkey) hit/miss/error counters and memory state
+- tasks: Background task queue inspection, retry, and discard
 """
 
 from fastapi import APIRouter
@@ -28,6 +29,7 @@ from kohakuhub.api.admin.routers import (
     search_router,
     stats_router,
     storage_router,
+    tasks_router,
     users_router,
 )
 
@@ -48,5 +50,6 @@ router.include_router(fallback_router, tags=["admin-fallback"])
 router.include_router(health_router, tags=["admin-health"])
 router.include_router(credentials_router, tags=["admin-credentials"])
 router.include_router(cache_router, tags=["admin-cache"])
+router.include_router(tasks_router, tags=["admin-tasks"])
 
 __all__ = ["router"]

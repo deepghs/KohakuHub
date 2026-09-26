@@ -64,9 +64,12 @@ def do_setup(client: httpx.Client):
 
 def write_credentials(access_key, secret_key):
     CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CRED_FILE, "w") as f:
+    # Write then rename so khub-worker never reads a half-written file.
+    tmp_file = CRED_FILE.with_suffix(".tmp")
+    with open(tmp_file, "w") as f:
         f.write(f"KOHAKU_HUB_LAKEFS_ACCESS_KEY={access_key}\n")
         f.write(f"KOHAKU_HUB_LAKEFS_SECRET_KEY={secret_key}\n")
+    os.replace(tmp_file, CRED_FILE)
     print(f"[startup] Saved credentials to {CRED_FILE}")
 
 
@@ -131,7 +134,22 @@ def run_migrations():
     print("[startup] ✓ Migrations completed successfully\n")
 
 
+def run_worker():
+    """Start khub-worker. hub-api owns LakeFS bootstrap and migrations."""
+    if "KOHAKU_HUB_LAKEFS_ACCESS_KEY" not in os.environ:
+        while not CRED_FILE.exists():
+            print(f"[startup] Waiting for hub-api to write {CRED_FILE}...")
+            time.sleep(2)
+        load_credentials()
+    print("[startup] Starting background task worker...")
+    os.execvp(sys.executable, [sys.executable, "-m", "kohakuhub.worker"])
+
+
 def main():
+    if sys.argv[1:] == ["worker"]:
+        run_worker()
+        return
+
     wait_for_lakefs()
 
     if CRED_FILE.exists() or (

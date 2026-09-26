@@ -26,6 +26,7 @@ jobs:
           - "0.36.2"
           - "1.0.1"
           - "1.6.0"
+          - "2.0.0"
           - "latest"
     env:
       KOHAKU_HUB_DATABASE_URL: postgresql://hub_test:hub_test_password@127.0.0.1:25432/kohakuhub_test
@@ -63,7 +64,9 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       minio:
-        image: quay.io/minio/minio:latest
+        # quay.io/minio/minio no longer serves anonymous pulls; use the
+        # community-maintained build of the same server.
+        image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
@@ -191,7 +194,9 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       minio:
-        image: quay.io/minio/minio:latest
+        # quay.io/minio/minio no longer serves anonymous pulls; use the
+        # community-maintained build of the same server.
+        image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin

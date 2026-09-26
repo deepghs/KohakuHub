@@ -99,6 +99,10 @@ The Docker Compose setup includes the following services:
 
 - **hub-ui**: Nginx server for the frontend application (port `28080`).
 - **hub-api**: The main FastAPI backend (port `48888`).
+- **khub-worker**: Runs durable background tasks from the same image as
+  `hub-api` and shares its environment. `hub-api` runs migrations and writes
+  the LakeFS credentials the worker reads. See
+  [Background Tasks](../development/background-tasks.md).
 - **postgres**: PostgreSQL database for metadata (port `5432`).
 - **lakefs**: LakeFS for data versioning (port `28000`). Pinned to
   `treeverse/lakefs:latest`; **minimum supported LakeFS is v0.54.0**

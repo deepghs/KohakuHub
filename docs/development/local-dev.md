@@ -139,6 +139,14 @@ make seed-demo
 
 This writes a local manifest to `hub-meta/dev/demo-seed-manifest.json`.
 
+To run background tasks, start the worker in another terminal after the backend is up:
+
+```bash
+make worker
+```
+
+See [Background Tasks](background-tasks.md) for how tasks work.
+
 ## Start The Frontends
 
 Main UI:
@@ -203,6 +211,8 @@ Additional seeded users use the same password:
 - `ivy_ops`
 
 The seeded data also includes fixed organizations and repositories, including public/private repos, model/dataset/space types, branches, tags, likes, LFS files, and dataset preview files.
+
+It also plants example rows for the admin **Background Tasks** page: one task in each state the page can show (succeeded, failed, queued, delayed retry, running, and running with an expired lease). Their `demo.*` kinds are never registered as handlers, so a running worker leaves them untouched.
 
 Admin UI login does not use a username/password. Open `http://127.0.0.1:5174` and use the token from `.env.dev`.
 
