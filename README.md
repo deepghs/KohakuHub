@@ -1,3 +1,25 @@
+# Archived: development continues in CheeseCave
+
+This repository is archived and retained for historical reference. Development
+continues in **CheeseCave**, a **hard fork of KohakuHub**.
+
+We plan to make breaking changes based on KohakuHub, so CheeseCave will evolve
+independently rather than remain an upstream-compatible fork. The project has
+been split into three repositories:
+
+| Repository | Responsibility |
+| --- | --- |
+| [cheesecave-backend](https://github.com/cheesecave/cheesecave-backend) | Backend API, workers, migrations and deployment configuration |
+| [cheesecave-web](https://github.com/cheesecave/cheesecave-web) | Main website UI |
+| [cheesecave-admin](https://github.com/cheesecave/cheesecave-admin) | Administration UI |
+
+CheeseCave is an independently maintained derivative, not an official KohakuHub
+release. Original author attribution, applicable licenses and repository history
+are retained. The original documentation below is preserved as historical
+information and may not describe CheeseCave.
+
+---
+
 # Kohaku Hub - Self-hosted HuggingFace Alternative
 
 <p align="center">
